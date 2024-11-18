@@ -22,7 +22,11 @@ DEBUG_LOG = False
 VCPKG_INCLUDE_RE = r"^vcpkg\/installed\/[a-z0-9-]+\/include\/([^\/]+)\/"
 
 CCFLAGS = ["-pthread", "-fnon-call-exceptions", "-g",
-            "-Wall", "-Wextra", "-Wconversion", "-Wno-sign-compare", "-Wno-deprecated"]
+            "-Wall", "-Wextra", "-Wconversion", 
+            "-Wno-sign-compare", "-Wno-deprecated", "-Wno-sign-conversion",
+            "-Werror=shift-count-overflow",
+            "-Werror=return-type",
+]
 CXXFLAGS = ["-std=c++23"]
 LFLAGS = ["-lrt"]
 OBJDIR = "obj"
@@ -36,6 +40,8 @@ USECLANG = False
 
 CXX = "clang++" if USECLANG else "g++"
 CC = "clang" if USECLANG else "gcc"
+
+TESTMAIN = "deps/baselib/lib/testing/testmain.cc"
 
 class Release:
     CCFLAGS = CCFLAGS + ["-O2", "-mtune=native"]
@@ -828,7 +834,7 @@ class CompilationDatabase:
         self.entries = []
 
     def build(self):
-        for path in find_files_with_suffixes(self.paths, [".cc", ".cpp", ".c"]):
+        for path in find_files(self.paths, suffixes=[".cc", ".cpp", ".c"]):
             self.process_file(path)
 
         return json.dumps(self.entries, indent=2)
@@ -851,7 +857,7 @@ class CompilationDatabase:
             "arguments": compilation_cmd,
         })
 
-def find_files_with_suffixes(paths: Path, suffixes: list[str]):
+def find_files(paths: Path, suffixes: tuple[str], prefixes: tuple[str] = None):
     """
     Generator function to yield all files in the given directory
     that end with any of the specified suffixes.
@@ -872,10 +878,13 @@ def find_files_with_suffixes(paths: Path, suffixes: list[str]):
             for entry in entries:
                 # print("entry", entry)
                 if entry.is_file() and entry.name.endswith(suffixes):
+                    if prefixes is not None and not entry.name.startswith(prefixes):
+                        continue
+
                     yield Path(entry.path)
                     
                 elif entry.is_dir() and not entry.is_symlink() and not entry.name.startswith("."):  # Recurse into subdirectories
-                    yield from find_files_with_suffixes([entry.path], suffixes)
+                    yield from find_files([entry.path], suffixes=suffixes, prefixes=prefixes)
 
 def atomic_write(path: Path, data: str):
     tmpfile = path.with_extra_suffix(".tmp")
@@ -931,6 +940,35 @@ def vscode(paths: list[Path]):
     db = CompilationDatabase(paths)
     return db.build()
 
+def mkpath(path: str) -> Path:
+    return Path(os.path.relpath(os.path.abspath(path), os.path.abspath(ROOT)))
+
+def run_tests(dirs: list[str]):
+    dirs = [os.path.abspath(dir) for dir in dirs]
+
+    # change directory to root
+    oldwd = None
+    if ROOT != ".":
+        oldwd = os.getcwd()
+        os.chdir(ROOT)
+
+    
+    testmain_path = mkpath(TESTMAIN)
+    testmain_name = testmain_path.with_suffix('')
+    target = Target(testmain_name, TargetType.EXECUTABLE)
+    target.compile(testmain_path, SourceType.CPP)
+    
+    for filename in find_files(dirs, suffixes = ('_test.cc', '_test.cpp')):
+        print("building %s..." % filename)
+        path = mkpath(filename)
+        target.compile(path, SourceType.CPP)
+
+    bin = target.link()
+    bin = os.path.abspath(bin)
+    if oldwd:
+        os.chdir(oldwd)
+    os.execv(bin, [bin])
+        
 
 ## MAIN ##
 def main():
@@ -959,6 +997,9 @@ def main():
 
     ide_parser = subparsers.add_parser('ide', help='generate a compile_commands.json compilation database')
     ide_parser.add_argument('paths', nargs='*')
+
+    test_parser = subparsers.add_parser('test', help='run tests in the specified directories or files')
+    test_parser.add_argument('dirs', nargs='+')
 
     args = parser.parse_args()
     if args.cmd in ['build', 'run']:
@@ -1020,6 +1061,12 @@ def main():
         data = vscode(paths)
         atomic_write(Path("compile_commands.json"), data)
         print("wrote compile_commands.json")
+
+    elif args.cmd == "test":
+        dirs = args.dirs
+        run_tests(dirs)
+        
+
     else:
         parser.print_help()
         exit(1)
