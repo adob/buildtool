@@ -24,16 +24,19 @@ VCPKG_INCLUDE_RE = r"^vcpkg\/installed\/[a-z0-9-]+\/include\/([^\/]+)\/"
 CCFLAGS = ["-pthread", "-fnon-call-exceptions", "-g",
             "-Wall", "-Wextra", "-Wconversion", 
             "-Wno-sign-compare", "-Wno-deprecated", "-Wno-sign-conversion",
+            "-Wno-missing-field-initializers",
             "-Werror=shift-count-overflow",
             "-Werror=return-type",
 ]
-CXXFLAGS = ["-std=c++23"]
+CLANG_CCFLAGS = ["-Wno-logical-op-parentheses"]
+CXXFLAGS = ["-std=c++26"]
 LFLAGS = ["-lrt"]
 OBJDIR = "obj"
 DEPDIR = "obj"
 SUFFIX = ""
 
 SRCDIR = "."
+SRC_ROOTS = [SRCDIR]
 BINDIR = "bin"
 INCPATH = []
 USECLANG = False
@@ -42,16 +45,23 @@ CXX = "clang++" if USECLANG else "g++"
 CC = "clang" if USECLANG else "gcc"
 
 TESTMAIN = "deps/baselib/lib/testing/testmain.cc"
+BENCHMAIN = "deps/baselib/lib/testing/benchmain.cc"
 
 class Release:
-    CCFLAGS = CCFLAGS + ["-O2", "-mtune=native"]
+    CCFLAGS = CCFLAGS + ["-O2", "-mtune=native", 
+                         #"-march=native", 
+                         "-mcx16"]
     LFLAGS  = LFLAGS + ["-fwhole-program", "-O2", "-mtune=native"]
     OBJDIR  = OBJDIR + "/release"
     DEPDIR  = DEPDIR + "/release"
 
 
 class Debug:
-    CCFLAGS = CCFLAGS + ["-fsanitize=address"]
+    CCFLAGS = CCFLAGS + [
+        "-fsanitize=address", 
+        #"-fsanitize=thread", 
+        "-fsanitize=undefined",
+        "-mcx16"]
     OBJDIR  = OBJDIR + "/debug"
     DEPDIR  = DEPDIR + "/debug"
     SUFFIX  = "+debug"
@@ -79,28 +89,77 @@ class SourceType(StrEnum):
 BasePath = type(pathlib.Path())
 class Path(BasePath):
     def __new__(cls, *paths: str):
+        paths = [str(p) for p in paths]
         normalized = os.path.normpath('/'.join(paths))
-        return super(Path, cls).__new__(cls, normalized)
+        p = super(Path, cls).__new__(cls, normalized)
+        #print("normalized", normalized, '/'.join(paths), id(p))
+        return p
+    
+    #def __init__(self, *paths: str):
+    #    paths = [str(p) for p in paths]
+    #    normalized = os.path.normpath('/'.join(paths))
+
+    #    #print("__INIT__", paths)
+    #    super().__init__(normalized)
 
     def with_extra_suffix(self, suffix: str) -> 'Path':
         return self.with_name(self.name + suffix)
     
     @cache
-    def stat(self):
+    def try_stat(self):
         try:
             return super().stat()
         except FileNotFoundError:
             return None
         
     def mtime(self):
-        stat = self.stat()
+        stat = self.try_stat()
         if stat is None:
             return 0
         return stat.st_mtime
     
     def exists(self):
-        return self.stat() is not None
+        return self.try_stat() is not None
 
+class CompiledModule:
+    modules = {}
+
+    @staticmethod
+    def get(name: str, type=None):
+        mod = CompiledModule.modules.get(name)
+        if mod:
+            return mod
+        mod = CompiledModule(name, type)
+        CompiledModule.modules[name] = mod
+        return mod
+    
+    def __init__(self, name: str, type:SourceType = None):
+        self.name = name
+        if type is not None:
+            self.type = type
+        elif name.startswith('/'):
+            self.type = SourceType.SYSTEM_HEADER
+        elif name.startswith('./'):
+            self.type = SourceType.USER_HEADER
+        else:
+            self.type = SourceType.MODULE
+        self.cmhash = None
+
+        # self.cmfile = mod2cm(name)
+        # self.cmfile_path = OBJDIR / self.cmfile
+
+    def build(self, target):
+        debug_log("CompiledModule.build()")
+        if self.cmhash:
+            return self.cmhash
+        
+        self.srcpath = target.mod2src(self.name, self.type)
+        
+        self.srcfile = target.compile(self.srcpath, type=self.type, modname=self.name)
+
+        self.cmpath = self.srcfile.cmpath
+        self.cmhash = sha256_file(self.cmpath)
+        return self.cmhash
 
 class Target:
     def __init__(self, path: Path, targettype: TargetType):
@@ -113,8 +172,10 @@ class Target:
         self.most_recent_output_mtime = 0
         self.extra_linkflags = set()
 
-    def compile(self, path: Path, modname: str=None):
-        if path.suffix in CCFILE_SUFFIXES:
+    def compile(self, path: Path, type=None, modname: str=None):
+        if type is not None:
+            pass
+        elif path.suffix in CCFILE_SUFFIXES:
             type = SourceType.CPP
         elif path.suffix in ('.c'):
             type = SourceType.C
@@ -130,8 +191,8 @@ class Target:
         debug_log(f"processing {path} type={type}")
         file.build(self)
 
-        #if type not in [SourceType.SYSTEM_HEADER, SourceType.USER_HEADER]:
-        self.objs.append(file.objpath)
+        if type not in [SourceType.SYSTEM_HEADER, SourceType.USER_HEADER]:
+            self.objs.append(file.objpath)
 
         if file.output_mtime > self.most_recent_output_mtime:
             self.most_recent_output_mtime = file.output_mtime
@@ -179,7 +240,33 @@ class Target:
 
         lflags.update(extra)
         return lflags
-        
+    
+
+    def mod2src(self, modname: str, type: SourceType):
+        debug_log("mod2src", modname, type)
+        path = mod2path(modname, type)
+        debug_log("TRYING TO FIND module source file", path)
+        failed = []
+
+        for base_path in [SRCDIR, *INCPATH]:
+            if isinstance(base_path, str):
+                base_path = base_path.removeprefix("-I").removeprefix("-iquote")
+                base_path = Path(base_path)
+
+            full_path = base_path / path
+            debug_log("TRYING", full_path)
+            if full_path.exists():
+                return full_path
+            
+            failed.append(str(full_path))
+
+            srcfile2 = full_path.parent / full_path.stem / full_path.name
+            if srcfile2.exists():
+                    return srcfile2
+            failed.append(str(srcfile2))
+
+        warn(f"FATAL: Unable to locate module {modname}: the following files do not exist: %s" % ', '.join(failed))
+        exit(1)
 
 class SourceFile:
     files = {}
@@ -219,6 +306,14 @@ class SourceFile:
         self.mtime       = self.path.mtime()
         self.deps        = set()
         self.up_to_date  = None
+
+        if type is None:
+            if path.suffix in CCFILE_SUFFIXES:
+                self.type = SourceType.CPP
+            elif path.suffix == '.c':
+                self.type = SourceType.C
+            else:
+                raise Exception('Unrecognized file type: %s' % str(path))
 
     def check_up_to_date(self):
         if self.up_to_date is not None:
@@ -321,10 +416,8 @@ class SourceFile:
 
             if isinstance(dep, ModuleDep):
                 deps.append(f"module:{dep.name}@{dep.sha256}")
-
-            if isinstance(dep, HeaderDep):
+            elif isinstance(dep, HeaderDep):
                 deps.append(f"include:{dep.path}")
-
             else:
                 raise Exception(f"unhandled dep type #{dep} of type #{type(dep)}")
 
@@ -332,6 +425,7 @@ class SourceFile:
             'command': self.compiler_cmd(),
             'deps': deps
         }
+        #print(out)
         atomic_write(self.infofile, json.dumps(out, indent=2) + '\n')
 
     @cache
@@ -361,41 +455,53 @@ class SourceFile:
         dirparts = list(self.dirname.parts)
         try:
             src_index = dirparts.index('src')
-            dirparts[src_index] = 'include'
-            flags.add("-I"+str(Path(*dirparts)))
+            #dirparts[src_index] = 'include'
+            flags.add("-I"+str(Path(*dirparts[:src_index], 'include')))
+            flags.add("-iquote"+str(Path(*dirparts[:src_index], 'src')))
         except ValueError:
-            pass
+            try:
+                deps_index = dirparts.index('deps')
+                f = "-I"+str(Path(*dirparts[:deps_index+2]))
+                flags.add(f)
+                #print("ADDING", f)
+            except ValueError:
+                pass
 
         if self.type == SourceType.C:
             flags.add("-xc")
 
         return flags
 
-    def compiler_cmd_clang(self):
+    def compiler_cmd_clang(self, extra_args=[]):
         extra_args1 = self.compiler_extra_args()
         header_units = []
 
         if self.type == SourceType.USER_HEADER:
-            return [C, "-xc++-header", "-fmodule-header=user", f"-fprebuilt-module-path={OBJDIR}", *CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+self.cmpath, "-c", self.path]
+            return ["clang++", "-xc++-header", "-fmodule-header=user", f"-fprebuilt-module-path={OBJDIR}", *CCFLAGS, *CLANG_CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+str(self.cmpath), "-c", str(self.path)]
         
-        elif self.type == SourceType.SYSTEM_HEADER:
+        if self.type == SourceType.SYSTEM_HEADER:
             raise NotImplementedError
         
-        elif self.type == SourceType.MODULE:
+        if self.type == SourceType.MODULE:
             extra_args2 = [f"-fmodule-file={f}" for f in header_units] + [
                 "-xc++-module", 
                 f"-fmodule-output={self.cmpath}", 
                 "-MD", 
                 f"-MF{self.makefile}"
             ]
-            return [CXX, f"-fprebuilt-module-path={OBJDIR}", *extra_args1, *extra_args2, *CCFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", self.path]
+            return ["clang++", f"-fprebuilt-module-path={OBJDIR}", *extra_args1, *extra_args2, *CCFLAGS, *CLANG_CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", str(self.path)]
         
-        else:
-            if self.type == SourceType.C:
-                cmd = CC
-                
-            extra_args2 = [f"-fmodule-file={f}" for f in header_units] + ["-MD", f"-MF{self.makefile}"]
-            return [CXX, f"-fprebuilt-module-path={OBJDIR}", *extra_args1, *extra_args2, *CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", self.path]
+        
+        if self.type == SourceType.CPP:
+            args = [f"-fmodule-file={f}" for f in header_units] + ["-MD", f"-MF{self.makefile}"]
+            return ["clang++", *args, f"-fprebuilt-module-path={OBJDIR}", *extra_args, *extra_args1, *CCFLAGS, *CLANG_CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", str(self.path)]    
+            
+        if self.type == SourceType.C:
+            args = ["-MD", f"-MF{self.makefile}"]
+            return ["clang", *args, *extra_args, *extra_args, *extra_args1, *CCFLAGS, *CLANG_CCFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", str(self.path)]
+        
+        raise Exception("unrecognized type: %s" % self.type)
+                    
 
     def compiler_cmd_gcc(self):
         cmd = CXX
@@ -409,7 +515,7 @@ class SourceFile:
         elif self.type == SourceType.USER_HEADER:
             args += ["-fmodules-ts", "-fmodule-header=user", "-iquote.", *CXXFLAGS]
 
-        elif self.type == SourceType.CPP:
+        elif self.type in [SourceType.CPP, SourceType.MODULE]:
             args += [
                 "-fmodules-ts", 
                 *CXXFLAGS
@@ -445,6 +551,9 @@ class SourceFile:
         # https://github.com/urnathan/libcody
         # https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2020/p1184r2.pdf
         print(f"BUILDING {self.type} {self.path}")
+        if ".." in str(self.path):
+            print("TYPE", type(self.path), id(self.path))
+            raise "x"
 
         mapper_read, compiler_write = os.pipe()
         compiler_read, mapper_write = os.pipe()
@@ -481,7 +590,7 @@ class SourceFile:
                     line = mapper_read.readline()
                     if line == "":
                         eof = True
-                        break;
+                        break
                     
                     line = line.strip()
                     # debug_log("GOT LINE <%s>" % line)
@@ -502,13 +611,13 @@ class SourceFile:
                     # debug_log("CMD", cmd, args)
 
                     if cmd == "HELLO":
-                        out.append("HELLO 1 compile.rb")
+                        out.append("HELLO 1 buildtool.py")
                         
                     elif cmd == "INCLUDE-TRANSLATE":
                         file = args[0]
                         if not file.startswith('/'):
+                            debug_log(f"INCLUDE-TRANSLATE {file}")
                             path = Path(file)
-                            #debug_log(f"INCLUDE-TRANSLATE {path}")
                             header_dep = HeaderDep.get(path)
 
                             self.deps.add(header_dep)
@@ -517,27 +626,33 @@ class SourceFile:
                         out.append("BOOL TRUE")
 
                     elif cmd == "MODULE-REPO":
-                        out.append("PATHNAME obj/release")
+                        debug_log(f"MODULE-REPO => PATHNAME {OBJDIR}")
+                        out.append(f"PATHNAME {OBJDIR}")
 
                     elif cmd == "MODULE-IMPORT":
-                        debug_log("MODULE-IMPORT #{path}: #{args}")
-
                         modname = args[0].replace("'", '')
                         mod = CompiledModule.get(modname)
                         cmhash = mod.build(target)
                         self.deps.add(ModuleDep(modname, cmhash))
+                        
+                        path = mod.cmpath.relative_to(OBJDIR)
+                        debug_log(f"MODULE-IMPORT {self.path}: {args} => PATHNAME {path}")
+                        out.append(f"PATHNAME {path}")
 
                     elif cmd == "MODULE-EXPORT":
                         modname = args[0]
-                        debug_log(f"MODULE-EXPORT {modname}")
-                        file = modname.replace("'", '').replace(':', '-')
-                        if file.startswith('/'):
-                            file = "system" + file + ".pcm"
-                        elif file.startswith("./"):
-                            file = file[2:] + ".pcm"
-                        else:
-                            file = file.replace('.', '/') + ".pcm"
-                        out.append(f"PATHNAME {file}")
+                        #debug_log(f"MODULE-EXPORT {modname}")
+                        file = modname.replace("'", '')
+                        cmfile = mod2cm(file)
+                        # .replace(':', '-')
+                        # if file.startswith('/'):
+                        #     file = "system" + file + ".pcm"
+                        # elif file.startswith("./"):
+                        #     file = file[2:] + ".pcm"
+                        # else:
+                        #     file = file.replace('.', '/') + ".pcm"
+                        debug_log(f"MODULE-EXPORT {modname} => {cmfile}")
+                        out.append(f"PATHNAME {cmfile}")
 
                     elif cmd == "MODULE-COMPILED":
                         out.append("OK")
@@ -573,9 +688,14 @@ class SourceFile:
     def compile_clang(self, target):
         deps, header_units = self.clang_get_deps(target)
         
-        print(f"COMPILE {self.path}: ")
+        print(f"BUILDING {self.type} {self.path}")
+        cmdline = self.compiler_cmd()
+        print(*cmdline)
         
-        subprocess.run(self.compiler_cmd(), check=True)
+        result = subprocess.run(cmdline, check=False)
+        if result.returncode != 0:
+            exit(result.returncode)
+
         self.process_makefile_deps()
         return deps
 
@@ -587,56 +707,72 @@ class SourceFile:
             extra_args = ["-xc++-header"]
         else:
             extra_args = ["-xc++"]
-        args = ["clang-scan-deps", "-format=p1689", "--", CXX, *extra_args, f"-fprebuilt-module-path={OBJDIR}", *CCFLAGS, *INCPATH, "-o"+self.objpath, "-c", self.path]
+        args = ["clang-scan-deps", "-format=p1689", "--", CXX, *extra_args, f"-fprebuilt-module-path={OBJDIR}", *CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", self.path]
 
-        stdout, stderr, status = subprocess.run(args, capture_output=True)
+        #print("running", *args)
+        result = subprocess.run(args, capture_output=True)
 
         header_units = []
         #line_match = re.compile('^[a-zA-Z0-9\-_.\/]+:\d+:\d+: error: header file (["<])([a-zA-Z0-9\-_.\/]+)[">] \(aka \'([a-zA-Z0-9\-_.\/]+)\'\) cannot be imported because it is not known to be a header unit\n$')
-        if status.returncode != 0:
-            for line in stderr.decode().splitlines():
-                m = re.match(r'^.*:\d+:\d+: error: header file (["<])([a-zA-Z0-9\-_.\/]+)[">] \(aka \'([a-zA-Z0-9\-_.\/]+)\'\) cannot be imported because it is not known to be a header unit\n$', line)
+        if result.returncode != 0:
+            for line in result.stderr.decode().splitlines():
+                m = re.match(r'^.*:\d+:\d+: error: header file (["<])([a-zA-Z0-9\-_.\/]+)[">] \(aka \'([a-zA-Z0-9\-_.\/]+)\'\) cannot be imported because it is not known to be a header unit$', line)
+                #print("GOT", m, line)
                 if m:
-                    type = 'system_header' if m.group(1) == '<' else 'user_header'
+                    type = SourceType.SYSTEM_HEADER if m.group(1) == '<' else SourceType.USER_HEADER
                     header_path = m.group(3)
-                    srcfile = SourceFile.get(header_path, type)
-                    srcfile.build(target)
-                    if type == 'user_header':
-                        self.deps.add(srcfile)
-                    self.vcpkgs.update(srcfile.vcpkgs)
-                    header_units.append(srcfile.cmpath)
+
+                    print("GOT HEADER PATH", header_path)
+                    mod = CompiledModule.get(header_path, type)
+                    cmhash = mod.build(target)
+                    dep = ModuleDep(header_path, cmhash)
+                    self.deps.add(dep)
+                    header_units.append(mod.cmpath)
+                    #exit(0)
+
+                    #srcfile = SourceFile.get(header_path, type)
+                    #srcfile.build(target)
+                    #if type == SourceType.USER_HEADER:
+                        #self.deps.add(srcfile)
+                    #self.vcpkgs.update(srcfile.vcpkgs)
+                    #header_units.append(srcfile.cmpath)
 
             extra_args += [f"-fmodule-file={f}" for f in header_units]
-            args = ["clang-scan-deps", "-format=p1689", "--", CXX, *extra_args, f"-fprebuilt-module-path={OBJDIR}", *CCFLAGS, *INCPATH, "-o"+self.objpath, "-c", self.path]
-            stdout, stderr, status = subprocess.run(args, capture_output=True)
+            clang_args = self.compiler_cmd_clang(extra_args=extra_args)
+            #args = ["clang-scan-deps", "-format=p1689", "--", CXX, *extra_args,  *CCFLAGS, *CXXFLAGS, *INCPATH, "-o"+str(self.objpath), "-c", self.path]
+            args = ["clang-scan-deps", "-format=p1689", "--", *clang_args]
+            result = subprocess.run(args, capture_output=True)
 
-            if status.returncode != 0:
-                warn("SCANDEPS failed")
-                warn(stderr.decode())
+            if result.returncode != 0:
+                warn("SCANDEPS failed with cmd line:", *args)
+                warn(result.stderr.decode())
                 exit(1)
 
-        p1689 = json.loads(stdout.decode())
-        provides = p1689["rules"][0]["requires"]
-        if self.type == 'module':
-            provides = p1689["rules"][0]["provides"]
-            if not provides or len(provides) != 1:
-                warn(f"wanted module with name {self.modname} in file {self.path} but got something else")
-                exit(1)
+        # print(result.stdout.decode())
+        p1689 = json.loads(result.stdout.decode())
+        for rule in p1689["rules"]:
+            
+            # provides = p1689["rules"][0]["requires"]
+            if self.type == 'module':
+                provides = rule["provides"]
+                if not provides or len(provides) != 1:
+                    warn(f"wanted module with name {self.modname} in file {self.path} but got something else")
+                    exit(1)
 
-            name = provides[0]["logical-name"]
-            if name != self.modname:
-                warn(f"wanted module with name {self.modname} in file {self.path} but got {name}")
-                exit(1)
+                name = provides[0]["logical-name"]
+                if name != self.modname:
+                    warn(f"wanted module with name {self.modname} in file {self.path} but got {name}")
+                    exit(1)
 
-        reqs = p1689["rules"][0]["requires"]
-        if reqs:
-            for req in reqs:
-                modname = req["logical-name"]
-                print(f"about to build dep module {modname}")
-                mod = CompiledModule.get(modname)
-                mod.build(target)
-                self.deps.add(mod)
-        return self.deps, header_units
+            if "requires" in rule:
+                reqs = rule["requires"]
+                for req in reqs:
+                    modname = req["logical-name"]
+                    print(f"about to build dep module {modname}")
+                    mod = CompiledModule.get(modname)
+                    cmhash = mod.build(target)
+                    self.deps.add(ModuleDep(modname, cmhash))
+            return self.deps, header_units
 
     def process_makefile_deps(self):
         if self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER]:
@@ -789,7 +925,7 @@ class HeaderDep:
 
     def find_cpp(self, hfile: Path):
         if hfile.suffix not in HFILE_SUFFIXES:
-            return
+            return None
         
         basename = hfile.with_suffix('')
         for ext in [".cc", ".cpp", ".c"]:
@@ -800,9 +936,17 @@ class HeaderDep:
         #print("!!!!", list(hfile.parts), 'include' in hfile.parts)
         if "include" in hfile.parts:
             parts = list(hfile.parts)
-            parts[parts.index('include')] = 'src'
+            include_index = parts.index('include')
+            parts[include_index] = 'src'
             newpath = Path(*parts)
-            return self.find_cpp(newpath)
+
+            if newpath.parent.is_dir():
+                return self.find_cpp(newpath)
+            
+            # project/include/project/file.h -> project/src/file.h
+            if include_index > 0 and include_index < len(parts) - 2 and parts[include_index-1] == parts[include_index+1]:
+                parts.pop(include_index+1)
+                return self.find_cpp(Path(*parts))
         
         return None
     
@@ -857,7 +1001,7 @@ class CompilationDatabase:
             "arguments": compilation_cmd,
         })
 
-def find_files(paths: Path, suffixes: tuple[str], prefixes: tuple[str] = None):
+def find_files(paths: list[Path], suffixes: tuple[str], prefixes: tuple[str] = None):
     """
     Generator function to yield all files in the given directory
     that end with any of the specified suffixes.
@@ -873,8 +1017,18 @@ def find_files(paths: Path, suffixes: tuple[str], prefixes: tuple[str] = None):
     # print("file", paths)
     suffixes = tuple(suffixes)  # Convert to tuple for faster checks
 
-    for directory in paths:
-        with os.scandir(directory) as entries:
+    for path in paths:
+        if path.is_file():
+            if not path.name.endswith(suffixes):
+                continue
+
+            if prefixes is not None and not path.name.startswith(prefixes):
+                continue
+
+            yield path
+            continue
+
+        with os.scandir(path) as entries:
             for entry in entries:
                 # print("entry", entry)
                 if entry.is_file() and entry.name.endswith(suffixes):
@@ -884,7 +1038,7 @@ def find_files(paths: Path, suffixes: tuple[str], prefixes: tuple[str] = None):
                     yield Path(entry.path)
                     
                 elif entry.is_dir() and not entry.is_symlink() and not entry.name.startswith("."):  # Recurse into subdirectories
-                    yield from find_files([entry.path], suffixes=suffixes, prefixes=prefixes)
+                    yield from find_files([Path(entry.path)], suffixes=suffixes, prefixes=prefixes)
 
 def atomic_write(path: Path, data: str):
     tmpfile = path.with_extra_suffix(".tmp")
@@ -908,13 +1062,59 @@ def shell(*args):
     return result.stdout
 
 def mod2cm(modname):
+    debug_log(f"mod2cm {modname}")
     if modname.startswith('/'):
         path = modname[1:]
     elif modname.startswith('./'):
-        path = modname[2:].removeprefix((SRCDIR + '/', ''))
+        path = Path(modname + '.pcm')
+        path = str(path.relative_to(SRCDIR))
+        return path
+        #path = modname[2:].removeprefix((SRCDIR + '/', ''))
     else:
         path = modname.replace(':', '-')
+
+    #path = path.replace('.', '/')
     return path + ".pcm"
+
+def mod2path(modname: str, type:SourceType):
+    debug_log("mod2path", modname, type)
+    if type == SourceType.USER_HEADER:
+        return Path(modname)
+    
+    if modname.startswith('/'):
+        return Path(modname)
+        
+    if modname.startswith('./'):
+        return Path(modname)
+
+    # puts "modname #{modname.inspect}"
+    path = modname.replace('.', '/')
+
+    if ':' in modname:
+        path = path.replace(':', '/')
+        
+    return path + '.cc'
+    
+    # srcfile =  SRCDIR / path + ".cc"
+
+    #     if not srcfile.exists():
+    #         warn(f"FATAL: Unable to locate module fragment {modname}: the following files does not exist: {srcfile}")
+    #         exit(1)
+    #     return srcfile
+
+
+    # srcfile1 = SRCDIR / (path + ".cc")
+    # if srcfile1.exists():
+    #     return srcfile1
+    
+    # basename = srcfile1.name
+    # srcfile2 = SRCDIR / path / basename
+    
+    # if srcfile2.exists():
+    #     return srcfile2
+    
+    # warn(f"FATAL: Unable to locate module {modname}: the following files do not exist: {srcfile1}, {srcfile2}")
+    # exit(1)
 
 def parse_makefile_rules(text):
     rules = text.replace(':', '').replace('\\\n', '').split()
@@ -930,7 +1130,7 @@ def debug_log(*text):
 def build(path: Path, buildtype: str):
     name = path.with_suffix('')
     target = Target(name, buildtype)
-    target.compile(path, SourceType.CPP)
+    target.compile(path)
     
     os.makedirs(BINDIR, exist_ok=True)
 
@@ -943,8 +1143,8 @@ def vscode(paths: list[Path]):
 def mkpath(path: str) -> Path:
     return Path(os.path.relpath(os.path.abspath(path), os.path.abspath(ROOT)))
 
-def run_tests(dirs: list[str]):
-    dirs = [os.path.abspath(dir) for dir in dirs]
+def run_tool(tool_path: str, dirs: list[str]):
+    dirs = [Path(os.path.abspath(dir)) for dir in dirs]
 
     # change directory to root
     oldwd = None
@@ -953,13 +1153,13 @@ def run_tests(dirs: list[str]):
         os.chdir(ROOT)
 
     
-    testmain_path = mkpath(TESTMAIN)
-    testmain_name = testmain_path.with_suffix('')
-    target = Target(testmain_name, TargetType.EXECUTABLE)
-    target.compile(testmain_path, SourceType.CPP)
+    main_path = mkpath(tool_path)
+    main_name = main_path.with_suffix('')
+    target = Target(main_name, TargetType.EXECUTABLE)
+    target.compile(main_path, SourceType.CPP)
     
     for filename in find_files(dirs, suffixes = ('_test.cc', '_test.cpp')):
-        print("building %s..." % filename)
+        #print("building %s..." % filename)
         path = mkpath(filename)
         target.compile(path, SourceType.CPP)
 
@@ -968,11 +1168,29 @@ def run_tests(dirs: list[str]):
     if oldwd:
         os.chdir(oldwd)
     os.execv(bin, [bin])
+
+
+def run_tests(dirs: list[str]):
+    run_tool(TESTMAIN, dirs)
+
+def run_benchmarks(dirs: list[str]):
+    run_tool(BENCHMAIN, dirs)
         
+def sha256_file(path: Path):
+    with open(path, 'rb', buffering=0) as f:
+        return hashlib.file_digest(f, 'sha256').hexdigest()
 
 ## MAIN ##
-def main():
-    global OBJDIR, DEPDIR, SRCDIR, BINDIR
+def main(
+        OBJDIR=OBJDIR,
+        DEPDIR=DEPDIR, 
+        SRCDIR=SRCDIR, 
+        BINDIR=BINDIR,
+        INCPATH=INCPATH,
+        CXX=CXX, 
+        USECLANG=USECLANG, 
+        SRC_ROOTS=SRC_ROOTS
+):
 
     buildcfg = Release
     parser = argparse.ArgumentParser(
@@ -987,12 +1205,14 @@ def main():
     build_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
     build_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
     build_parser.add_argument('--library', action='store_true', help='build in library mode')
+    build_parser.add_argument('--clang', action='store_true', help='build with clang')
     build_parser.add_argument('args', nargs='*')
 
     run_parser = subparsers.add_parser('run', help='run the specified binary')
     run_parser.add_argument('path', help="path/to/file.cc")
     run_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
     run_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
+    run_parser.add_argument('--clang', action='store_true', help='build with clang')
     run_parser.add_argument('args', nargs='*')
 
     ide_parser = subparsers.add_parser('ide', help='generate a compile_commands.json compilation database')
@@ -1000,16 +1220,31 @@ def main():
 
     test_parser = subparsers.add_parser('test', help='run tests in the specified directories or files')
     test_parser.add_argument('dirs', nargs='+')
+    test_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
+    test_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
+    test_parser.add_argument('--clang', action='store_true', help='build with clang')
+
+    bench_parser = subparsers.add_parser('bench', help='run benchmarks in the specified directories or files')
+    bench_parser.add_argument('dirs', nargs='+')
+    bench_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
+    bench_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
+    bench_parser.add_argument('--clang', action='store_true', help='build with clang')
 
     args = parser.parse_args()
-    if args.cmd in ['build', 'run']:
+
+    g = globals()
+    if args.cmd in ['build', 'run', 'test', 'bench']:
         if args.buildtype == 'debug':
             buildcfg = Debug
         else:
             buildcfg = Release
+
+        if args.clang:
+            g['USECLANG'] = True
+            g['CXX'] = 'clang++'
     
     if args.debug_log:
-        DEBUG_LOG = True
+        g['DEBUG_LOG'] = True
 
     for key, val in buildcfg.__dict__.items():
         if key.startswith('__'):
@@ -1017,10 +1252,11 @@ def main():
 
         globals()[key] = val
 
-    OBJDIR = Path(OBJDIR)
-    DEPDIR = Path(DEPDIR)
-    SRCDIR = Path(SRCDIR)
-    BINDIR = Path(BINDIR)
+    g['OBJDIR'] = Path(OBJDIR)
+    g['DEPDIR'] = Path(DEPDIR)
+    g['SRCDIR'] = Path(SRCDIR)
+    g['BINDIR'] = Path(BINDIR)
+    g['INCPATH'] = INCPATH
 
     if args.cmd == 'build':
         file = args.path
@@ -1050,7 +1286,8 @@ def main():
         os.chdir(ROOT)
 
         if len(args.paths) == 0:
-            paths.append(SRCDIR)
+            for root in SRC_ROOTS:
+                paths.append(Path(root))
 
         else:
             for arg in args.paths:
@@ -1065,6 +1302,11 @@ def main():
     elif args.cmd == "test":
         dirs = args.dirs
         run_tests(dirs)
+
+    elif args.cmd == "bench":
+        dirs = args.dirs
+        run_benchmarks(dirs)
+    
         
 
     else:
