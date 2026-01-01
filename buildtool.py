@@ -230,6 +230,9 @@ class Path():
     def is_dir(self):
         return self.path.is_dir()
     
+    def is_file(self):
+        return self.path.is_file()
+    
     def __fspath__(self) -> str:
         return self.path.__fspath__()
     
@@ -975,7 +978,8 @@ class DirectoryConfig:
                 elif key.startswith('__'):
                     continue
                 else:
-                    raise(Exception(f"unrecognized key {key} in {buildpy_file}"))
+                    #raise(Exception(f"unrecognized key {key} in {buildpy_file}"))
+                    pass
 
             self.buildvars = out
 
