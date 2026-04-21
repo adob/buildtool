@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
 import os
 import json
 import hashlib
@@ -100,7 +101,8 @@ class BuildConfig:
                  BINDIR=BINDIR, 
                  INCFLAGS=INCFLAGS,
                  SUFFIX="",
-                 OUTFILE=None):
+                 OUTFILE=None,
+                 USECLANG=False):
         self.CC = CC
         self.CXX = CXX
         self.CFLAGS = COMPILE_FLAGS + CFLAGS
@@ -113,6 +115,7 @@ class BuildConfig:
         self.INCFLAGS = INCFLAGS
         self.SUFFIX = SUFFIX
         self.OUTFILE = OUTFILE
+        self.USECLANG = USECLANG
 
 class TargetType(Enum):
     EXECUTABLE = 1
@@ -168,7 +171,14 @@ class Path():
             return None
         
         return Path(parent)
+    
+    @property
+    def stem(self):
+        return self.path.stem
 
+    @property
+    def anchor(self):
+        return self.path.anchor
 
     #    paths = [str(p) for p in paths]
     #    normalized = os.path.normpath('/'.join(paths))
@@ -199,10 +209,14 @@ class Path():
         return  str(self.path)
     
     def __truediv__(self, other):
-        if isinstance(other, Path):
-            return Path(self.path / other.path)
-            
-        return Path(self.path / other)
+        if not isinstance(other, Path):
+            other = Path(other)
+
+        p = other.path
+        if p.is_absolute():
+            p = pathlib.Path("SYSTEM") / p.relative_to(p.anchor)
+
+        return Path(self.path / p)
     
     def __rtruediv__(self, other):
         if isinstance(other, Path):
@@ -232,6 +246,9 @@ class Path():
     
     def is_file(self):
         return self.path.is_file()
+    
+    def is_absolute(self):
+        return self.path.is_absolute()
     
     def __fspath__(self) -> str:
         return self.path.__fspath__()
@@ -272,14 +289,14 @@ class CompiledModule:
         # self.cmfile = mod2cm(name)
         # self.cmfile_path = OBJDIR / self.cmfile
 
-    def build(self, target):
+    def build(self, target, inherited_dircfg: DirectoryConfig):
         debug_log("CompiledModule.build()")
         if self.cmhash:
             return self.cmhash
         
         self.srcpath = target.mod2src(self.name, self.type)
         
-        self.srcfile = target.compile(self.srcpath, type=self.type, modname=self.name)
+        self.srcfile = target.compile(self.srcpath, type=self.type, modname=self.name, inherited_dircfg=inherited_dircfg)
 
         self.cmpath = self.srcfile.cmpath
         self.cmhash = sha256_file(self.cmpath)
@@ -296,7 +313,7 @@ class Target:
         self.extra_linkflags = {}
         self.cfg = cfg
 
-    def compile(self, path: Path, type=None, modname: str=None):
+    def compile(self, path: Path, type=None, modname: str=None, inherited_dircfg: DirectoryConfig=None):
         if type is not None:
             pass
         elif path.suffix in CCFILE_SUFFIXES:
@@ -309,7 +326,7 @@ class Target:
             warn("unrecognized file type: %s" % path)
             exit(1)
 
-        file = SourceFile.get(path, self.cfg, type=type, modname=modname)
+        file = SourceFile.get(path, self.cfg, type=type, modname=modname, inherited_dircfg=inherited_dircfg)
         if file in self.processed_files:
             return
         self.processed_files.add(file)
@@ -374,22 +391,27 @@ class Target:
         debug_log("TRYING TO FIND module source file", path)
         failed = []
 
-        for base_path in [SRCDIR, *INCFLAGS]:
-            if isinstance(base_path, str):
-                base_path = base_path.removeprefix("-I").removeprefix("-iquote")
-                base_path = Path(base_path)
+        if path.is_absolute():
+            if path.exists():
+                return path
+            failed.append(str(path))
+        else:
+            for base_path in [SRCDIR, *INCFLAGS]:
+                if isinstance(base_path, str):
+                    base_path = base_path.removeprefix("-I").removeprefix("-iquote")
+                    base_path = Path(base_path)
 
-            full_path = base_path / path
-            debug_log("TRYING", full_path)
-            if full_path.exists():
-                return full_path
-            
-            failed.append(str(full_path))
+                full_path = base_path / path
+                debug_log("TRYING", full_path)
+                if full_path.exists():
+                    return full_path
+                
+                failed.append(str(full_path))
 
-            srcfile2 = full_path.parent / full_path.stem / full_path.name
-            if srcfile2.exists():
-                    return srcfile2
-            failed.append(str(srcfile2))
+                srcfile2 = full_path.parent / full_path.stem / full_path.name
+                if srcfile2.exists():
+                        return srcfile2
+                failed.append(str(srcfile2))
 
         warn(f"FATAL: Unable to locate module {modname}: the following files do not exist: %s" % ', '.join(failed))
         exit(1)
@@ -398,7 +420,7 @@ class SourceFile:
     files = {}
 
     @staticmethod
-    def get(path: Path, cfg: BuildConfig, type: SourceType=None, modname: str=None):
+    def get(path: Path, cfg: BuildConfig, type: SourceType=None, modname: str=None, inherited_dircfg: DirectoryConfig=None):
         file = SourceFile.files.get(path)
         if file:
             if type and file.type and type != file.type:
@@ -406,19 +428,24 @@ class SourceFile:
             if modname and file.modname and modname != file.modname:
                 raise Exception("modname mismatch")
             return file
-        file = SourceFile(path, type=type, modname=modname, cfg=cfg)
+        file = SourceFile(path, type=type, modname=modname, cfg=cfg, inherited_dircfg=inherited_dircfg)
         SourceFile.files[path] = file
         return file
 
-    def __init__(self, path: Path, type: SourceType, modname: str, cfg: BuildConfig):
+    def __init__(self, path: Path, type: SourceType, modname: str, cfg: BuildConfig, inherited_dircfg: DirectoryConfig=None):
         self.path         = path
         self.dirname      = path.parent
         self.type         = type
         self.modname      = modname
         self.processed    = False
         self.output_mtime = 0
+        self.inherited_dircfg = inherited_dircfg
 
-        file_parts        = list(path.relative_to(SRCDIR).parts)
+        if path.is_absolute():
+            file_parts = list(path.parts)
+        else:
+            file_parts = list(path.relative_to(SRCDIR).parts)
+
         for i, part in enumerate(file_parts):
             if part == "..":
                 file_parts[i] = "__PARENT__"
@@ -430,7 +457,7 @@ class SourceFile:
             self.cmpath  = cfg.OBJDIR / mod2cm(modname)
         else:
             self.cmpath  = cfg.OBJDIR / file.with_suffix(".pcm")
-
+        
         self.output_path = self.cmpath if self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER, SourceType.GENERATED_HEADER] else self.objpath
         self.infofile    = cfg.OBJDIR / file.with_suffix(".info")
         self.makefile    = cfg.OBJDIR / file.with_suffix(".make")
@@ -530,7 +557,7 @@ class SourceFile:
         for dep in self.deps:
             if isinstance(dep, ModuleDep):
                 mod = CompiledModule.get(dep.name)
-                new_hash = mod.build(target, cfg)
+                new_hash = mod.build(target, inherited_dircfg=self.dircfg())
 
                 if new_hash != dep.sha256:
                     self.need_recompile = True
@@ -561,11 +588,14 @@ class SourceFile:
 
     @cache
     def dircfg(self):
+        if self.dirname.is_absolute():
+            return self.inherited_dircfg
+        
         return DirectoryConfig.get(self.dirname)
 
     @cache
     def compiler_cmd(self, cfg: BuildConfig):
-        if USECLANG:
+        if cfg.USECLANG:
             cmd = self.compiler_cmd_clang(cfg)
         else:
             cmd = self.compiler_cmd_gcc(cfg)
@@ -615,7 +645,6 @@ class SourceFile:
             f = "-I"+str(Path(*dirparts[:index+2]))
             flags.add(f)
             return
-
         
 
     def compiler_cmd_clang(self, cfg: BuildConfig, extra_args=[]):
@@ -623,7 +652,7 @@ class SourceFile:
         header_units = []
 
         if self.type == SourceType.USER_HEADER:
-            return [cfg.CXX, "-xc++-header", "-fmodule-header=user", f"-fprebuilt-module-path={cfg.OBJDIR}", *cfg.CFLAGS, *cfg.CXXFLAGS, *cfg.INCFLAGS, "-o"+str(self.cmpath), "-c", str(self.path)]
+            return [cfg.CXX, "-xc++-header", "-fmodule-header=user", f"-fprebuilt-module-path={cfg.OBJDIR}", *cfg.CXXFLAGS, *cfg.INCFLAGS, "-o"+str(self.cmpath), *extra_args, str(self.path)]
         
         if self.type == SourceType.SYSTEM_HEADER:
             raise NotImplementedError
@@ -635,7 +664,7 @@ class SourceFile:
                 "-MD", 
                 f"-MF{self.makefile}"
             ]
-            return [cfg.CXX, f"-fprebuilt-module-path={cfg.OBJDIR}", *extra_args1, *extra_args2, *cfg.CLANG_CFLAGS, *cfg.CXXFLAGS, *cfg.INCFLAGS, "-o"+str(self.objpath), "-c", str(self.path)]
+            return [cfg.CXX, f"-fprebuilt-module-path={cfg.OBJDIR}", *extra_args, *extra_args1, *extra_args2, *CLANG_CFLAGS, *cfg.CXXFLAGS, *cfg.INCFLAGS, "-o"+str(self.objpath), "-c", str(self.path)]
         
         
         if self.type == SourceType.CPP:
@@ -657,10 +686,10 @@ class SourceFile:
             args += [*cfg.CFLAGS]
             
         if self.type == SourceType.SYSTEM_HEADER:
-            args += ["-fmodules-ts", "-fmodule-header=system", "-I.", *cfg.CXXFLAGS]
+            args += ["-fmodules-ts", "-fmodule-header=system", "-xc++-system-header", "-I.", *cfg.CXXFLAGS]
 
         elif self.type == SourceType.USER_HEADER:
-            args += ["-fmodules-ts", "-fmodule-header=user", "-iquote.", *cfg.CXXFLAGS]
+            args += ["-fmodules-ts", "-fmodule-header=user", "-xc++-user-header", "-iquote.", *cfg.CXXFLAGS]
 
         elif self.type in [SourceType.CPP, SourceType.MODULE]:
             args += [
@@ -675,6 +704,7 @@ class SourceFile:
 
         if self.type not in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER, SourceType.GENERATED_HEADER]:
             args += ["-o"+str(self.objpath)]
+        #args += ["-o"+str(self.output_path)]
 
         args += ["-c", str(self.path)]
 
@@ -683,7 +713,7 @@ class SourceFile:
     def compile(self, target, cfg: BuildConfig):
         self.header_deps = set()
 
-        if USECLANG:
+        if cfg.USECLANG:
             self.compile_clang(target, cfg)
         else:
             self.compile_gcc(target, cfg)
@@ -697,7 +727,8 @@ class SourceFile:
         # https://splichal.eu/scripts/sphinx/gcc/_build/html/gcc-command-options/c%2B%2B-modules.html
         # https://github.com/urnathan/libcody
         # https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2020/p1184r2.pdf
-        print(f"BUILDING {self.type} {self.path}")
+        print(f"BUILDING {self.type} {self.path}...")
+        start = time.perf_counter()
         if ".." in str(self.path):
             print("TYPE", type(self.path), self.path, id(self.path))
             raise "x"
@@ -779,7 +810,7 @@ class SourceFile:
                     elif cmd == "MODULE-IMPORT":
                         modname = args[0].replace("'", '')
                         mod = CompiledModule.get(modname)
-                        cmhash = mod.build(target, cfg)
+                        cmhash = mod.build(target, inherited_dircfg=self.dircfg())
                         self.deps.add(ModuleDep(modname, cmhash))
                         
                         path = mod.cmpath.relative_to(cfg.OBJDIR)
@@ -790,7 +821,7 @@ class SourceFile:
                         modname = args[0]
                         #debug_log(f"MODULE-EXPORT {modname}")
                         file = modname.replace("'", '')
-                        cmfile = mod2cm(file)
+                        cmfile = Path(".") / mod2cm(file)
                         # .replace(':', '-')
                         # if file.startswith('/'):
                         #     file = "system" + file + ".pcm"
@@ -826,22 +857,32 @@ class SourceFile:
         if exitcode != 0:
             exit(exitcode)
 
+        end = time.perf_counter()
+        print(f"{self.path} done in {end - start:.2f} seconds")
+
     def compile_gcc_c(self, cfg: BuildConfig):
-        print(f"BUILDING {self.type} {self.path}")
+        print(f"BUILDING {self.type} {self.path}...")
         
+        start = time.perf_counter()
         shell(*self.compiler_cmd(cfg))
         self.process_makefile_deps()
+        end = time.perf_counter()
+        #print(f"done in {end - start:.2f} seconds")
 
-    def compile_clang(self, target):
-        deps, header_units = self.clang_get_deps(target)
+    def compile_clang(self, target, cfg: BuildConfig):
+        deps, header_units = self.clang_get_deps(target, cfg)
         
-        print(f"BUILDING {self.type} {self.path}")
-        cmdline = self.compiler_cmd()
+        print(f"BUILDING {self.type} {self.path}...")
+        start = time.perf_counter()
+        cmdline = self.compiler_cmd(cfg)
         print(*cmdline)
         
         result = subprocess.run(cmdline, check=False)
         if result.returncode != 0:
             exit(result.returncode)
+
+        end = time.perf_counter()
+        #print(f"done in {end - start:.2f} seconds")
 
         self.process_makefile_deps()
         return deps
@@ -869,9 +910,9 @@ class SourceFile:
                     type = SourceType.SYSTEM_HEADER if m.group(1) == '<' else SourceType.USER_HEADER
                     header_path = m.group(3)
 
-                    print("GOT HEADER PATH", header_path)
+                    #print("GOT HEADER PATH", header_path)
                     mod = CompiledModule.get(header_path, type)
-                    cmhash = mod.build(target, cfg)
+                    cmhash = mod.build(target, inherited_dircfg=self.dircfg())
                     dep = ModuleDep(header_path, cmhash)
                     self.deps.add(dep)
                     header_units.append(mod.cmpath)
@@ -885,7 +926,7 @@ class SourceFile:
                     #header_units.append(srcfile.cmpath)
 
             extra_args += [f"-fmodule-file={f}" for f in header_units]
-            clang_args = self.compiler_cmd_clang(extra_args=extra_args)
+            clang_args = self.compiler_cmd_clang(cfg, extra_args=extra_args)
             #args = ["clang-scan-deps", "-format=p1689", "--", cfg.CXX, *extra_args,  *CCFLAGS, *CXXFLAGS, *INCFLAGS, "-o"+str(self.objpath), "-c", self.path]
             args = ["clang-scan-deps", "-format=p1689", "--", *clang_args]
             result = subprocess.run(args, capture_output=True)
@@ -917,7 +958,7 @@ class SourceFile:
                     modname = req["logical-name"]
                     print(f"about to build dep module {modname}")
                     mod = CompiledModule.get(modname)
-                    cmhash = mod.build(target, cfg)
+                    cmhash = mod.build(target, inherited_dircfg=self.dircfg())
                     self.deps.add(ModuleDep(modname, cmhash))
             return self.deps, header_units
 
@@ -951,9 +992,18 @@ class DirectoryConfig:
         return cfg
 
     def __init__(self, path: Path):
+        if path.is_absolute():
+            self.dir = None
+            return
+        
         self.dir = path.relative_to(SRCDIR)
 
     def process(self):
+        if self.dir is None:
+            self.buildvars = {}
+            self.linkflags = []
+            return
+        
         buildpy_file = self.dir / 'BUILD.py'
         if not buildpy_file.exists():
             self.buildvars = {}
@@ -1227,7 +1277,7 @@ def shell(*args):
 def mod2cm(modname):
     debug_log(f"mod2cm {modname}")
     if modname.startswith('/'):
-        path = modname[1:]
+        path = modname
     elif modname.startswith('./'):
         path = Path(modname + '.pcm')
         path = str(path.relative_to(SRCDIR))
@@ -1256,7 +1306,7 @@ def mod2path(modname: str, type:SourceType):
     if ':' in modname:
         path = path.replace(':', '/')
         
-    return path + '.cc'
+    return Path(path + '.cc')
     
     # srcfile =  SRCDIR / path + ".cc"
 
@@ -1415,8 +1465,8 @@ def main(
             buildtype = Release
 
         if args.clang:
-            g['USECLANG'] = True
-            g['CXX'] = 'clang++'
+            USECLANG = True
+            CXX = 'clang++'
     
     if args.debug_log:
         g['DEBUG_LOG'] = True
@@ -1427,18 +1477,23 @@ def main(
 
         globals()[key] = val
 
+    build_dir = "release"
+    if buildtype == Debug:
+        build_dir = "debug"
+
     cfg = BuildConfig(
         CC=CC,
         CXX=CXX, 
         CFLAGS=CFLAGS,
         CXXFLAGS=CXXFLAGS,
         LDFLAGS=LDFLAGS,
-        OBJDIR=Path(OBJDIR),
+        OBJDIR=Path(OBJDIR) / build_dir,
         DEPDIR=Path(DEPDIR),
         SRCDIR=Path(SRCDIR),
         BINDIR=Path(BINDIR),
         INCFLAGS=INCFLAGS,
-        SUFFIX=SUFFIX
+        SUFFIX=SUFFIX,
+        USECLANG=USECLANG,
     )
 
     # g['OBJDIR'] = Path(OBJDIR)
