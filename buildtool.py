@@ -29,7 +29,7 @@ COMPILE_FLAGS = ["-pthread", "-fnon-call-exceptions", "-g",
             "-Wno-sign-compare", "-Wno-deprecated", "-Wno-sign-conversion",
             "-Wno-missing-field-initializers",
             "-Werror=shift-count-overflow",
-            "-Werror=return-type",
+            "-Werror=return-type", "-Wno-unused-parameter"
 ]
 CFLAGS = COMPILE_FLAGS
 CLANG_CFLAGS = ["-Wno-logical-op-parentheses"]
@@ -1229,8 +1229,8 @@ def find_files(paths: list[Path], suffixes: tuple[str], prefixes: tuple[str] = N
     # Normalize the suffixes to ensure consistent comparison
     # print("file", paths)
     suffixes = tuple(suffixes)  # Convert to tuple for faster checks
-
     for path in paths:
+        print("file", path)
         if path.is_file():
             if not path.name.endswith(suffixes):
                 continue
