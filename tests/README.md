@@ -9,6 +9,9 @@ python3 -m unittest discover -s tests -v
 The tests use the Python standard library. No GCC, Clang, pkg-config, or
 third-party Python packages are required.
 
+`test_clang_wrapper.py` also has opt-in real compiler tests for the patched
+Clang wrapper. See [build and test instructions](../clang-wrapper/README.md).
+
 CLI builds use `build/release` and `build/debug` for GCC, and `build/release+clang`
 and `build/debug+clang` for Clang. Custom object and dependency roots receive the
 same build-directory suffix, keeping object files, module files, and metadata

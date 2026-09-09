@@ -18,8 +18,10 @@ from uuid import uuid4
 
 if __package__:
     from .vfs import FileSystem, RealFileSystem, MemoryFileSystem
+    from .clang_mapper import compile_with_mapper
 else:
     from vfs import FileSystem, RealFileSystem, MemoryFileSystem
+    from clang_mapper import compile_with_mapper
 
 _DEFAULT_VFS = RealFileSystem()
 
@@ -115,6 +117,7 @@ class BuildConfig:
                  SUFFIX="",
                  OUTFILE=None,
                  USECLANG=False,
+                 CLANG_WRAPPER=None,
                  vfs: FileSystem = _DEFAULT_VFS):
         self.vfs = vfs
         self.CC = CC
@@ -130,6 +133,8 @@ class BuildConfig:
         self.SUFFIX = SUFFIX
         self.OUTFILE = OUTFILE
         self.USECLANG = USECLANG
+        self.CLANG_WRAPPER = CLANG_WRAPPER
+        self.active_modules = set()
         self.source_files: dict[Path, SourceFile] = {}
         self.compiled_modules: dict[str, CompiledModule] = {}
         self.directory_configs: dict[Path, DirectoryConfig] = {}
@@ -146,6 +151,7 @@ class BuildConfig:
         self.directory_configs.clear()
         self.header_deps.clear()
         self.compiler_commands.clear()
+        self.active_modules.clear()
 
 class TargetType(Enum):
     EXECUTABLE = 1
@@ -321,9 +327,14 @@ class CompiledModule:
         if self.cmhash:
             return self.cmhash
         
-        self.srcpath = target.mod2src(self.name, self.type)
-        
-        self.srcfile = target.compile(self.srcpath, type=self.type, modname=self.name, inherited_dircfg=inherited_dircfg)
+        if self.name in target.cfg.active_modules:
+            raise RuntimeError(f"Cyclic module import: {self.name}")
+        target.cfg.active_modules.add(self.name)
+        try:
+            self.srcpath = target.mod2src(self.name, self.type)
+            self.srcfile = target.compile(self.srcpath, type=self.type, modname=self.name, inherited_dircfg=inherited_dircfg)
+        finally:
+            target.cfg.active_modules.remove(self.name)
 
         self.cmpath = self.srcfile.cmpath
         self.cmhash = sha256_file(self.cmpath, target.cfg.vfs)
@@ -543,7 +554,8 @@ class SourceFile:
             elif depname.startswith('module:'):
                 m = re.match(r'module:(.*)@(.*)', depname)
                 name, sha256 = m.groups()
-                self.deps[ModuleDep(name, sha256)] = None
+                source_type = data.get('module_types', {}).get(name)
+                self.deps[ModuleDep(name, sha256, SourceType(source_type) if source_type else None)] = None
                 self.up_to_date = False
 
             elif depname.startswith('include:'):
@@ -589,7 +601,7 @@ class SourceFile:
     def build_deps(self, target, cfg: BuildConfig):
         for dep in self.deps:
             if isinstance(dep, ModuleDep):
-                mod = CompiledModule.get(dep.name, cfg)
+                mod = CompiledModule.get(dep.name, cfg, dep.type)
                 new_hash = mod.build(target, inherited_dircfg=self.dircfg())
 
                 if new_hash != dep.sha256:
@@ -616,6 +628,10 @@ class SourceFile:
             'command': self.compiler_cmd(cfg),
             'deps': deps
         }
+        module_types = {dep.name: dep.type.value for dep in self.deps
+                        if isinstance(dep, ModuleDep) and dep.type is not None}
+        if module_types:
+            out['module_types'] = module_types
         #print(out)
         atomic_write(self.infofile, json.dumps(out, indent=2) + '\n', cfg.vfs)
 
@@ -630,6 +646,10 @@ class SourceFile:
             return cfg.compiler_commands[self]
         if cfg.USECLANG:
             cmd = self.compiler_cmd_clang(cfg)
+            if cfg.CLANG_WRAPPER:
+                # Include the selected backend in incremental command identity.
+                # Runtime pipe descriptors are intentionally excluded.
+                cmd = [cfg.CLANG_WRAPPER, "--", *cmd]
         else:
             cmd = self.compiler_cmd_gcc(cfg)
 
@@ -684,6 +704,15 @@ class SourceFile:
     def compiler_cmd_clang(self, cfg: BuildConfig, extra_args=[]):
         extra_args1 = self.compiler_extra_args()
         header_units = []
+
+        if cfg.CLANG_WRAPPER and self.type in (SourceType.USER_HEADER, SourceType.SYSTEM_HEADER):
+            # The mapper supplies a resolved filename, so no second header
+            # search is needed. Keep inherited package flags and emit a depfile
+            # for the headers textually included by this header unit.
+            flavor = "system" if self.type == SourceType.SYSTEM_HEADER else "user"
+            return [cfg.CXX, "-xc++-header", f"-fmodule-header={flavor}",
+                    *extra_args, *extra_args1, *cfg.CXXFLAGS, *cfg.INCFLAGS,
+                    "-MD", f"-MF{self.makefile}", "-o" + str(self.cmpath), str(self.path)]
 
         if self.type == SourceType.USER_HEADER:
             return [cfg.CXX, "-xc++-header", "-fmodule-header=user", f"-fprebuilt-module-path={cfg.OBJDIR}", *cfg.CXXFLAGS, *cfg.INCFLAGS, "-o"+str(self.cmpath), *extra_args, str(self.path)]
@@ -904,6 +933,16 @@ class SourceFile:
         #print(f"done in {end - start:.2f} seconds")
 
     def compile_clang(self, target, cfg: BuildConfig):
+        if cfg.CLANG_WRAPPER:
+            self.deps = {}
+            self.vcpkgs = set()
+            print(f"BUILDING {self.type} {self.path}...")
+            cfg.vfs.makedirs(self.cmpath.parent, exist_ok=True)
+            compile_with_mapper(
+                cfg.CLANG_WRAPPER, self.compiler_cmd_clang(cfg),
+                lambda request: self.resolve_clang_module(request, target, cfg))
+            self.process_makefile_deps()
+            return self.deps
         deps, header_units = self.clang_get_deps(target, cfg)
         
         print(f"BUILDING {self.type} {self.path}...")
@@ -921,7 +960,31 @@ class SourceFile:
         self.process_makefile_deps()
         return deps
 
+    def resolve_clang_module(self, request, target, cfg):
+        source_type = None
+        if not isinstance(request, dict):
+            raise ValueError("Invalid Clang mapper request")
+        if request.get("kind") == "header":
+            name = request.get("path")
+            if not isinstance(name, str) or not os.path.isabs(name):
+                raise ValueError("Clang mapper requires an absolute header path")
+            # Absolute header identities survive .info reloads and refer to
+            # the same PCM from direct imports and named-module dependencies.
+            name = os.path.normpath(name)
+            source_type = SourceType.SYSTEM_HEADER if request.get("system", False) else SourceType.USER_HEADER
+        elif request.get("kind") == "module":
+            name = request.get("name")
+            if not isinstance(name, str) or not re.fullmatch(r"[\w.]+(?::[\w.]+)?", name):
+                raise ValueError("Invalid Clang module name")
+        else:
+            raise ValueError("Unknown Clang mapper request kind")
+        module = CompiledModule.get(name, cfg, source_type)
+        cmhash = module.build(target, inherited_dircfg=self.dircfg())
+        self.deps[ModuleDep(name, cmhash, source_type)] = None
+        return cfg.vfs.abspath(module.cmpath)
+
     def clang_get_deps(self, target, cfg: BuildConfig):
+        print("clang_get_deps", self.path)
         self.deps = {}
         self.vcpkgs = set()
 
@@ -933,7 +996,7 @@ class SourceFile:
 
         #print("running", *args)
         result = subprocess.run(args, capture_output=True)
-
+        #print(result.stdout.decode(), result.stderr.decode())
         header_units = []
         #line_match = re.compile('^[a-zA-Z0-9\-_.\/]+:\d+:\d+: error: header file (["<])([a-zA-Z0-9\-_.\/]+)[">] \(aka \'([a-zA-Z0-9\-_.\/]+)\'\) cannot be imported because it is not known to be a header unit\n$')
         if result.returncode != 0:
@@ -970,7 +1033,7 @@ class SourceFile:
                 warn(result.stderr.decode())
                 exit(1)
 
-        # print(result.stdout.decode())
+
         p1689 = json.loads(result.stdout.decode())
         for rule in p1689["rules"]:
             
@@ -997,11 +1060,23 @@ class SourceFile:
             return self.deps, header_units
 
     def process_makefile_deps(self):
-        if self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER]:
+        if not self.cfg.CLANG_WRAPPER and self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER]:
             return
         text = self.makefile.read_text(self.cfg.vfs)
         rules = parse_makefile_rules(text)
         for rule in rules:
+            if self.cfg.CLANG_WRAPPER:
+                # PCMs are tracked by ModuleDep hashes, not as input headers.
+                if rule.endswith('.pcm'):
+                    continue
+                if self.cfg.vfs.abspath(rule) == self.cfg.vfs.abspath(self.path):
+                    continue
+                path = Path(rule)
+                dep = HeaderDep.get(path, self.cfg)
+                self.deps[dep] = None
+                if not path.is_absolute():
+                    self.header_deps[dep] = None
+                continue
             if not rule.startswith('/') and rule != self.path:
                 headerdep = HeaderDep.get(Path(rule), self.cfg)
                 self.deps[headerdep] = None
@@ -1013,9 +1088,10 @@ class SourceFile:
 
 
 class ModuleDep:
-    def __init__(self, name, sha256):
+    def __init__(self, name, sha256, type=None):
         self.name = name
         self.sha256 = sha256
+        self.type = type
 
 class DirectoryConfig:
     CACHE_VERSION = 1
@@ -1140,6 +1216,10 @@ class HeaderDep:
         if self.built:
             return
         self.built = True
+        if self.path.is_absolute():
+            # External headers participate in timestamp checks but do not
+            # discover project BUILD.py files or companion source files.
+            return
         #debug_log("HeaderDep.build", self.path)
         
         dirname = self.path.parent
@@ -1368,8 +1448,34 @@ def mod2path(modname: str, type:SourceType):
     # exit(1)
 
 def parse_makefile_rules(text):
-    rules = text.replace(':', '').replace('\\\n', '').split()
-    return rules[1:]
+    # Compiler depfiles escape whitespace, #, backslash and colon with a
+    # backslash, and escape dollar signs as $$. Only the first unescaped
+    # colon separates the target from dependencies (we don't request -MP).
+    text = text.replace('\\\n', '')
+    words, word = [], []
+    dependencies = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == '\\' and i + 1 < len(text):
+            i += 1
+            word.append(text[i])
+        elif ch == ':' and not dependencies:
+            dependencies = True
+            word = []
+        elif ch.isspace():
+            if word and dependencies:
+                words.append(''.join(word))
+            word = []
+        elif ch == '$' and i + 1 < len(text) and text[i + 1] == '$':
+            word.append('$')
+            i += 1
+        else:
+            word.append(ch)
+        i += 1
+    if word and dependencies:
+        words.append(''.join(word))
+    return words
 
 def warn(*s: str):
     print(*s, file=sys.stderr)
@@ -1538,6 +1644,7 @@ def main(
         INCFLAGS=INCFLAGS,
         SUFFIX=SUFFIX,
         USECLANG=USECLANG,
+        CLANG_WRAPPER=os.environ.get("BT_CLANG_WRAPPER") if USECLANG else None,
         vfs=vfs,
     )
 
