@@ -14,6 +14,7 @@ from typing import Dict, Set
 import pathlib
 from enum import Enum, StrEnum
 from dataclasses import dataclass
+from uuid import uuid4
 
 if __package__:
     from .vfs import FileSystem, RealFileSystem, MemoryFileSystem
@@ -41,8 +42,8 @@ CFLAGS = COMPILE_FLAGS
 CLANG_CFLAGS = ["-Wno-logical-op-parentheses"]
 CXXFLAGS = COMPILE_FLAGS + ["-std=c++26"]
 LDFLAGS = ["-lrt"]
-OBJDIR = "obj"
-DEPDIR = "obj"
+OBJDIR = "build"
+DEPDIR = "build"
 SUFFIX = ""
 
 SRCDIR = "."
@@ -336,7 +337,7 @@ class Target:
         self.processed_files = set()
         self.configs = set()
         self.most_recent_output_mtime = 0
-        self.extra_linkflags = {}
+        self.extra_linkflags = []
         self.cfg = cfg
 
     def compile(self, path: Path, type=None, modname: str=None, inherited_dircfg: DirectoryConfig=None):
@@ -376,16 +377,23 @@ class Target:
         extra_flags = []
         
         if self.cfg.OUTFILE is None:
-            ofile = self.cfg.BINDIR / (self.path.name + suffix)
+            name = self.path.name + suffix
         else:
-            ofile = self.cfg.BINDIR / self.cfg.OUTFILE
+            name = self.cfg.OUTFILE
+        ofile = self.cfg.OBJDIR / "bin" / name
+        public_file = self.cfg.BINDIR / name
 
         ofile_mtime = ofile.mtime(self.cfg.vfs)
         if self.most_recent_output_mtime >= ofile_mtime or THIS_MTIME > ofile_mtime:
             lflags = self.get_linkflags()
+            self.cfg.vfs.makedirs(ofile.parent, exist_ok=True)
             print("LINKING", ofile)
             shell(self.cfg.CXX, *extra_flags, *self.objs, *lflags, f"-o{ofile}")
-        return ofile
+        self.cfg.vfs.makedirs(public_file.parent, exist_ok=True)
+        link_target = os.path.relpath(self.cfg.vfs.abspath(ofile),
+                                      self.cfg.vfs.abspath(public_file.parent))
+        atomic_symlink(public_file, link_target, self.cfg.vfs)
+        return public_file
 
     def add_config(self, config):
         if config in self.configs:
@@ -393,12 +401,11 @@ class Target:
         self.configs.add(config)
 
         if config.linkflags:
-            self.extra_linkflags.update(dict.fromkeys(config.linkflags))
+            self.extra_linkflags.extend(config.linkflags)
 
 
     def get_linkflags(self):
-        lflags = dict.fromkeys(self.cfg.LDFLAGS)
-        lflags.update(self.extra_linkflags)
+        lflags = list(self.cfg.LDFLAGS) + self.extra_linkflags
 
         extra = []
 
@@ -407,8 +414,7 @@ class Target:
                 rpath_flag = '-Wl,-rpath,' + flag[2:]
                 extra.append(rpath_flag)
 
-        lflags.update(dict.fromkeys(extra))
-        return list(lflags)
+        return lflags + extra
     
 
     def mod2src(self, modname: str, type: SourceType):
@@ -487,7 +493,8 @@ class SourceFile:
         self.infofile    = cfg.OBJDIR / file.with_suffix(".info")
         self.makefile    = cfg.OBJDIR / file.with_suffix(".make")
         self.mtime       = self.path.mtime(cfg.vfs)
-        self.deps        = set()
+        # Preserve dependency encounter order while deduplicating headers.
+        self.deps        = {}
         self.up_to_date  = None
 
         if type is None:
@@ -536,7 +543,7 @@ class SourceFile:
             elif depname.startswith('module:'):
                 m = re.match(r'module:(.*)@(.*)', depname)
                 name, sha256 = m.groups()
-                self.deps.add(ModuleDep(name, sha256))
+                self.deps[ModuleDep(name, sha256)] = None
                 self.up_to_date = False
 
             elif depname.startswith('include:'):
@@ -545,7 +552,7 @@ class SourceFile:
                 self.up_to_date = False
                 if hfile.mtime(cfg.vfs) >= infofile_mtime:
                     self.need_recompile = True
-                self.deps.add(hfile)
+                self.deps[hfile] = None
 
             else:
                 raise Exception(f"unrecognized dep type: {depname}")
@@ -631,22 +638,22 @@ class SourceFile:
     
     IFLAG_RE = re.compile('^-I')
     def compiler_extra_args(self):
-        flags = set()
+        flags = []
 
         buildvars = self.dircfg().buildvars
         if 'CFLAGS' in buildvars:
             cflags = buildvars['CFLAGS']
 
-            cflags = map(lambda flag: re.sub(self.IFLAG_RE, '-idirafter', flag, 1), cflags)
-            flags.update(cflags)
+            cflags = map(lambda flag: re.sub(self.IFLAG_RE, '-idirafter', flag, count=1), cflags)
+            flags.extend(cflags)
 
         dirparts = list(self.dirname.parts)
         self.add_include(dirparts, flags)
 
         if self.type == SourceType.C:
-            flags.add("-xc")
+            flags.append("-xc")
         elif self.type == SourceType.ASM:
-            flags.add("-xassembler-with-cpp")
+            flags.append("-xassembler-with-cpp")
 
         return flags
     
@@ -656,21 +663,21 @@ class SourceFile:
         try: index = dirparts.index('src')
         except ValueError: pass
         if index >= 0:
-            flags.add("-I"+str(Path(*dirparts[:index], 'include')))
-            flags.add("-iquote"+str(Path(*dirparts[:index], 'src')))
+            flags.append("-I"+str(Path(*dirparts[:index], 'include')))
+            flags.append("-iquote"+str(Path(*dirparts[:index], 'src')))
             return
         
         try: index = dirparts.index('Src')
         except ValueError: pass
         if index >= 0:
-            flags.add("-iquote"+str(Path(*dirparts[:index], 'Inc')))
+            flags.append("-iquote"+str(Path(*dirparts[:index], 'Inc')))
             return
         
         try: index = dirparts.index('deps')
         except ValueError: pass
         if index >= 0:
             f = "-I"+str(Path(*dirparts[:index+2]))
-            flags.add(f)
+            flags.append(f)
             return
         
 
@@ -738,7 +745,7 @@ class SourceFile:
         return args
 
     def compile(self, target, cfg: BuildConfig):
-        self.header_deps = set()
+        self.header_deps = {}
 
         if cfg.USECLANG:
             self.compile_clang(target, cfg)
@@ -784,7 +791,7 @@ class SourceFile:
         mapper_read = os.fdopen(mapper_read, 'r')
         mapper_write = os.fdopen(mapper_write, 'w')
 
-        self.deps = set()
+        self.deps = {}
         self.vcpkgs = set()
 
         try:
@@ -825,8 +832,8 @@ class SourceFile:
                             path = Path(file)
                             header_dep = HeaderDep.get(path, cfg)
 
-                            self.deps.add(header_dep)
-                            self.header_deps.add(header_dep)
+                            self.deps[header_dep] = None
+                            self.header_deps[header_dep] = None
 
                         out.append("BOOL TRUE")
 
@@ -838,7 +845,7 @@ class SourceFile:
                         modname = args[0].replace("'", '')
                         mod = CompiledModule.get(modname, cfg)
                         cmhash = mod.build(target, inherited_dircfg=self.dircfg())
-                        self.deps.add(ModuleDep(modname, cmhash))
+                        self.deps[ModuleDep(modname, cmhash)] = None
                         
                         path = mod.cmpath.relative_to(cfg.OBJDIR)
                         debug_log(f"MODULE-IMPORT {self.path}: {args} => PATHNAME {path}")
@@ -915,7 +922,7 @@ class SourceFile:
         return deps
 
     def clang_get_deps(self, target, cfg: BuildConfig):
-        self.deps = set()
+        self.deps = {}
         self.vcpkgs = set()
 
         if self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER]:
@@ -941,7 +948,7 @@ class SourceFile:
                     mod = CompiledModule.get(header_path, cfg, type)
                     cmhash = mod.build(target, inherited_dircfg=self.dircfg())
                     dep = ModuleDep(header_path, cmhash)
-                    self.deps.add(dep)
+                    self.deps[dep] = None
                     header_units.append(mod.cmpath)
                     #exit(0)
 
@@ -986,7 +993,7 @@ class SourceFile:
                     print(f"about to build dep module {modname}")
                     mod = CompiledModule.get(modname, cfg)
                     cmhash = mod.build(target, inherited_dircfg=self.dircfg())
-                    self.deps.add(ModuleDep(modname, cmhash))
+                    self.deps[ModuleDep(modname, cmhash)] = None
             return self.deps, header_units
 
     def process_makefile_deps(self):
@@ -997,8 +1004,8 @@ class SourceFile:
         for rule in rules:
             if not rule.startswith('/') and rule != self.path:
                 headerdep = HeaderDep.get(Path(rule), self.cfg)
-                self.deps.add(headerdep)
-                self.header_deps.add(headerdep)
+                self.deps[headerdep] = None
+                self.header_deps[headerdep] = None
                 
             elif re.match(VCPKG_INCLUDE_RE, rule):
                 pkg = re.match(VCPKG_INCLUDE_RE, rule).group(1)
@@ -1011,6 +1018,8 @@ class ModuleDep:
         self.sha256 = sha256
 
 class DirectoryConfig:
+    CACHE_VERSION = 1
+
     @classmethod
     def get(cls, path: Path, cfg: BuildConfig):
         if path in cfg.directory_configs:
@@ -1044,7 +1053,15 @@ class DirectoryConfig:
         json_mtime = json_file.mtime(self.cfg.vfs)
         buildrb_mtime = buildpy_file.mtime(self.cfg.vfs)
 
-        if buildrb_mtime > json_mtime or THIS_MTIME > json_mtime:
+        cached = None
+        if buildrb_mtime <= json_mtime and THIS_MTIME <= json_mtime:
+            try:
+                cached = json.loads(json_file.read_text(self.cfg.vfs))
+            except Exception as ex:
+                warn("error reading JSON %s: %s" % (json_file, str(ex)))
+                exit(1)
+
+        if cached is None or cached.get('version') != self.CACHE_VERSION:
             text = try_read(buildpy_file, self.cfg.vfs)
             code = compile(text, buildpy_file, 'exec')
             env = {}
@@ -1065,13 +1082,10 @@ class DirectoryConfig:
 
             self.handle_pkgconfig(self.buildvars)
             self.cfg.vfs.makedirs(json_file.parent, exist_ok=True)
-            atomic_write(json_file, json.dumps(self.buildvars, indent=2), self.cfg.vfs)
+            cached = {'version': self.CACHE_VERSION, 'buildvars': self.buildvars}
+            atomic_write(json_file, json.dumps(cached, indent=2), self.cfg.vfs)
         else:
-            try:
-                self.buildvars = json.loads(json_file.read_text(self.cfg.vfs))
-            except Exception as ex:
-                warn("error reading JSON %s: %s" % (json_file, str(ex)))
-                exit(1)
+            self.buildvars = cached['buildvars']
 
         if 'LDFLAGS' in self.buildvars:
             self.linkflags = self.buildvars['LDFLAGS']
@@ -1082,25 +1096,20 @@ class DirectoryConfig:
         if 'PKGCONFIG' not in buildvars:
             return
         
-        linkflags = set()
-        if 'LDFLAGS' in buildvars:
-            linkflags.update(buildvars['LDFLAGS'])
-
-        cflags = set()
-        if 'CFLAGS' in buildvars:
-            cflags.update(buildvars['CFLAGS'])
+        linkflags = list(buildvars.get('LDFLAGS', []))
+        cflags = list(buildvars.get('CFLAGS', []))
         
         for pkg in buildvars['PKGCONFIG']:
             libs_flags = shlex.split(shell("pkg-config", "--libs", pkg))
             cflags_cur = self.filter_cflags(shlex.split(shell("pkg-config", "--cflags", pkg)))
-            linkflags.update(libs_flags)
-            cflags.update(cflags_cur)
+            linkflags.extend(libs_flags)
+            cflags.extend(cflags_cur)
 
         if linkflags:
-            buildvars['LDFLAGS'] = list(linkflags)
+            buildvars['LDFLAGS'] = linkflags
 
         if cflags:
-            buildvars['CFLAGS'] = list(cflags)
+            buildvars['CFLAGS'] = cflags
             # buildvars['CXXFLAGS'] = list(cflags)
             
     def filter_cflags(self, flags):
@@ -1278,6 +1287,17 @@ def atomic_write(path: Path, data: str, vfs: FileSystem):
     vfs.write_text(tmpfile, data)
     vfs.replace(tmpfile, path)
 
+def atomic_symlink(path: Path, target: str, vfs: FileSystem):
+    tmpfile = path.with_extra_suffix(f".{uuid4().hex}.tmp")
+    vfs.symlink(target, tmpfile)
+    try:
+        vfs.replace(tmpfile, path)
+    finally:
+        try:
+            vfs.unlink(tmpfile)
+        except FileNotFoundError:
+            pass
+
 def try_read(path: Path, vfs: FileSystem):
     try:
         return path.read_text(vfs)
@@ -1363,8 +1383,6 @@ def build(path: Path, cfg: BuildConfig):
     target = Target(name, cfg)
     target.compile(path)
     
-    cfg.vfs.makedirs(cfg.BINDIR, exist_ok=True)
-
     return target.link()
 
 def make_compilation_database(paths: list[Path], cfg: BuildConfig):
@@ -1504,6 +1522,8 @@ def main(
     build_dir = "release"
     if buildtype == Debug:
         build_dir = "debug"
+    if USECLANG:
+        build_dir += "+clang"
 
     cfg = BuildConfig(
         CC=CC,

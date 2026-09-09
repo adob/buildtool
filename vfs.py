@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -41,6 +42,15 @@ class FileSystem(ABC):
 
     @abstractmethod
     def unlink(self, path):
+        pass
+
+    @abstractmethod
+    def symlink(self, target, path):
+        """Create a symbolic link, preserving the target's relative spelling."""
+        pass
+
+    @abstractmethod
+    def readlink(self, path) -> str:
         pass
 
     @abstractmethod
@@ -99,6 +109,12 @@ class RealFileSystem(FileSystem):
     def unlink(self, path):
         os.unlink(path)
 
+    def symlink(self, target, path):
+        os.symlink(target, path)
+
+    def readlink(self, path):
+        return os.readlink(path)
+
     def scandir(self, path):
         with os.scandir(path) as entries:
             return [DirectoryEntry(
@@ -120,15 +136,16 @@ class RealFileSystem(FileSystem):
 
 @dataclass
 class _MemoryEntry:
-    data: bytes | None  # None denotes a directory.
+    data: bytes | None  # None denotes a directory when target is also None.
     mtime: float
+    target: str | None = None
 
 
 class MemoryFileSystem(FileSystem):
     """Files and directories with a virtual cwd and deterministic timestamps.
 
     Each mutation advances the clock; advance() can also simulate elapsed time.
-    This backend does not emulate permissions, symlinks, or external processes.
+    This backend does not emulate permissions or external processes.
     """
 
     def __init__(self, cwd="/workspace"):
@@ -144,18 +161,30 @@ class MemoryFileSystem(FileSystem):
         self._clock += seconds
         return self._clock
 
+    def _resolve(self, path, *, follow_final=True, missing_ok=False, links=0):
+        parts = self.abspath(path).split(os.sep)[1:]
+        current = os.sep
+        for index, part in enumerate(parts):
+            if not part:
+                continue
+            current = os.path.join(current, part)
+            entry = self._entries.get(current)
+            if entry is None:
+                if missing_ok:
+                    return os.path.join(current, *parts[index + 1:])
+                raise FileNotFoundError(current)
+            if entry.target is not None and (follow_final or index < len(parts) - 1):
+                if links >= 40:
+                    raise OSError(errno.ELOOP, "Too many symbolic links", current)
+                target = os.path.join(os.path.dirname(current), entry.target, *parts[index + 1:])
+                return self._resolve(target, follow_final=follow_final,
+                                     missing_ok=missing_ok, links=links + 1)
+            if index < len(parts) - 1 and entry.data is not None:
+                raise NotADirectoryError(current)
+        return current
+
     def _entry(self, path):
-        path = self.abspath(path)
-        # Distinguish a missing child from traversing through a regular file.
-        parent = os.path.dirname(path)
-        if parent != path:
-            entry = self._entry(parent)
-            if entry.data is not None:
-                raise NotADirectoryError(parent)
-        try:
-            return self._entries[path]
-        except KeyError:
-            raise FileNotFoundError(path) from None
+        return self._entries[self._resolve(path)]
 
     def _require_directory(self, path):
         if self._entry(path).data is not None:
@@ -175,14 +204,14 @@ class MemoryFileSystem(FileSystem):
         return entry.data
 
     def write_bytes(self, path, data):
-        path = self.abspath(path)
+        path = self._resolve(path, missing_ok=True)
         self._require_directory(os.path.dirname(path))
         if self.is_dir(path):
             raise IsADirectoryError(path)
         self._entries[path] = _MemoryEntry(bytes(data), self.advance())
 
     def makedirs(self, path, exist_ok=False):
-        path = self.abspath(path)
+        path = self._resolve(path, missing_ok=True)
         if path in self._entries:
             if not exist_ok or self._entries[path].data is not None:
                 raise FileExistsError(path)
@@ -194,29 +223,49 @@ class MemoryFileSystem(FileSystem):
         self._entries[path] = _MemoryEntry(None, self.advance())
 
     def replace(self, source, destination):
-        source, destination = self.abspath(source), self.abspath(destination)
-        entry = self._entry(source)
+        source = self._resolve(source, follow_final=False)
+        destination = self._resolve(destination, follow_final=False, missing_ok=True)
+        entry = self._entries[source]
         self._require_directory(os.path.dirname(destination))
-        if entry.data is None or self.is_dir(destination):
-            raise IsADirectoryError("replace() supports files only")
+        dest_entry = self._entries.get(destination)
+        if (entry.data is None and entry.target is None) or (
+            dest_entry is not None and dest_entry.data is None and dest_entry.target is None
+        ):
+            raise IsADirectoryError("replace() supports files and symbolic links only")
         if source != destination:
             self._entries[destination] = entry
             del self._entries[source]
             self.advance()
 
     def unlink(self, path):
-        path = self.abspath(path)
-        if self._entry(path).data is None:
+        path = self._resolve(path, follow_final=False)
+        entry = self._entries[path]
+        if entry.data is None and entry.target is None:
             raise IsADirectoryError(path)
         del self._entries[path]
         self.advance()
 
+    def symlink(self, target, path):
+        path = self._resolve(path, follow_final=False, missing_ok=True)
+        self._require_directory(os.path.dirname(path))
+        if path in self._entries:
+            raise FileExistsError(path)
+        self._entries[path] = _MemoryEntry(None, self.advance(), os.fspath(target))
+
+    def readlink(self, path):
+        path = self._resolve(path, follow_final=False)
+        target = self._entries[path].target
+        if target is None:
+            raise OSError(errno.EINVAL, "Not a symbolic link", path)
+        return target
+
     def scandir(self, path):
         self._require_directory(path)
-        absolute = self.abspath(path)
+        absolute = self._resolve(path)
         return [DirectoryEntry(
             os.path.join(os.fspath(path), os.path.basename(name)),
-            os.path.basename(name), entry.data is not None, entry.data is None,
+            os.path.basename(name), self.is_file(name), self.is_dir(name),
+            entry.target is not None,
         ) for name, entry in sorted(self._entries.items())
                 if name != absolute and os.path.dirname(name) == absolute]
 
@@ -225,4 +274,4 @@ class MemoryFileSystem(FileSystem):
 
     def chdir(self, path):
         self._require_directory(path)
-        self._cwd = self.abspath(path)
+        self._cwd = self._resolve(path)

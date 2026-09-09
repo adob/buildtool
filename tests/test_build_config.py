@@ -25,8 +25,8 @@ class BuildConfigCacheTests(unittest.TestCase):
         }
 
     def test_same_paths_are_cached_separately_for_each_configuration(self):
-        first_cfg = bt.BuildConfig(vfs=self.fs, CXX="first-c++", OBJDIR="obj/first")
-        second_cfg = bt.BuildConfig(vfs=self.fs, CXX="second-c++", OBJDIR="obj/second")
+        first_cfg = bt.BuildConfig(vfs=self.fs, CXX="first-c++", OBJDIR="build/first")
+        second_cfg = bt.BuildConfig(vfs=self.fs, CXX="second-c++", OBJDIR="build/second")
         first = self.cached_objects(first_cfg)
         second = self.cached_objects(second_cfg)
         for name, value in self.cached_objects(first_cfg).items():
@@ -35,8 +35,8 @@ class BuildConfigCacheTests(unittest.TestCase):
                 self.assertIsNot(value, second[name])
         self.assertEqual(first["command"][0], "first-c++")
         self.assertEqual(second["command"][0], "second-c++")
-        self.assertIn("-oobj/first/main.o", first["command"])
-        self.assertIn("-oobj/second/main.o", second["command"])
+        self.assertIn("-obuild/first/main.o", first["command"])
+        self.assertIn("-obuild/second/main.o", second["command"])
         self.assertIs(bt.SourceFile.get(bt.Path("./main.cc"), first_cfg), first["source"])
         self.assertIs(bt.HeaderDep.get(bt.Path("./header.h"), first_cfg), first["header"])
         self.assertIs(bt.DirectoryConfig.get(bt.Path("./"), first_cfg), first["directory"])

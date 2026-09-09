@@ -12,6 +12,44 @@ import buildtool as bt
 class FileSystemContract:
     """The same operations must behave alike on disk and in memory."""
 
+    def test_relative_symlinks_and_atomic_replacement(self):
+        self.fs.makedirs("bin")
+        self.fs.makedirs("build")
+        self.fs.write_text("build/program", "first")
+        self.fs.symlink("../build/program", "bin/program")
+        self.assertEqual(self.fs.readlink("bin/program"), "../build/program")
+        self.assertEqual(self.fs.read_text("bin/program"), "first")
+        self.assertEqual(self.fs.stat("bin/program"), self.fs.stat("build/program"))
+        entry = self.fs.scandir("bin")[0]
+        self.assertTrue(entry.is_symlink)
+        self.assertTrue(entry.is_file)
+        self.fs.write_text("build/other", "second")
+        self.fs.symlink("../build/other", "bin/temporary")
+        self.fs.replace("bin/temporary", "bin/program")
+        self.assertEqual(self.fs.read_text("bin/program"), "second")
+        self.assertEqual(self.fs.read_text("build/program"), "first")
+        self.fs.unlink("bin/program")
+        self.assertEqual(self.fs.read_text("build/other"), "second")
+
+    def test_dangling_symlink_and_writes_through_links(self):
+        self.fs.symlink("missing", "link")
+        self.assertEqual(self.fs.readlink("link"), "missing")
+        self.assertFalse(self.fs.is_file("link"))
+        with self.assertRaises(FileExistsError):
+            self.fs.symlink("other", "link")
+        self.fs.write_text("link", "created")
+        self.assertEqual(self.fs.read_text("missing"), "created")
+        self.assertEqual(self.fs.readlink("link"), "missing")
+
+    def test_directory_symlink(self):
+        self.fs.makedirs("directory")
+        self.fs.symlink("directory", "link")
+        self.fs.write_text("link/file", "data")
+        self.assertEqual(self.fs.read_text("directory/file"), "data")
+        self.assertEqual(self.fs.scandir("link")[0].name, "file")
+        self.fs.unlink("link")
+        self.assertTrue(self.fs.is_dir("directory"))
+
     def test_text_bytes_and_hash(self):
         self.fs.write_text("text", "hello λ\n")
         self.assertEqual(self.fs.read_text("text"), "hello λ\n")
@@ -133,7 +171,7 @@ class RealFileSystemTests(FileSystemContract, unittest.TestCase):
 class BuildtoolFileSystemTests(unittest.TestCase):
     def setUp(self):
         self.fs = bt.MemoryFileSystem()
-        self.cfg = bt.BuildConfig(vfs=self.fs, DEPDIR="obj")
+        self.cfg = bt.BuildConfig(vfs=self.fs, DEPDIR="build")
 
     def test_path_observes_creation_changes_and_deletion(self):
         path = bt.Path("file")
@@ -190,8 +228,8 @@ class BuildtoolFileSystemTests(unittest.TestCase):
             (source.with_name("other.cc"), "src/other.cc"),
             (source.relative_to("src"), "main.cc"),
             (bt.mod2path("m:part", bt.SourceType.MODULE), "m/part.cc"),
-            (bt.Path("obj") / bt.Path("/usr/include/file.h"),
-             "obj/SYSTEM/usr/include/file.h"),
+            (bt.Path("build") / bt.Path("/usr/include/file.h"),
+             "build/SYSTEM/usr/include/file.h"),
         ]
         for derived, expected in cases:
             with self.subTest(path=expected):

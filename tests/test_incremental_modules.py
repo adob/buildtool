@@ -17,8 +17,8 @@ class BuildDecisionTests(unittest.TestCase):
         )
         self.source.up_to_date = False
         self.source.need_recompile = False
-        self.source.deps = {bt.ModuleDep("value", "old-hash")}
-        self.source.header_deps = set()
+        self.source.deps = {bt.ModuleDep("value", "old-hash"): None}
+        self.source.header_deps = {}
         self.target = mock.Mock(cfg=self.cfg)
         self.events = []
         self.enterContext(mock.patch.object(self.source, "check_up_to_date"))
@@ -68,7 +68,7 @@ class IncrementalModuleTests(unittest.TestCase):
     def setUp(self):
         self.fs = bt.MemoryFileSystem()
         self.cfg = bt.BuildConfig(
-            CXX="fake-c++", OBJDIR="obj", INCFLAGS=[], SRCDIR=".", vfs=self.fs
+            CXX="fake-c++", OBJDIR="build", INCFLAGS=[], SRCDIR=".", vfs=self.fs
         )
         self.calls = []
         self.fail_source = None
@@ -89,11 +89,11 @@ class IncrementalModuleTests(unittest.TestCase):
             raise RuntimeError("compiler failed: " + name)
         contents = json.loads(cfg.vfs.read_text(source.path))
         value = contents.get("value", 0)
-        source.deps = set()
+        source.deps = {}
         for imported in contents.get("imports", []):
             module = bt.CompiledModule.get(imported, cfg)
             digest = module.build(target, inherited_dircfg=source.dircfg())
-            source.deps.add(bt.ModuleDep(imported, digest))
+            source.deps[bt.ModuleDep(imported, digest)] = None
             value += int(cfg.vfs.read_text(module.cmpath))
         self.calls.append(name)
         self.write(source.objpath, json.dumps({"value": value, "source": contents}), vfs=cfg.vfs)
@@ -105,11 +105,11 @@ class IncrementalModuleTests(unittest.TestCase):
         self.calls = []
         target = bt.Target(bt.Path("main"), self.cfg)
         target.compile(bt.Path("main.cc"))
-        return json.loads(self.fs.read_text("obj/main.o"))["value"]
+        return json.loads(self.fs.read_text("build/main.o"))["value"]
 
     def assert_recorded_module_hash(self, importer, module):
-        metadata = json.loads(self.fs.read_text(f"obj/{importer}.info"))
-        digest = bt.sha256_file(bt.Path(f"obj/{module}.pcm"), self.fs)
+        metadata = json.loads(self.fs.read_text(f"build/{importer}.info"))
+        digest = bt.sha256_file(bt.Path(f"build/{module}.pcm"), self.fs)
         self.assertIn(f"module:{module}@{digest}", metadata["deps"])
 
     def test_build_does_not_access_host_files_or_start_a_compiler(self):
@@ -129,7 +129,7 @@ class IncrementalModuleTests(unittest.TestCase):
         self.source("value", value=1)
         self.source("main", imports=["value"])
         other_fs = bt.MemoryFileSystem()
-        other_cfg = bt.BuildConfig(CXX="fake-c++", OBJDIR="obj", vfs=other_fs)
+        other_cfg = bt.BuildConfig(CXX="fake-c++", OBJDIR="build", vfs=other_fs)
         other_fs.write_text("value.cc", json.dumps({"value": 9}))
         other_fs.write_text("main.cc", json.dumps({"imports": ["value"]}))
 
@@ -138,8 +138,8 @@ class IncrementalModuleTests(unittest.TestCase):
         first.compile(bt.Path("main.cc"))
         second = bt.Target(bt.Path("main"), other_cfg)
         second.compile(bt.Path("main.cc"))
-        self.assertEqual(json.loads(self.fs.read_text("obj/main.o"))["value"], 1)
-        self.assertEqual(json.loads(other_fs.read_text("obj/main.o"))["value"], 9)
+        self.assertEqual(json.loads(self.fs.read_text("build/main.o"))["value"], 1)
+        self.assertEqual(json.loads(other_fs.read_text("build/main.o"))["value"], 9)
         self.assertIsNot(bt.CompiledModule.get("value", self.cfg),
                          bt.CompiledModule.get("value", other_cfg))
 
@@ -152,7 +152,7 @@ class IncrementalModuleTests(unittest.TestCase):
         self.calls = []
         bt.Target(bt.Path("main"), other_cfg).compile(bt.Path("main.cc"))
         self.assertEqual(self.calls, [])
-        self.assertEqual(json.loads(other_fs.read_text("obj/main.o"))["value"], 9)
+        self.assertEqual(json.loads(other_fs.read_text("build/main.o"))["value"], 9)
 
     def test_module_edit_recompiles_importer_and_updates_metadata(self):
         self.source("value", value=1)
@@ -161,12 +161,12 @@ class IncrementalModuleTests(unittest.TestCase):
         self.assertEqual(self.calls, ["value.cc", "main.cc"])
         self.assertEqual(self.build(), 1)
         self.assertEqual(self.calls, [])
-        old_object = self.fs.read_bytes("obj/main.o")
+        old_object = self.fs.read_bytes("build/main.o")
 
         self.source("value", value=2)
         self.assertEqual(self.build(), 2)
         self.assertEqual(self.calls, ["value.cc", "main.cc"])
-        self.assertNotEqual(self.fs.read_bytes("obj/main.o"), old_object)
+        self.assertNotEqual(self.fs.read_bytes("build/main.o"), old_object)
         self.assert_recorded_module_hash("main", "value")
         self.assertEqual(self.build(), 2)
         self.assertEqual(self.calls, [])
@@ -189,26 +189,26 @@ class IncrementalModuleTests(unittest.TestCase):
         self.source("value", value=1, implementation="before")
         self.source("main", imports=["value"])
         self.assertEqual(self.build(), 1)
-        old_object = self.fs.read_bytes("obj/main.o")
-        old_metadata = self.fs.read_bytes("obj/main.info")
+        old_object = self.fs.read_bytes("build/main.o")
+        old_metadata = self.fs.read_bytes("build/main.info")
 
         self.source("value", value=1, implementation="after")
         self.assertEqual(self.build(), 1)
         self.assertEqual(self.calls, ["value.cc"])
-        self.assertEqual(self.fs.read_bytes("obj/main.o"), old_object)
-        self.assertEqual(self.fs.read_bytes("obj/main.info"), old_metadata)
+        self.assertEqual(self.fs.read_bytes("build/main.o"), old_object)
+        self.assertEqual(self.fs.read_bytes("build/main.info"), old_metadata)
 
     def test_failed_recompile_does_not_publish_new_dependency_hash(self):
         self.source("value", value=1)
         self.source("main", imports=["value"])
         self.assertEqual(self.build(), 1)
-        old_metadata = self.fs.read_bytes("obj/main.info")
+        old_metadata = self.fs.read_bytes("build/main.info")
 
         self.source("value", value=2)
         self.fail_source = "main.cc"
         with self.assertRaisesRegex(RuntimeError, "compiler failed: main.cc"):
             self.build()
-        self.assertEqual(self.fs.read_bytes("obj/main.info"), old_metadata)
+        self.assertEqual(self.fs.read_bytes("build/main.info"), old_metadata)
 
         self.fail_source = None
         self.assertEqual(self.build(), 2)

@@ -9,6 +9,24 @@ python3 -m unittest discover -s tests -v
 The tests use the Python standard library. No GCC, Clang, pkg-config, or
 third-party Python packages are required.
 
+CLI builds use `build/release` and `build/debug` for GCC, and `build/release+clang`
+and `build/debug+clang` for Clang. Custom object and dependency roots receive the
+same build-directory suffix, keeping object files, module files, and metadata
+separate by compiler.
+
+Real executables live under each build directory's `bin/`, for example
+`build/release/bin/hello` and `build/release+clang/bin/hello`. The public `bin/hello`
+is a relative symlink to the selected build. It is replaced atomically after a
+successful build, including when switching back to an existing build that
+requires no compilation or linking. Debug builds retain the `+debug` filename
+suffix. A failed link leaves the public symlink unchanged.
+
+Compiler and linker flags preserve their declared order and repeated arguments.
+Package flags are appended in `PKGCONFIG` order, and dependency traversal retains
+encounter order when collecting directory linker flags. Older `buildvars.json`
+caches are regenerated once to recover flags previously reordered or removed
+by set-based collection.
+
 ## Injecting a filesystem
 
 Build configurations default to `RealFileSystem`. Tests explicitly pass a
@@ -64,7 +82,7 @@ Build timestamps come from output files.
 The in-memory backend advances a deterministic clock on mutations; `advance()`
 can simulate additional elapsed time. Its working directory is virtual and
 never changes the host process's working directory. It models files and
-directories, not permissions or symlinks.
+directories and symbolic links, but not permissions.
 
 Compiler execution is a separate boundary: subprocesses, their pipes, and
 arbitrary filesystem calls inside user-written `BUILD.py` code are not
@@ -73,6 +91,12 @@ with a fake that reads and writes through the injected filesystem.
 
 ## Coverage
 
+- `FlagOrderTests`: GCC/Clang commands remain unchanged across Python hash seeds;
+  project and package flags retain order and repetitions; dependency ordering
+  survives metadata round trips; old directory caches are regenerated.
+- `CompilerOutputTests`: alternating GCC/Clang CLI builds retain independent
+  outputs and update the public symlink without recompilation or relinking when
+  revisited, in release and debug modes; failures preserve the public entry.
 - `BuildConfigCacheTests`: cache reuse, isolation between configurations on the
   same filesystem, independent resets, and collection of discarded caches.
 - `BuildDecisionTests`: ordering of dependency checks, recompilation, and metadata

@@ -13,8 +13,6 @@ def build(filename: str|list[str], cfg: BuildConfig):
             path = Path(fname)
             target.compile(path)
             
-        cfg.vfs.makedirs(cfg.BINDIR, exist_ok=True)
-
         target.link()
     else:
         path = Path(filename)
