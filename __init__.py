@@ -1,6 +1,7 @@
 from .buildtool import BuildConfig, INCFLAGS, main
 from .buildtool import build as _build, Path, Target, build_compilation_database as _build_compilation_database
-import os
+from .buildtool import reset_build_state
+from .vfs import FileSystem, RealFileSystem, MemoryFileSystem
 
 def build(filename: str|list[str], cfg: BuildConfig):
     if not isinstance(filename, str):
@@ -12,7 +13,7 @@ def build(filename: str|list[str], cfg: BuildConfig):
             path = Path(fname)
             target.compile(path)
             
-        os.makedirs(cfg.BINDIR, exist_ok=True)
+        cfg.vfs.makedirs(cfg.BINDIR, exist_ok=True)
 
         target.link()
     else:
