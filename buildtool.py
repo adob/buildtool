@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import asyncio
 import json
+import hashlib
 import subprocess
 import shlex
 import argparse
@@ -25,12 +26,14 @@ if __package__:
     from .compiler import mapper_pipe, run_compiler
     from .scheduler import BuildSession, Job
     from .memory import MemoryBudget
+    from .gcc_std import GccStdHeaders, GccStdModules, header_unit_flags
 else:
     from vfs import FileSystem, RealFileSystem, MemoryFileSystem
     from clang_mapper import compile_with_mapper_async
     from compiler import mapper_pipe, run_compiler
     from scheduler import BuildSession, Job
     from memory import MemoryBudget
+    from gcc_std import GccStdHeaders, GccStdModules, header_unit_flags
 
 _DEFAULT_VFS = RealFileSystem()
 
@@ -122,12 +125,17 @@ class BuildConfig:
     JOBS: int
     REBUILD: bool
     VERBOSE: bool
+    STD_HEADER_UNIT: bool
     memory: MemoryBudget | None
     source_files: dict[Path, SourceFile]
     compiled_modules: dict[str, CompiledModule]
     directory_configs: dict[Path, DirectoryConfig]
     header_deps: dict[Path, HeaderDep]
     compiler_commands: dict[SourceFile, list[str]]
+    gcc_std_headers: GccStdHeaders
+    gcc_std_modules: GccStdModules
+    std_header_sources: dict[tuple[Path, tuple[str, ...]], SourceFile]
+    std_module_sources: dict[tuple[Path, tuple[str, ...]], SourceFile]
 
     def __init__(
         self,
@@ -149,6 +157,7 @@ class BuildConfig:
         JOBS: int = 1,
         REBUILD: bool = False,
         VERBOSE: bool = False,
+        STD_HEADER_UNIT: bool = True,
         memory: MemoryBudget | None = None,
         vfs: FileSystem = _DEFAULT_VFS,
     ) -> None:
@@ -172,12 +181,17 @@ class BuildConfig:
         self.JOBS = JOBS
         self.REBUILD = REBUILD
         self.VERBOSE = VERBOSE
+        self.STD_HEADER_UNIT = STD_HEADER_UNIT
         self.memory = memory
         self.source_files = {}
         self.compiled_modules = {}
         self.directory_configs = {}
         self.header_deps = {}
         self.compiler_commands = {}
+        self.gcc_std_headers = GccStdHeaders(vfs)
+        self.gcc_std_modules = GccStdModules(vfs)
+        self.std_header_sources = {}
+        self.std_module_sources = {}
 
     def reset_build_state(self) -> None:
         """Clear this configuration's caches, retaining filesystem contents.
@@ -189,6 +203,11 @@ class BuildConfig:
         self.directory_configs.clear()
         self.header_deps.clear()
         self.compiler_commands.clear()
+        self.gcc_std_headers.paths.clear()
+        self.gcc_std_modules.sources.clear()
+        self.gcc_std_modules.fingerprints.clear()
+        self.std_header_sources.clear()
+        self.std_module_sources.clear()
 
 class TargetType(Enum):
     EXECUTABLE = 1
@@ -364,15 +383,16 @@ class CompiledModule:
 
         Runs in the importing parent job, which waits for the module job.
         """
-        self.srcpath = target.mod2src(self.name, self.type)
+        self.srcpath = await target.resolve_module_source(self.name, self.type, inherited_dircfg, parent)
         module_job = target.schedule_compilation_job(
             self.srcpath, type=self.type, modname=self.name,
             inherited_dircfg=inherited_dircfg, parent=parent)
         await parent.wait_for_dependency(module_job)
         self.srcfile = target.job_sources[module_job]
         self.cmpath = self.srcfile.cmpath
-        if self.cmhash is None:
-            self.cmhash = sha256_file(self.cmpath, target.cfg.vfs)
+        if self.srcfile.cmhash is None:
+            self.srcfile.cmhash = sha256_file(self.cmpath, target.cfg.vfs)
+        self.cmhash = self.srcfile.cmhash
         return self.cmhash
 
 class Target:
@@ -435,7 +455,11 @@ class Target:
     ) -> Job:
         """Schedule path once, recording parent order and optional module settings."""
         if type is None:
-            if path.suffix in CCFILE_SUFFIXES:
+            existing = self.cfg.source_files.get(path)
+            if existing is not None:
+                # A header companion may already have been identified by an import.
+                type, modname = existing.type, existing.modname
+            elif path.suffix in CCFILE_SUFFIXES:
                 type = SourceType.CPP
             elif path.suffix == '.c':
                 type = SourceType.C
@@ -550,7 +574,18 @@ class Target:
         return lflags + extra
     
 
+    async def resolve_module_source(self, name: str, type: SourceType,
+                                    directory: DirectoryConfig | None, parent: Job) -> Path:
+        """Resolve name/type, discovering GCC SDK modules with directory flags via parent."""
+        if not self.cfg.USECLANG and type == SourceType.MODULE and name in ('std', 'std.compat'):
+            flags = header_unit_flags([*self.cfg.CXXFLAGS, *self.cfg.INCFLAGS],
+                                      directory.buildvars.get('CFLAGS', []) if directory else [])
+            return Path(await self.cfg.gcc_std_modules.resolve(
+                name, self.cfg.CXX, flags, str(self.cfg.DEPDIR / 'gcc-std-modules'), parent))
+        return self.mod2src(name, type)
+
     def mod2src(self, modname: str | None, type: SourceType) -> Path:
+        """Find modname's interface or header of type in the configured search roots."""
         path = mod2path(modname, type)
         failed = []
 
@@ -565,15 +600,15 @@ class Target:
                     base_path = Path(base_path)
 
                 full_path = base_path / path
-                if full_path.exists(self.cfg.vfs):
-                    return full_path
-                
-                failed.append(str(full_path))
-
-                srcfile2 = full_path.parent / full_path.stem / full_path.name
-                if srcfile2.exists(self.cfg.vfs):
-                        return srcfile2
-                failed.append(str(srcfile2))
+                directory = full_path.with_suffix('')
+                candidates = [full_path]
+                if type == SourceType.MODULE:
+                    candidates.append(directory / 'module.cc')
+                candidates.append(directory / full_path.name)
+                for candidate in candidates:
+                    if candidate.is_file(self.cfg.vfs):
+                        return candidate
+                    failed.append(str(candidate))
 
         raise RuntimeError(f"Unable to locate module {modname}: " + ", ".join(failed))
 
@@ -586,6 +621,31 @@ class SourceFile:
         modname: str | None = None,
         inherited_dircfg: DirectoryConfig | None = None,
     ) -> SourceFile:
+        std_header = type == SourceType.SYSTEM_HEADER and str(path).endswith('/bits/stdc++.h')
+        std_module = type == SourceType.MODULE and modname in ('std', 'std.compat') and path.is_absolute()
+        if not cfg.USECLANG and (std_header or std_module):
+            # The aggregate is requested by many directories. Keep incompatible
+            # command-line configurations in separate source and artifact caches.
+            directory_flags = (inherited_dircfg.buildvars.get('CFLAGS', [])
+                               if inherited_dircfg is not None else [])
+            flags = header_unit_flags([*cfg.CXXFLAGS, *cfg.INCFLAGS], directory_flags)
+            key = (path, (cfg.CXX, *flags))
+            if std_module:
+                # A replaced compiler must not reuse an older module's CMI/object.
+                key = (path, (*key[1], cfg.gcc_std_modules.fingerprints[(cfg.CXX, flags)]))
+            cache = cfg.std_header_sources if std_header else cfg.std_module_sources
+            if key not in cache:
+                source = SourceFile(path, type, modname, cfg, inherited_dircfg)
+                source.std_header_flags = flags
+                variant = hashlib.sha256(json.dumps(key[1]).encode()).hexdigest()[:16]
+                for attribute in ('objpath', 'cmpath', 'infofile', 'makefile'):
+                    original = getattr(source, attribute)
+                    setattr(source, attribute, original.with_extra_suffix('.' + variant))
+                source.output_path = source.cmpath if std_header else source.objpath
+                source.std_header_variant = std_header
+                source.std_module_variant = std_module
+                cache[key] = source
+            return cache[key]
         file = cfg.source_files.get(path)
         if file:
             if type and file.type and type != file.type:
@@ -614,6 +674,10 @@ class SourceFile:
         self.job = None
         self.output_mtime = 0
         self.inherited_dircfg = inherited_dircfg
+        self.std_header_variant = False
+        self.std_module_variant = False
+        self.std_header_flags: tuple[str, ...] = ()
+        self.cmhash = None
 
         if path.is_absolute():
             file_parts = list(path.parts)
@@ -678,6 +742,14 @@ class SourceFile:
             self.need_recompile = True
             debug_log("compiler command changed %s != %s" % (data['command'], self.compiler_cmd(cfg)), log=self.job)
             return
+
+        if (not cfg.USECLANG and self.type not in (SourceType.C, SourceType.ASM)
+                and data.get('std_header_unit', True) != cfg.STD_HEADER_UNIT):
+            # Mapper policy changes are not reflected in the compiler command.
+            # Recompile before loading dependencies recorded under the old mode.
+            self.up_to_date = False
+            self.need_recompile = True
+            return
         
         self.need_recompile = False
         for depname in data['deps']:
@@ -732,11 +804,19 @@ class SourceFile:
 
     async def build_deps(self, target: Target, cfg: BuildConfig) -> None:
         """Schedule recorded dependencies for target/cfg, then compare module hashes."""
+        # Restore module identities before a preceding header schedules the same
+        # path as its companion. Keep job scheduling in dependency encounter order.
+        for dep in self.deps:
+            if isinstance(dep, ModuleDep):
+                mod = CompiledModule.get(dep.name, cfg, dep.type)
+                path = await target.resolve_module_source(mod.name, mod.type, self.dircfg(), self.job)
+                SourceFile.get(path, cfg, type=mod.type, modname=mod.name,
+                               inherited_dircfg=self.dircfg())
         modules = []
         for dep in self.deps:
             if isinstance(dep, ModuleDep):
                 mod = CompiledModule.get(dep.name, cfg, dep.type)
-                path = target.mod2src(mod.name, mod.type)
+                path = await target.resolve_module_source(mod.name, mod.type, self.dircfg(), self.job)
                 target.schedule_compilation_job(
                     path, type=mod.type, modname=mod.name,
                     inherited_dircfg=self.dircfg(), parent=self.job)
@@ -766,6 +846,8 @@ class SourceFile:
             'command': self.compiler_cmd(cfg),
             'deps': deps
         }
+        if not cfg.USECLANG and self.type not in (SourceType.C, SourceType.ASM):
+            out['std_header_unit'] = cfg.STD_HEADER_UNIT
         module_types = {dep.name: dep.type.value for dep in self.deps
                         if isinstance(dep, ModuleDep) and dep.type is not None}
         if module_types:
@@ -796,6 +878,7 @@ class SourceFile:
     
     IFLAG_RE = re.compile('^-I')
     def compiler_extra_args(self) -> list[str]:
+        """Return this source's directory flags and include paths."""
         flags = []
 
         buildvars = self.dircfg().buildvars
@@ -880,6 +963,14 @@ class SourceFile:
                     
 
     def compiler_cmd_gcc(self, cfg: BuildConfig) -> list[str]:
+        if self.std_module_variant:
+            return [cfg.CXX, '-fmodules-ts', *self.std_header_flags,
+                    '-o' + str(self.objpath), '-c', str(self.path)]
+        if self.std_header_variant:
+            # Build with exactly the configuration used for this unit's cache key,
+            # independent of which importing directory requested it first.
+            return [cfg.CXX, '-fmodules-ts', '-fmodule-header=system',
+                    '-xc++-system-header', *self.std_header_flags, '-c', str(self.path)]
         cmd = cfg.CXX
         args = [cmd]
         if self.type in (SourceType.C, SourceType.ASM):
@@ -969,14 +1060,31 @@ class SourceFile:
 
     async def gcc_mapper_request(self, verb: str, args: list[str], target: Target, cfg: BuildConfig) -> str:
         """Answer one GCC verb/args request, scheduling imports under target/cfg."""
+        #if cfg.VERBOSE:
+        #    print("GCC MAPPER REQUEST:", verb, args)
         if verb == 'HELLO':
             return 'HELLO 1 buildtool.py'
         if verb == 'INCLUDE-TRANSLATE':
-            if not args[0].startswith('/'):
+            # Building the aggregate must use textual includes so its own
+            # standard headers cannot request this same unit recursively.
+            if not cfg.STD_HEADER_UNIT or self.std_header_variant:
+                reply = 'BOOL TRUE'
+            elif await cfg.gcc_std_headers.matches(
+                    args[0], cfg.CXX,
+                    [*cfg.CXXFLAGS, *self.compiler_extra_args(), *cfg.INCFLAGS], self.job):
+                module = CompiledModule.get(args[0], cfg, SourceType.SYSTEM_HEADER)
+                digest = await module.build(target, self.dircfg(), self.job)
+                self.deps[ModuleDep(args[0], digest, SourceType.SYSTEM_HEADER)] = None
+                return 'PATHNAME ' + shlex.quote(str(module.cmpath.relative_to(cfg.OBJDIR)))
+            else:
+                # FALSE means unknown, allowing GCC to ask about bits/stdc++.h.
+                # TRUE would mark the original header as explicitly textual.
+                reply = 'BOOL FALSE'
+            if not args[0].startswith('/') or self.std_header_variant or self.std_module_variant:
                 header = HeaderDep.get(Path(args[0]), cfg)
                 self.deps[header] = None
                 self.header_deps[header] = None
-            return 'BOOL TRUE'
+            return reply
         if verb == 'MODULE-REPO':
             return f'PATHNAME {cfg.OBJDIR}'
         if verb == 'MODULE-IMPORT':
@@ -986,6 +1094,8 @@ class SourceFile:
             self.deps[ModuleDep(name, digest)] = None
             return f'PATHNAME {module.cmpath.relative_to(cfg.OBJDIR)}'
         if verb == 'MODULE-EXPORT':
+            if self.std_header_variant or self.std_module_variant:
+                return 'PATHNAME ' + shlex.quote(str(self.cmpath.relative_to(cfg.OBJDIR)))
             # Path joining maps absolute header names under SYSTEM/, matching
             # SourceFile.cmpath. GCC expects a path relative to MODULE-REPO.
             module_path = cfg.OBJDIR / mod2cm(args[0], cfg.SRCDIR)
@@ -1388,6 +1498,10 @@ class CompilationDatabase:
         # dirpath = os.path.dirname(filepath)
         # filename = os.path.basename(filepath)
         compilation_cmd = [str(cmd) for cmd in file.compiler_cmd_clang(cfg)]
+        # clangd builds its own BMIs. The normal build cache may contain GCC CMIs
+        # or Clang BMIs made with a different compiler/configuration.
+        compilation_cmd = [arg for arg in compilation_cmd
+                           if arg != f'-fprebuilt-module-path={cfg.OBJDIR}']
 
         self.entries.append({
             "file": str(path),
@@ -1655,6 +1769,68 @@ def reset_build_state(cfg: BuildConfig) -> None:
     """Start a fresh build invocation for the specified configuration."""
     cfg.reset_build_state()
 
+
+def looks_like_module_interface(path: Path, vfs: FileSystem) -> bool:
+    """Heuristically recognize an export-module declaration in path using vfs.
+
+    This filter is only for header generation; Clang validates the selected
+    inputs. It ignores comments, literals, and preprocessor directive lines,
+    but does not evaluate conditional compilation or expand macros.
+    """
+    source = path.read_text(vfs).replace('\\\n', '')
+    ignored = (r'\b(?:u8|u|U|L)?R"(?P<delimiter>[^ ()\\\t\r\n]{0,16})\(.*?\)(?P=delimiter)"'
+               r'|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\''
+               r'|//[^\n]*|/\*.*?\*/')
+    source = re.sub(ignored, ' ', source, flags=re.DOTALL)
+    source = re.sub(r'^[ \t]*#[^\n]*', '', source, flags=re.MULTILINE)
+    return re.search(r'\bexport\s+module\s+[A-Za-z_]\w*(?:\s*[.:]\s*[A-Za-z_]\w*)*\s*[;\[]',
+                     source) is not None
+
+
+def module_header_sources(directory: Path, vfs: FileSystem) -> Iterator[Path]:
+    """Yield candidate .cc interfaces below directory in sorted order using vfs."""
+    for entry in sorted(vfs.scandir(directory), key=lambda entry: entry.name):
+        if entry.is_symlink:
+            continue
+        path = Path(entry.path)
+        if entry.is_dir and not entry.name.startswith('.') and entry.name != 'generated-headers':
+            yield from module_header_sources(path, vfs)
+        elif entry.is_file and path.suffix == '.cc' and looks_like_module_interface(path, vfs):
+            yield path
+
+
+def generate_module_headers(path: Path, cfg: BuildConfig) -> list[Path]:
+    """Extract interfaces below path with cfg's Clang flags into sibling generated-headers."""
+    # Use project-relative inputs so their BUILD.py settings are loaded even when
+    # the user supplies an absolute scan path.
+    root = Path(os.path.relpath(cfg.vfs.abspath(path), cfg.vfs.getcwd()))
+    if not root.is_dir(cfg.vfs):
+        raise RuntimeError(f'Expected a directory for generate-module-headers: {path}')
+    output_root = Path(cfg.vfs.abspath(root)).parent / 'generated-headers'
+    sources = list(module_header_sources(root, cfg.vfs))
+    if not sources:
+        print(f'No module interfaces found in {path}')
+        return []
+    tool = Path(os.environ.get('BT_MODULE_HEADER',
+        str(pathlib.Path(__file__).resolve().parent / 'build/module-header/module-to-header')))
+    if not tool.is_file(cfg.vfs):
+        raise RuntimeError(f'Module header extractor not found: {tool}. Build module-header with CMake '
+                           '(see module-header/README.md), or set BT_MODULE_HEADER.')
+    resource_dir = shell(cfg.CXX, '-print-resource-dir', verbose=cfg.VERBOSE).strip()
+    if not resource_dir:
+        raise RuntimeError(f'{cfg.CXX} returned an empty Clang resource directory')
+    outputs = []
+    for source in sources:
+        output = output_root / source.relative_to(root).with_suffix('.h')
+        file = SourceFile.get(source, cfg, type=SourceType.MODULE)
+        cfg.vfs.makedirs(output.parent, exist_ok=True)
+        print(f'GENERATING {source} -> {output}', flush=True)
+        shell(tool, source, '-o', output, '--', *file.compiler_extra_args(),
+              *CLANG_CFLAGS, *cfg.CXXFLAGS, *cfg.INCFLAGS,
+              '-resource-dir=' + resource_dir, verbose=cfg.VERBOSE)
+        outputs.append(output)
+    return outputs
+
 ## MAIN ##
 def _main(
     CC: str = CC,
@@ -1700,6 +1876,11 @@ def _main(
     ide_parser = subparsers.add_parser('ide', help='generate a compile_commands.json compilation database')
     ide_parser.add_argument('paths', nargs='*')
 
+    headers_parser = subparsers.add_parser('generate-module-headers',
+        help='recursively generate headers for .cc module interfaces')
+    headers_parser.add_argument('path', help='directory to scan; output goes to sibling generated-headers')
+    headers_parser.add_argument('args', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+
     test_parser = subparsers.add_parser('test', help='run tests in the specified directories or files')
     test_parser.add_argument('dirs', nargs='+')
     test_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
@@ -1715,7 +1896,7 @@ def _main(
         command_parser.add_argument('remaining_paths', nargs=argparse.REMAINDER,
                                     help=argparse.SUPPRESS)
 
-    for command_parser in (build_parser, run_parser, test_parser, bench_parser, ide_parser):
+    for command_parser in (build_parser, run_parser, test_parser, bench_parser, ide_parser, headers_parser):
         command_parser.add_argument('--verbose', '-v', action='store_true', default=argparse.SUPPRESS,
                                     help='print every command and compilation timings')
 
@@ -1724,10 +1905,14 @@ def _main(
                                     dest='buildtype', const='debug', help='build in debug mode')
         command_parser.add_argument('--rebuild', action='store_true',
                                     help='recompile the target and all its dependencies, then relink')
+        command_parser.add_argument('--no-std-header-unit', action='store_true',
+                                    help='disable automatic GCC bits/stdc++.h header-unit imports')
         command_parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
                                     help="maximum active compiler processes (also capped by memory)")
 
     args = parser.parse_args()
+    if args.cmd == 'generate-module-headers' and args.args:
+        parser.error('generate-module-headers accepts exactly one directory; options must precede it')
     if args.cmd in ('ide', 'test', 'bench'):
         paths = args.paths if args.cmd == 'ide' else args.dirs
         paths.extend(args.remaining_paths)
@@ -1743,6 +1928,10 @@ def _main(
             USECLANG = True
             CXX = CLANG_PATH + CLANGXX
             CC = CLANG_PATH + CLANG
+    if args.cmd == 'generate-module-headers':
+        USECLANG = True
+        CXX = os.environ.get('BT_MODULE_HEADER_CLANG', CLANG_PATH + CLANGXX)
+        CC = CLANG_PATH + CLANG
     
     if args.debug_log:
         g['DEBUG_LOG'] = True
@@ -1774,6 +1963,7 @@ def _main(
         JOBS=getattr(args, "jobs", 1),
         REBUILD=getattr(args, 'rebuild', False),
         VERBOSE=args.verbose,
+        STD_HEADER_UNIT=not getattr(args, 'no_std_header_unit', False),
         memory=MemoryBudget() if args.cmd in ('build', 'run', 'test', 'bench') else None,
         vfs=vfs,
     )
@@ -1810,6 +2000,12 @@ def _main(
         if oldwd:
             cfg.vfs.chdir(oldwd)
         os.execv(bin, [bin] + args.args)
+
+    elif args.cmd == 'generate-module-headers':
+        target = mkpath(args.path, vfs=cfg.vfs)
+        if ROOT != '.':
+            cfg.vfs.chdir(ROOT)
+        generate_module_headers(target, cfg)
 
     elif args.cmd == 'ide':
         paths = []

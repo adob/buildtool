@@ -12,11 +12,11 @@ import buildtool as bt
 class CliArgumentTests(unittest.TestCase):
     def test_run_preserves_options_after_target(self) -> None:
         """Only options before the target configure the build; the rest reach execv."""
-        for flags in ([], ['--debug', '--verbose', '-j', '2', '--rebuild']):
+        for flags in ([], ['--debug', '--verbose', '-j', '2', '--rebuild', '--no-std-header-unit']):
             with self.subTest(flags=flags), mock.patch.dict(vars(bt)):
                 fs = bt.MemoryFileSystem()
                 forwarded = ['--option', 'some value', '--verbose', '--debug',
-                             '--help', '--clang', '-j', '0', '--rebuild', '']
+                             '--help', '--clang', '-j', '0', '--rebuild', '--no-std-header-unit', '']
                 argv = ['bt', 'run', *flags, 'src/foo.cc', *forwarded]
                 with mock.patch.object(sys, 'argv', argv), \
                      mock.patch.object(bt, 'ROOT', '.'), \
@@ -28,6 +28,7 @@ class CliArgumentTests(unittest.TestCase):
                 self.assertEqual(str(path), 'src/foo.cc')
                 self.assertEqual(cfg.VERBOSE, bool(flags))
                 self.assertEqual(cfg.REBUILD, bool(flags))
+                self.assertEqual(cfg.STD_HEADER_UNIT, not bool(flags))
                 self.assertFalse(cfg.USECLANG)
                 self.assertEqual(str(cfg.OBJDIR), 'build/debug' if flags else 'build/release')
                 if flags:

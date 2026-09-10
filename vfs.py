@@ -70,6 +70,11 @@ class FileSystem(ABC):
     def abspath(self, path: str | os.PathLike[str]) -> str:
         return os.path.normpath(os.path.join(self.getcwd(), os.fspath(path)))
 
+    @abstractmethod
+    def realpath(self, path: str | os.PathLike[str]) -> str:
+        """Return path's absolute spelling with symbolic links resolved."""
+        pass
+
     def read_text(self, path: str | os.PathLike[str]) -> str:
         return self.read_bytes(path).decode("utf-8")
 
@@ -93,6 +98,10 @@ class FileSystem(ABC):
 
 
 class RealFileSystem(FileSystem):
+    def realpath(self, path: str | os.PathLike[str]) -> str:
+        """Resolve path against the real filesystem."""
+        return os.path.realpath(path)
+
     def stat(self, path: str | os.PathLike[str]) -> os.stat_result:
         return os.stat(path)
 
@@ -194,6 +203,10 @@ class MemoryFileSystem(FileSystem):
 
     def _entry(self, path: str | os.PathLike[str]) -> _MemoryEntry:
         return self._entries[self._resolve(path)]
+
+    def realpath(self, path: str | os.PathLike[str]) -> str:
+        """Resolve path using this virtual filesystem's symbolic links."""
+        return self._resolve(path)
 
     def _require_directory(self, path: str | os.PathLike[str]) -> None:
         if self._entry(path).data is not None:

@@ -12,6 +12,7 @@ class BuildDecisionTests(unittest.TestCase):
     def setUp(self):
         self.fs = bt.MemoryFileSystem()
         self.fs.write_text("main.cc", "")
+        self.fs.write_text("value.cc", "")
         self.cfg = bt.BuildConfig(vfs=self.fs)
         self.source = bt.SourceFile(
             bt.Path("main.cc"), bt.SourceType.CPP, None, self.cfg
@@ -21,6 +22,7 @@ class BuildDecisionTests(unittest.TestCase):
         self.source.deps = {bt.ModuleDep("value", "old-hash"): None}
         self.source.header_deps = {}
         self.target = mock.Mock(cfg=self.cfg)
+        self.target.resolve_module_source = mock.AsyncMock(return_value=bt.Path("value.cc"))
         self.events = []
         self.enterContext(mock.patch.object(self.source, "check_up_to_date"))
         self.enterContext(mock.patch.object(self.source, "dircfg"))
@@ -32,7 +34,7 @@ class BuildDecisionTests(unittest.TestCase):
             self.source, "update",
             side_effect=lambda *args: self.events.append("update"),
         ))
-        self.module = mock.Mock()
+        self.module = bt.CompiledModule("value")
         self.module.build = mock.AsyncMock()
         self.enterContext(mock.patch.object(
             bt.CompiledModule, "get", return_value=self.module

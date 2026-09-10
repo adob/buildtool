@@ -9,6 +9,97 @@ python3 -m unittest discover -s tests -v
 The tests use the Python standard library. No GCC, Clang, pkg-config, or
 third-party Python packages are required.
 
+The optional `test_module_header.py` tests exercise the
+[Clang module-to-header prototype](../module-header/README.md), including linking
+header consumers to a module object. Its executable and matching compiler are
+selected with `BT_TEST_MODULE_HEADER` and `BT_TEST_MODULE_HEADER_CLANG`.
+`test_generate_module_headers.py` covers the `generate-module-headers` subcommand
+using an injected filesystem and mock extractor, including recursive discovery,
+output paths, compiler flags, and failure handling.
+
+## GCC standard-library header units
+
+On GCC 16 and later, a standard include such as `#include <algorithm>` can
+trigger a request for `bits/stdc++.h`. Buildtool builds that aggregate header
+unit on demand and returns its compiled path through the module mapper. This
+also works when a user header unit includes a standard header. Projects that
+never request the aggregate incur no discovery or compilation cost for it.
+
+Use `bt build --no-std-header-unit cmd/hello.cc` to disable automatic translation
+and discovery. The flag also works with `run`, `test`, and `bench` and must appear
+before the first path. Python callers can use `BuildConfig(STD_HEADER_UNIT=False)`.
+Switching this setting recompiles affected GCC C++ sources automatically; no
+`--rebuild` is needed. Explicit header-unit imports remain supported.
+
+`gcc_std.py` identifies the header using the selected compiler's default include
+search, preserving target/sysroot flags but excluding project include paths and
+include-path environment variables. A matching filename suffix alone is not
+enough; the requested file must resolve to the discovered SDK file. The probe
+and compilation run as dependency jobs, releasing a waiting importer's slot.
+Concurrent importers share the work, including with `-j1`.
+
+The aggregate's own includes remain textual to prevent recursive construction.
+Its compiled unit and metadata are stored under the configuration's build
+directory with a compiler/flags hash suffix. Its controlled configuration uses
+global `CXXFLAGS` and `INCFLAGS`, plus directory options affecting the standard
+library. Directory package include paths, warning flags, and ordinary project
+macros do not create separate units or enter their compiler commands. Reserved
+macros (names starting with `_`), `NDEBUG`, and other compiler options remain in
+the configuration, so ABI, target, and language differences still select distinct
+units. Both `-D` and `-U`, joined or separate, are supported. Put any unusual
+nonreserved macro intended to configure the SDK in global `CXXFLAGS`; directory
+project macros are intentionally local to the importing code. Forced includes,
+`-imacros`, and preprocessor passthrough preserve the full directory configuration
+conservatively. Importing source files retain all their own flags.
+
+Header dependencies and content hashes participate in ordinary
+incremental checks; `--rebuild` forces reconstruction.
+
+`test_gcc_std_headers.py` covers SDK identity, symlinks, shadow headers, lazy
+discovery, flag filtering, failures, shared jobs, configuration isolation, and
+incremental invalidation. Run its optional real GCC 16 tests with:
+
+```sh
+BT_TEST_GCC=g++ python3 -m unittest discover -s tests -p test_gcc_std_headers.py -v
+```
+
+## GCC named standard-library modules
+
+`import std;` and `import std.compat;` are discovered on demand using GCC's
+`-print-file-name=libstdc++.modules.json`. Buildtool reads the manifest and resolves
+each `source-path` relative to the manifest directory. This requires a GCC/libstdc++
+installation providing that metadata (tested with GCC 16). Clang's discovery is
+unchanged.
+
+The metadata location is persisted in
+`build/<configuration>/gcc-std-modules/<hash>.json`. The key includes the compiler
+path and file identity, flags, working directory, and driver search environment.
+Fresh builds reread the manifest, but reuse the stored location without launching
+GCC. Missing metadata or sources produce an explicit error.
+
+Named modules use the same controlled flags as the standard header unit, with
+separate CMI, object, and incremental metadata artifacts. For example, the CMI
+is `build/<configuration>/std.pcm.<hash>`; the object and `.info` file live under
+the corresponding `SYSTEM/.../bits/std` path. Compatible importers share the
+artifacts. The mapper returns the CMI and the linker receives the object;
+`std.compat` also builds and links its `std` dependency.
+
+An up-to-date build requires no compiler, discovery, or linker invocation. Editing
+an importer reuses the modules. Module sources, tracked SDK headers, compiler
+identity, and relevant flags invalidate cached modules as appropriate.
+`--rebuild` recompiles them. `--no-std-header-unit` disables automatic header units
+while leaving named standard modules available; those modules use textual
+includes in that mode.
+
+`test_gcc_std_modules.py` covers persistent discovery, configuration isolation,
+dependency invalidation, and failure recovery using a fake filesystem/compiler.
+Its optional real GCC test compiles and links both modules, verifies execution,
+checks no-op and importer-only rebuilds, and tests both header-unit modes:
+
+```sh
+BT_TEST_GCC=g++ python3 -m unittest discover -s tests -p test_gcc_std_modules.py -v
+```
+
 ## Building a directory
 
 `bt build cmd/foo` compiles every immediate `.cc`, `.cpp`, `.c`, `.S`, and `.s`
@@ -26,6 +117,33 @@ including files named `*_test.cc`, are included.
 
 `bt run cmd/foo --option` uses the same directory build but executes the artifact
 directly without publishing it. A directory without `main` cannot be run.
+
+## Named module lookup
+
+`bt ide` refreshes the compilation database, including newly added interfaces and
+partitions. Its commands omit buildtool's automatic `-fprebuilt-module-path` so
+clangd can build its own BMIs with its compiler and flags. GCC CMIs and Clang BMIs
+are not interchangeable even when both have a `.pcm` filename. Explicit custom
+module search paths in user flags remain. Normal compiler commands are unchanged.
+`test_ide_modules.py` checks this separation for both backend configurations.
+
+For `import lib.math;`, buildtool searches each configured source/include root
+in this order: `lib/math.cc`, `lib/math/module.cc`, `lib/math/math.cc`.
+The first existing file wins; all three candidates in an earlier root precede
+those in later roots. Lookup checks file metadata without reading source contents
+or scanning directories. Other filenames are not discovered automatically.
+
+The import identifies the selected file as a module, including for Clang's
+module compilation flags. The compiler validates its declaration. Explicit
+`.cc` file and directory targets do not infer module declarations from source
+contents. A header companion already identified by an import reuses that module
+job, including on incremental builds.
+
+For a library offering headers and modules, `module.cc` avoids the conventional
+header/companion filename collision: without an import identifying it as a module,
+`math.cc` beside `math.h` is still treated as the header's implementation source.
+`test_module_lookup.py` covers metadata-only lookup and optional GCC/Clang builds
+for all three layouts, including imports alongside legacy headers and no-op builds.
 
 ## Parallel compilation and output
 

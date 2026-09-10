@@ -1,0 +1,16 @@
+cmake_minimum_required(VERSION 3.20)
+project(buildtool_module_header LANGUAGES C CXX)
+
+find_package(Clang REQUIRED CONFIG)
+add_executable(module-to-header main.cpp)
+target_compile_features(module-to-header PRIVATE cxx_std_17)
+target_include_directories(module-to-header SYSTEM PRIVATE
+  ${CLANG_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
+separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
+target_compile_options(module-to-header PRIVATE ${LLVM_DEFINITIONS_LIST})
+if(NOT LLVM_ENABLE_RTTI)
+  target_compile_options(module-to-header PRIVATE -fno-rtti)
+endif()
+llvm_map_components_to_libnames(HEADER_LLVM_LIBS native)
+target_link_libraries(module-to-header PRIVATE clangTooling ${HEADER_LLVM_LIBS})
+install(TARGETS module-to-header RUNTIME DESTINATION bin)
