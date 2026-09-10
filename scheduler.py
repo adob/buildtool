@@ -167,6 +167,7 @@ class Job:
         await self.session.slots.acquire(self)
         self.has_slot = True
         try:
+            self.session.compilation_started = True
             yield
         finally:
             if self.has_slot:
@@ -180,24 +181,39 @@ class BuildSession:
         jobs: int = 1,
         output: TextIO | None = None,
         memory: MemoryBudget | None = None,
+        verbose: bool = False,
     ) -> None:
-        """Limit compilers to jobs and optional memory; report text to output (stdout)."""
+        """Limit jobs by memory; write to output, with launch commands when verbose."""
         if jobs < 1:
             raise ValueError('jobs must be at least 1')
         self.output = output if output is not None else sys.stdout
+        self.verbose = verbose
         limit = jobs
+        self.concurrency_message = ''
+        self.compilation_started = False
         if memory is not None:
             available = memory.available()
             limit = memory.job_limit(jobs, available)
             memory_text = ('available memory unknown' if available is None else
-                           f'{available / GIB:.1f} GiB available')
-            self.output.write(f'Concurrency: {limit} compiler jobs '
-                              f'(requested: {jobs}, {memory_text}, '
-                              f'{memory.bytes_per_job / GIB:g} GiB/job estimate)\n')
-            self.output.flush()
+                           f'{available / GIB:.0f} GB available')
+            self.concurrency_message = (
+                f'Concurrency: {limit} compiler jobs '
+                f'(requested: {jobs}, {memory_text}, '
+                f'{memory.bytes_per_job / GIB:.0f} GB/job estimate)\n')
         self.slots = CompilerSlots(limit, memory)
         self.jobs = {}
         self.roots = []
+
+    def report_concurrency(self) -> None:
+        """Print the banner once before streamed output, after compilation starts."""
+        if self.compilation_started and self.concurrency_message:
+            self.output.write(self.concurrency_message)
+            self.concurrency_message = ''
+
+    def report_launch(self, command: str) -> None:
+        """Print command immediately, bypassing job logs, and flush the output stream."""
+        self.report_concurrency()
+        print(f'launching {command}', file=self.output, flush=True)
 
     def schedule(
         self,
@@ -223,6 +239,7 @@ class BuildSession:
             job.log.seek(offset)
             while data := job.log.read(65536):
                 offset += len(data)
+                self.report_concurrency()
                 self.output.write(decoder.decode(data))
                 self.output.flush()
             if job.finished:

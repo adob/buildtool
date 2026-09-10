@@ -13,13 +13,24 @@ third-party Python packages are required.
 
 CLI builds use the CPU count as their requested concurrency. Available memory
 caps this at an estimated **2 GiB per active compiler**, with a minimum of one.
-Startup prints the selected limit, requested limit, and available memory.
+The first compilation prints the selected limit, requested limit, and available
+memory above the first `BUILDING` line. Displayed memory values are rounded to
+whole 1024-based units labeled GB (1 GB here means 1024³ bytes).
+Builds requiring no compilation do not print a concurrency message.
 Set an explicit upper limit with:
 
 ```sh
 bt build -j4 cmd/hello.cc
 bt build --clang -j4 cmd/hello.cc
 ```
+
+`bt build --rebuild cmd/hello.cc` forces recompilation of the target and every
+reachable source, named module, and header unit, followed by relinking. Shared
+dependencies compile once per invocation. It rebuilds the selected compiler and
+configuration; unrelated targets and installed libraries are outside its scope.
+It does not delete build directories or reset configuration caches. The flag
+also works with `run`, `test`, and `bench`; the Python API uses
+`BuildConfig(REBUILD=True)`.
 
 `run`, `test`, and `bench` accept the same `-j` / `--jobs` option. The Python
 API accepts `BuildConfig(JOBS=4)`; its default remains one active compiler.
@@ -53,6 +64,24 @@ another importer happened to start building them first. Compiler stdout and
 stderr share a stream; other jobs' output is buffered, spilling to temporary
 files above 1 MiB per job. Warning output follows the same rules as other output.
 Compiler diagnostics retain colors when the reporter writes to a terminal.
+Compiler commands are printed once, immediately before their first stdout or
+stderr bytes. Silent compilations retain progress messages without command
+lines. Captured tool output used internally (such as pkg-config stdout) does
+not cause a command line to be printed.
+Use `--verbose` (`-v`) to log every command at launch, including silent commands
+and internal tools, and show the `done in ...` timing lines. Each launch prints
+`launching <COMMAND>` directly and flushes immediately, bypassing the ordered
+output queue. These lines follow actual launch order and can appear while an
+earlier job's diagnostics are streaming. Compiler diagnostics retain their
+ordered output queue. The option
+can appear before or after the subcommand, but before the first path; the Python API uses
+`BuildConfig(VERBOSE=True)`. Verbosity does not affect incremental build metadata.
+Use `--debug` (`-d`) to select debug builds independently of verbosity.
+All buildtool options must precede the first source/directory argument.
+For example, `bt run --debug src/foo.cc --option value` builds in debug mode and
+passes `--option value` to the program. After the target, even `--verbose`,
+`--debug`, and `--help` are program arguments. Commands taking multiple paths
+(`ide`, `test`, and `bench`) treat subsequent arguments as paths.
 Redirected output, `TERM=dumb`, and nonempty `NO_COLOR` disable automatic color
 forcing; explicit compiler color flags are preserved. The automatic color flag
 is applied only at execution time, so terminal detection does not affect build
@@ -95,8 +124,9 @@ Set `BT_TEST_GCC` to a GCC executable to enable its GCC case; its Clang case
 uses the same environment variables as the wrapper tests. Optional
 `BT_TEST_GCC_LDFLAGS` and `BT_TEST_CLANG_LDFLAGS` supply linker flags.
 
-CLI builds use `build/release` and `build/debug` for GCC, and `build/release+clang`
-and `build/debug+clang` for Clang. Custom object and dependency roots receive the
+CLI builds use `build/release` or `build/debug` for GCC, and
+`build/release+clang` or `build/debug+clang` for Clang.
+Custom object and dependency roots receive the
 same build-directory suffix, keeping object files, module files, and metadata
 separate by compiler.
 
@@ -182,7 +212,7 @@ with a fake that reads and writes through the injected filesystem.
   survives metadata round trips; old directory caches are regenerated.
 - `CompilerOutputTests`: alternating GCC/Clang CLI builds retain independent
   outputs and update the public symlink without recompilation or relinking when
-  revisited, in release and debug modes; failures preserve the public entry.
+  revisited, with and without verbose output; failures preserve the public entry.
 - `BuildConfigCacheTests`: cache reuse, isolation between configurations on the
   same filesystem, independent resets, and collection of discarded caches.
 - `BuildDecisionTests`: ordering of dependency checks, recompilation, and metadata

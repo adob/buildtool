@@ -17,10 +17,18 @@ else:
     from scheduler import Job
 
 
-async def read_output(stream: asyncio.StreamReader, job: Job, captured: bytearray | None = None) -> None:
-    """Drain stream into job's log, or into the supplied bytearray captured."""
+async def read_output(
+    stream: asyncio.StreamReader,
+    job: Job,
+    captured: bytearray | None = None,
+    command: str | None = None,
+) -> None:
+    """Drain stream into job or captured; prefix displayed output with command once."""
     while data := await stream.read(65536):
         if captured is None:
+            if command is not None:
+                job.message(command)
+                command = None
             job.write(data)
         else:
             captured.extend(data)
@@ -79,14 +87,17 @@ async def run_compiler(
         command += diagnostic_color_flags(job.session.output, command)
     stdout, stderr = bytearray(), bytearray()
     async with job.compiler_slot():
-        job.message(shlex.join(command))
+        command_text = shlex.join(command)
+        if job.session.verbose:
+            job.session.report_launch(command_text)
         process = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE if capture else asyncio.subprocess.STDOUT,
             pass_fds=pass_fds, env=env, start_new_session=True)
         readers = [asyncio.create_task(read_output(
-            process.stdout, job, stdout if capture else None))]
+            process.stdout, job, stdout if capture else None,
+            None if job.session.verbose else command_text))]
         if capture:
             readers.append(asyncio.create_task(read_output(process.stderr, job, stderr)))
         try:

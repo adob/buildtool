@@ -9,8 +9,8 @@ import buildtool as bt
 
 class CompilerOutputTests(unittest.TestCase):
     def test_alternating_compilers_keeps_independent_outputs(self):
-        for debug in [False, True]:
-            with self.subTest(debug=debug), mock.patch.dict(vars(bt)):
+        for debug, verbose in [(False, False), (False, True), (True, False), (True, True)]:
+            with self.subTest(debug=debug, verbose=verbose), mock.patch.dict(vars(bt)):
                 fs = bt.MemoryFileSystem()
                 fs.write_text("main.cc", "int main() {}\n")
                 fs.write_text("BUILD.py", 'CFLAGS = ["-DPROJECT_FLAG"]\n')
@@ -26,7 +26,7 @@ class CompilerOutputTests(unittest.TestCase):
                     compiled.append(cfg.CXX)
                     fs.write_text(source.objpath, cfg.CXX)
 
-                def link(*args):
+                def link(*args, verbose=False):
                     compiler = args[0]
                     objects = [arg for arg in args if str(arg).endswith(".o")]
                     self.assertEqual(len(objects), 1)
@@ -43,11 +43,14 @@ class CompilerOutputTests(unittest.TestCase):
                                        side_effect=compile_source), \
                      mock.patch.object(bt, "shell", side_effect=link):
                     for clang in [False, True, False, True]:
-                        args = ["bt", "build", "main.cc"]
+                        args = ["bt", "build"]
                         if debug:
                             args.append("--debug")
+                        if verbose:
+                            args.append("--verbose")
                         if clang:
                             args.append("--clang")
+                        args.append("main.cc")
                         with mock.patch.object(sys, "argv", args):
                             bt.main(vfs=fs)
                         suffix = "+clang" if clang else ""

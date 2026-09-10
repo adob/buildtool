@@ -74,17 +74,44 @@ class MemoryAccountingTests(unittest.TestCase):
 
 
 class MemorySchedulerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_startup_reports_selected_limit(self) -> None:
-        """Report the memory-capped limit even when no compilation is needed."""
+    async def test_first_compilation_reports_selected_limit_once(self) -> None:
+        """Defer the memory-capped limit until compilation and print it only once."""
         for available, expected in ((5 * GIB, 2), (0, 1), (None, 8)):
             with self.subTest(available=available):
                 output = io.StringIO()
                 session = BuildSession(8, output, MemoryBudget(available=lambda: available))
                 self.assertEqual(session.slots.limit, expected)
+                self.assertEqual(output.getvalue(), '')
+
+                async def compile_job(job: Job) -> None:
+                    """Acquire job's compiler slot and emit a diagnostic."""
+                    async with job.compiler_slot():
+                        job.message('compiling')
+
+                session.schedule('first', compile_job)
+                session.schedule('second', compile_job)
+                await session.finish()
                 self.assertIn(f'Concurrency: {expected} compiler jobs', output.getvalue())
                 self.assertIn('requested: 8', output.getvalue())
-                self.assertIn('2 GiB/job estimate', output.getvalue())
-                await session.finish()
+                self.assertIn('2 GB/job estimate', output.getvalue())
+                if available is not None:
+                    self.assertIn(f'{available / GIB:.0f} GB available', output.getvalue())
+                self.assertEqual(output.getvalue().count('Concurrency:'), 1)
+                self.assertLess(output.getvalue().index('Concurrency:'),
+                                output.getvalue().index('compiling'))
+
+    async def test_up_to_date_jobs_do_not_report_concurrency(self) -> None:
+        """Checking jobs that need no compiler must leave the output empty."""
+        output = io.StringIO()
+        session = BuildSession(8, output, MemoryBudget(available=lambda: 5 * GIB))
+
+        async def up_to_date(job: Job) -> None:
+            """Finish job's dependency check without acquiring a compiler slot."""
+            return
+
+        session.schedule('cached', up_to_date)
+        await session.finish()
+        self.assertEqual(output.getvalue(), '')
 
     async def test_memory_recovery_wakes_queued_compiler(self) -> None:
         """A timer admits queued work after RAM recovers without any job exiting."""

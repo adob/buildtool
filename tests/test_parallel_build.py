@@ -117,6 +117,19 @@ class ParallelBuildTests(unittest.TestCase):
         self.assertEqual(self.maximum_active, 1)
         self.assertEqual(self.calls.count('leaf.cc'), 1)
 
+    def test_forced_rebuild_recompiles_shared_and_transitive_dependencies(self) -> None:
+        """Force unchanged companions and nested modules once each, then return to no-op."""
+        self.write('value.cc', {'imports': ['leaf'], 'value': 42})
+        self.write('leaf.cc', {'value': 7})
+        self.write('unrelated.cc', {})
+        self.build()
+        self.assertEqual(self.build()[1], '')
+        self.cfg.REBUILD = True
+        self.build()
+        self.assertCountEqual(self.calls, ['main.cc', 'a/a.cc', 'b/b.cc', 'value.cc', 'leaf.cc'])
+        self.cfg.REBUILD = False
+        self.assertEqual(self.build()[1], '')
+
     def test_failure_does_not_publish_metadata_or_link(self):
         """A failed companion cannot publish success or update the public binary."""
         self.fail_source = 'a/a.cc'

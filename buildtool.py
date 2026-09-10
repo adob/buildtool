@@ -120,6 +120,8 @@ class BuildConfig:
     USECLANG: bool
     CLANG_WRAPPER: str | None
     JOBS: int
+    REBUILD: bool
+    VERBOSE: bool
     memory: MemoryBudget | None
     source_files: dict[Path, SourceFile]
     compiled_modules: dict[str, CompiledModule]
@@ -145,6 +147,8 @@ class BuildConfig:
         USECLANG: bool = False,
         CLANG_WRAPPER: str | None = None,
         JOBS: int = 1,
+        REBUILD: bool = False,
+        VERBOSE: bool = False,
         memory: MemoryBudget | None = None,
         vfs: FileSystem = _DEFAULT_VFS,
     ) -> None:
@@ -166,6 +170,8 @@ class BuildConfig:
         if JOBS < 1:
             raise ValueError("JOBS must be at least 1")
         self.JOBS = JOBS
+        self.REBUILD = REBUILD
+        self.VERBOSE = VERBOSE
         self.memory = memory
         self.source_files = {}
         self.compiled_modules = {}
@@ -399,7 +405,8 @@ class Target:
         """Build source paths or (path, type, module name, directory config) tuples."""
         async def run() -> None:
             """Schedule this target's roots and consume their ordered output."""
-            self.session = BuildSession(self.cfg.JOBS, memory=self.cfg.memory)
+            self.session = BuildSession(self.cfg.JOBS, memory=self.cfg.memory,
+                                        verbose=self.cfg.VERBOSE)
             self.job_sources = {}
             self.link_events = {}
             try:
@@ -490,11 +497,12 @@ class Target:
         public_file = self.cfg.BINDIR / name
 
         ofile_mtime = ofile.mtime(self.cfg.vfs)
-        if self.most_recent_output_mtime >= ofile_mtime or THIS_MTIME > ofile_mtime:
+        if self.cfg.REBUILD or self.most_recent_output_mtime >= ofile_mtime or THIS_MTIME > ofile_mtime:
             lflags = self.get_linkflags()
             self.cfg.vfs.makedirs(ofile.parent, exist_ok=True)
             print("LINKING", ofile)
-            shell(self.cfg.CXX, *extra_flags, *self.objs, *lflags, f"-o{ofile}")
+            shell(self.cfg.CXX, *extra_flags, *self.objs, *lflags, f"-o{ofile}",
+                  verbose=self.cfg.VERBOSE)
         self.cfg.vfs.makedirs(public_file.parent, exist_ok=True)
         link_target = os.path.relpath(self.cfg.vfs.abspath(ofile),
                                       self.cfg.vfs.abspath(public_file.parent))
@@ -627,6 +635,11 @@ class SourceFile:
 
     def check_up_to_date(self, cfg: BuildConfig) -> None:
         if self.up_to_date is not None:
+            return
+        if cfg.REBUILD:
+            # Rediscover dependencies through the compiler, including header units.
+            self.up_to_date = False
+            self.need_recompile = True
             return
         
         infofile_mtime = self.infofile.mtime(cfg.vfs)
@@ -885,6 +898,8 @@ class SourceFile:
 
     async def compile(self, target: Target, cfg: BuildConfig) -> None:
         """Compile for target/cfg using its selected asynchronous backend."""
+        # Let the reporter emit its banner before this backend's BUILDING line.
+        self.job.session.compilation_started = True
         self.header_deps = {}
 
         if cfg.USECLANG:
@@ -934,7 +949,8 @@ class SourceFile:
                                pass_fds=(read_fd, write_fd),
                                env=dict(os.environ, SOURCE_DATE_EPOCH='0'),
                                color_diagnostics=True)
-        self.job.message(f"{self.path} done in {time.perf_counter() - start:.2f} seconds")
+        if cfg.VERBOSE:
+            self.job.message(f"{self.path} done in {time.perf_counter() - start:.2f} seconds")
 
     async def gcc_mapper_request(self, verb: str, args: list[str], target: Target, cfg: BuildConfig) -> str:
         """Answer one GCC verb/args request, scheduling imports under target/cfg."""
@@ -1060,6 +1076,8 @@ class SourceFile:
             result = await run_compiler(self.job, args, capture=True)
 
             if result.returncode != 0:
+                if result.stderr and not cfg.VERBOSE:
+                    self.job.message(shlex.join(list(map(str, args))))
                 self.job.write(result.stderr)
                 raise subprocess.CalledProcessError(result.returncode, args)
 
@@ -1206,6 +1224,8 @@ class DirectoryConfig:
         cflags = list(buildvars.get('CFLAGS', []))
         
         output_options = {"log": log} if log is not None else {}
+        if self.cfg.VERBOSE:
+            output_options['verbose'] = True
         for pkg in buildvars['PKGCONFIG']:
             libs_flags = shlex.split(shell("pkg-config", "--libs", pkg, **output_options))
             cflags_cur = self.filter_cflags(shlex.split(shell("pkg-config", "--cflags", pkg, **output_options)))
@@ -1423,17 +1443,27 @@ def try_read(path: Path, vfs: FileSystem) -> str | None:
     except FileNotFoundError:
         return None
     
-def shell(*args: str | os.PathLike[str], log: Job | None = None) -> str:
-    """Run args synchronously, returning stdout and sending diagnostics to log."""
+def shell(*args: str | os.PathLike[str], log: Job | None = None, verbose: bool = False) -> str:
+    """Run args, returning stdout; send diagnostics to log and echo launches if verbose."""
+    cmd = shlex.join(list(map(str, args)))
+    if verbose:
+        if log is not None:
+            log.session.report_launch(cmd)
+        else:
+            print(f'launching {cmd}', flush=True)
     if log is not None:
-        log.message(shlex.join(list(map(str, args))))
         result = subprocess.run(args, capture_output=True, text=True)
-        log.write(result.stderr)
+        if result.stderr:
+            if not verbose:
+                log.message(cmd)
+            log.write(result.stderr)
         result.check_returncode()
         return result.stdout
-    cmd = " ".join(shlex.quote(str(arg)) for arg in args)
-    print(cmd)
-    result = subprocess.run(args, shell=False, text=True, stdin=0, stdout=subprocess.PIPE, stderr=2)
+    result = subprocess.run(args, shell=False, text=True, stdin=0, capture_output=True)
+    if result.stderr:
+        if not verbose:
+            print(cmd, flush=True)
+        print(result.stderr, end='', file=sys.stderr, flush=True)
     if result.returncode != 0:
         exit(1)
     return result.stdout
@@ -1616,25 +1646,26 @@ def _main(
     buildcfg = Release
     parser = argparse.ArgumentParser(
         prog        = 'buildtool',
-        description = 'Utility for compiling and running C++ programs'
+        description = 'Utility for compiling and running C++ programs',
+        allow_abbrev=False,
     )
     parser.add_argument('--debug-log', action='store_true', help='enable debug logging')
+    parser.add_argument('--verbose', '-v', action='store_true', help='print every command and compilation timings')
     subparsers = parser.add_subparsers(dest='cmd')
     
     build_parser = subparsers.add_parser('build', help='build the specified binary or library')
     build_parser.add_argument('path', help="path/to/file.cc")
     build_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
-    build_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
     build_parser.add_argument('--library', action='store_true', help='build in library mode')
     build_parser.add_argument('--clang', action='store_true', help='build with clang')
-    build_parser.add_argument('args', nargs='*')
+    build_parser.add_argument('args', nargs=argparse.REMAINDER)
 
     run_parser = subparsers.add_parser('run', help='run the specified binary')
     run_parser.add_argument('path', help="path/to/file.cc")
     run_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
-    run_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
     run_parser.add_argument('--clang', action='store_true', help='build with clang')
-    run_parser.add_argument('args', nargs='*')
+    run_parser.add_argument('args', nargs=argparse.REMAINDER,
+                            help='arguments passed to the program')
 
     ide_parser = subparsers.add_parser('ide', help='generate a compile_commands.json compilation database')
     ide_parser.add_argument('paths', nargs='*')
@@ -1642,20 +1673,34 @@ def _main(
     test_parser = subparsers.add_parser('test', help='run tests in the specified directories or files')
     test_parser.add_argument('dirs', nargs='+')
     test_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
-    test_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
     test_parser.add_argument('--clang', action='store_true', help='build with clang')
 
     bench_parser = subparsers.add_parser('bench', help='run benchmarks in the specified directories or files')
     bench_parser.add_argument('dirs', nargs='+')
     bench_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
-    bench_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
     bench_parser.add_argument('--clang', action='store_true', help='build with clang')
 
+    for command_parser in (ide_parser, test_parser, bench_parser):
+        # Capture option-looking filenames after the first path as positional args.
+        command_parser.add_argument('remaining_paths', nargs=argparse.REMAINDER,
+                                    help=argparse.SUPPRESS)
+
+    for command_parser in (build_parser, run_parser, test_parser, bench_parser, ide_parser):
+        command_parser.add_argument('--verbose', '-v', action='store_true', default=argparse.SUPPRESS,
+                                    help='print every command and compilation timings')
+
     for command_parser in (build_parser, run_parser, test_parser, bench_parser):
+        command_parser.add_argument('--debug', '-d', action='store_const',
+                                    dest='buildtype', const='debug', help='build in debug mode')
+        command_parser.add_argument('--rebuild', action='store_true',
+                                    help='recompile the target and all its dependencies, then relink')
         command_parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
                                     help="maximum active compiler processes (also capped by memory)")
 
     args = parser.parse_args()
+    if args.cmd in ('ide', 'test', 'bench'):
+        paths = args.paths if args.cmd == 'ide' else args.dirs
+        paths.extend(args.remaining_paths)
     if getattr(args, "jobs", 1) < 1:
         parser.error("--jobs must be at least 1")
 
@@ -1664,9 +1709,6 @@ def _main(
     if args.cmd in ['build', 'run', 'test', 'bench']:
         if args.buildtype == 'debug':
             buildtype = Debug
-        else:
-            buildtype = Release
-
         if args.clang:
             USECLANG = True
             CXX = CLANG_PATH + CLANGXX
@@ -1681,9 +1723,7 @@ def _main(
 
         globals()[key] = val
 
-    build_dir = "release"
-    if buildtype == Debug:
-        build_dir = "debug"
+    build_dir = "debug" if buildtype == Debug else "release"
     if USECLANG:
         build_dir += "+clang"
 
@@ -1702,6 +1742,8 @@ def _main(
         USECLANG=USECLANG,
         CLANG_WRAPPER=os.environ.get("BT_CLANG_WRAPPER") if USECLANG else None,
         JOBS=getattr(args, "jobs", 1),
+        REBUILD=getattr(args, 'rebuild', False),
+        VERBOSE=args.verbose,
         memory=MemoryBudget() if args.cmd in ('build', 'run', 'test', 'bench') else None,
         vfs=vfs,
     )

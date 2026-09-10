@@ -70,6 +70,20 @@ class ParallelCompilerTests(unittest.TestCase):
                     bt.build(bt.Path('main.cc'), cfg)
                 self.assertEqual(output.getvalue(), '')
                 self.assertEqual(before, {p: p.stat().st_mtime_ns for p in before})
+                cfg.REBUILD = True
+                cfg.reset_build_state()
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    bt.build(bt.Path('main.cc'), cfg)
+                rebuilt = [line for line in output.getvalue().splitlines()
+                           if line.startswith('BUILDING ')]
+                self.assertEqual(rebuilt, starts)
+                self.assertIn('LINKING ', output.getvalue())
+                self.assertEqual(subprocess.run([os.path.abspath(binary)]).returncode, 0)
+                cfg.REBUILD = False
+                cfg.reset_build_state()
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    bt.build(bt.Path('main.cc'), cfg)
+                self.assertEqual(output.getvalue(), '')
                 Path('shared.h').write_text('inline int shared() { return 3; }\n')
                 cfg.reset_build_state()
                 with contextlib.redirect_stdout(io.StringIO()):
