@@ -27,7 +27,8 @@ cfg = bt.BuildConfig(vfs=fs, CXX="clang++" if clang else "g++", CXXFLAGS=[], USE
 source = bt.SourceFile.get(bt.Path("main.cc"), cfg)
 command = source.compiler_cmd(cfg)
 fs.makedirs(source.infofile.parent, exist_ok=True)
-fs.write_text(source.infofile, json.dumps({"command": command if saved is None else saved, "deps": []}))
+fs.write_text(source.infofile, json.dumps({"command": command if saved is None else saved,
+                                         "tags": sorted(cfg.TAGS), "deps": []}))
 source.check_up_to_date(cfg)
 print(json.dumps({"command": command, "need_recompile": source.need_recompile}))
 '''

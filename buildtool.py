@@ -24,14 +24,14 @@ if __package__:
     from .vfs import FileSystem, RealFileSystem, MemoryFileSystem
     from .clang_mapper import compile_with_mapper_async
     from .compiler import mapper_pipe, run_compiler
-    from .scheduler import BuildSession, Job
+    from .scheduler import BuildSession, ConcurrencyReporter, Job
     from .memory import MemoryBudget
     from .gcc_std import GccStdHeaders, GccStdModules, header_unit_flags
 else:
     from vfs import FileSystem, RealFileSystem, MemoryFileSystem
     from clang_mapper import compile_with_mapper_async
     from compiler import mapper_pipe, run_compiler
-    from scheduler import BuildSession, Job
+    from scheduler import BuildSession, ConcurrencyReporter, Job
     from memory import MemoryBudget
     from gcc_std import GccStdHeaders, GccStdModules, header_unit_flags
 
@@ -104,6 +104,42 @@ class Debug:
 CCFILE_SUFFIXES = ('.cc', '.cpp')
 HFILE_SUFFIXES  = ('.h', '.hpp', '.hh')
 
+def native_tags() -> frozenset[str]:
+    """Return default native platform tags; explicit configurations replace this set."""
+    name = re.sub(r'\d+$', '', sys.platform)
+    name = {'win': 'windows', 'sunos': 'solaris'}.get(name, name)
+    tags = {name}
+    if name in ('aix', 'android', 'cygwin', 'darwin', 'dragonfly', 'freebsd',
+                'illumos', 'ios', 'linux', 'netbsd', 'openbsd', 'solaris'):
+        tags.add('posix')
+    return frozenset(tags)
+
+
+def validate_tags(tags: Iterable[str]) -> frozenset[str]:
+    """Normalize tag names and reject empty or filename-unsafe identifiers."""
+    if isinstance(tags, str):
+        raise ValueError('Tags must be a collection of names, not a string')
+    result = frozenset(tags)
+    for tag in sorted(result):
+        if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*', tag):
+            raise ValueError(f'Invalid build tag: {tag!r}')
+    return result
+
+
+def is_test_source(path: Path) -> bool:
+    """Recognize name_test+tag.cc/cpp as well as unqualified test filenames."""
+    return path.suffix in CCFILE_SUFFIXES and path.stem.split('+', 1)[0].endswith('_test')
+
+
+def source_matches_target(path: Path, cfg: BuildConfig) -> bool:
+    """Require every +tag in a source filename to be active in cfg; underscores are ordinary text."""
+    if path.suffix not in (*CCFILE_SUFFIXES, '.c', '.S', '.s'):
+        return True
+    tags = validate_tags(path.stem.split('+')[1:])
+    if cfg.KNOWN_TAGS is not None and (unknown := tags - cfg.KNOWN_TAGS):
+        raise ValueError(f'Unknown build tags in {path}: {", ".join(sorted(unknown))}')
+    return tags <= cfg.TAGS
+
 THIS_MTIME = 0
 
 # Generate the representation while retaining custom initialization and identity.
@@ -128,7 +164,10 @@ class BuildConfig:
     REBUILD: bool
     VERBOSE: bool
     STD_HEADER_UNIT: bool
+    TAGS: frozenset[str]
+    KNOWN_TAGS: frozenset[str] | None
     memory: MemoryBudget | None
+    concurrency_reporter: ConcurrencyReporter
     source_files: dict[Path, SourceFile]
     compiled_modules: dict[str, CompiledModule]
     directory_configs: dict[Path, DirectoryConfig]
@@ -162,8 +201,14 @@ class BuildConfig:
         STD_HEADER_UNIT: bool = True,
         memory: MemoryBudget | None = None,
         vfs: FileSystem = _DEFAULT_VFS,
+        TAGS: Iterable[str] | None = None,
+        KNOWN_TAGS: Iterable[str] | None = None,
     ) -> None:
         self.vfs = vfs
+        self.TAGS = validate_tags(TAGS) if TAGS is not None else native_tags()
+        self.KNOWN_TAGS = validate_tags(KNOWN_TAGS) if KNOWN_TAGS is not None else None
+        if self.KNOWN_TAGS is not None and (unknown := self.TAGS - self.KNOWN_TAGS):
+            raise ValueError(f'Unknown active build tags: {", ".join(sorted(unknown))}')
         self.CC = CC
         self.CXX = CXX
         self.CFLAGS = COMPILE_FLAGS + CFLAGS
@@ -185,6 +230,7 @@ class BuildConfig:
         self.VERBOSE = VERBOSE
         self.STD_HEADER_UNIT = STD_HEADER_UNIT
         self.memory = memory
+        self.concurrency_reporter = ConcurrencyReporter()
         self.source_files = {}
         self.compiled_modules = {}
         self.directory_configs = {}
@@ -200,6 +246,7 @@ class BuildConfig:
 
         Create new targets and sources before starting the next build.
         """
+        self.concurrency_reporter = ConcurrencyReporter()
         self.source_files.clear()
         self.compiled_modules.clear()
         self.directory_configs.clear()
@@ -429,7 +476,8 @@ class Target:
         async def run() -> None:
             """Schedule this target's roots and consume their ordered output."""
             self.session = BuildSession(self.cfg.JOBS, memory=self.cfg.memory,
-                                        verbose=self.cfg.VERBOSE)
+                                        verbose=self.cfg.VERBOSE,
+                                        concurrency_reporter=self.cfg.concurrency_reporter)
             self.job_sources = {}
             self.link_events = {}
             try:
@@ -594,7 +642,7 @@ class Target:
         failed = []
 
         if path.is_absolute():
-            if path.exists(self.cfg.vfs):
+            if path.exists(self.cfg.vfs) and source_matches_target(path, self.cfg):
                 return path
             failed.append(str(path))
         else:
@@ -610,7 +658,7 @@ class Target:
                     candidates.append(directory / 'module.cc')
                 candidates.append(directory / full_path.name)
                 for candidate in candidates:
-                    if candidate.is_file(self.cfg.vfs):
+                    if candidate.is_file(self.cfg.vfs) and source_matches_target(candidate, self.cfg):
                         return candidate
                     failed.append(str(candidate))
 
@@ -625,6 +673,8 @@ class SourceFile:
         modname: str | None = None,
         inherited_dircfg: DirectoryConfig | None = None,
     ) -> SourceFile:
+        if not source_matches_target(path, cfg):
+            raise RuntimeError(f'Source {path} requires inactive build tags (active: {", ".join(sorted(cfg.TAGS))})')
         std_header = type == SourceType.SYSTEM_HEADER and str(path).endswith('/bits/stdc++.h')
         std_module = type == SourceType.MODULE and modname in ('std', 'std.compat') and path.is_absolute()
         if (not cfg.USECLANG and std_header) or std_module:
@@ -749,6 +799,11 @@ class SourceFile:
             self.need_recompile = True
             return
         
+        if data.get('tags') != sorted(cfg.TAGS):
+            self.up_to_date = False
+            self.need_recompile = True
+            return
+
         if data['command'] != self.compiler_cmd(cfg):
             self.up_to_date = False
             self.need_recompile = True
@@ -860,6 +915,7 @@ class SourceFile:
 
         out = {
             'command': self.compiler_cmd(cfg),
+            'tags': sorted(cfg.TAGS),
             'deps': deps
         }
         if not cfg.USECLANG and self.type not in (SourceType.C, SourceType.ASM):
@@ -1449,7 +1505,7 @@ class HeaderDep:
         dircfg = DirectoryConfig.get(dirname, target.cfg, log=parent)
 
         target.add_config(dircfg, parent=parent)
-        cppfile = self.find_cpp(self.path, target.cfg.vfs)
+        cppfile = self.find_cpp(self.path, target.cfg)
         debug_log('find_cpp', self.path, '-->', cppfile, log=parent)
         if cppfile:
             self.cpp_path = cppfile
@@ -1466,14 +1522,16 @@ class HeaderDep:
             self._mtimes[vfs] = self.path.mtime(vfs)
         return self._mtimes[vfs]
 
-    def find_cpp(self, hfile: Path, vfs: FileSystem) -> Path | None:
+    def find_cpp(self, hfile: Path, cfg: BuildConfig) -> Path | None:
+        """Find hfile's companion source using cfg's filesystem and active tags."""
+        vfs = cfg.vfs
         if hfile.suffix not in HFILE_SUFFIXES:
             return None
         
         basename = hfile.with_suffix('')
         for ext in [".cc", ".cpp", ".c"]:
             cppfile = basename.with_extra_suffix(ext)
-            if cppfile.exists(vfs):
+            if cppfile.exists(vfs) and source_matches_target(cppfile, cfg):
                 return cppfile
             
         #print("!!!!", list(hfile.parts), 'include' in hfile.parts)
@@ -1484,12 +1542,12 @@ class HeaderDep:
             newpath = Path(*parts)
 
             if newpath.parent.is_dir(vfs):
-                return self.find_cpp(newpath, vfs)
+                return self.find_cpp(newpath, cfg)
             
             # project/include/project/file.h -> project/src/file.h
             if include_index > 0 and include_index < len(parts) - 2 and parts[include_index-1] == parts[include_index+1]:
                 parts.pop(include_index+1)
-                return self.find_cpp(Path(*parts), vfs)
+                return self.find_cpp(Path(*parts), cfg)
         
         if "Inc" in hfile.parts:
             parts = list(hfile.parts)
@@ -1498,7 +1556,7 @@ class HeaderDep:
             newpath = Path(*parts)
 
             if newpath.parent.is_dir(vfs):
-                return self.find_cpp(newpath, vfs)
+                return self.find_cpp(newpath, cfg)
 
         return None
     
@@ -1531,7 +1589,8 @@ class CompilationDatabase:
 
     def build(self, cfg: BuildConfig) -> str:
         for path in find_files(self.paths, suffixes=[".cc", ".cpp", ".c"], vfs=cfg.vfs):
-            self.process_file(path, cfg)
+            if source_matches_target(path, cfg):
+                self.process_file(path, cfg)
 
         asyncio.run(self.add_standard_modules(cfg))
         return json.dumps(self.entries, indent=2)
@@ -1766,11 +1825,11 @@ def debug_log(*text: object, log: Job | None = None) -> None:
 
 def directory_sources(path: Path, cfg: BuildConfig, *, tests: bool = False) -> list[Path]:
     """List immediate sources in path using cfg's VFS; tests selects only test sources."""
-    test_suffixes = ('_test.cc', '_test.cpp')
-    suffixes = test_suffixes if tests else (*CCFILE_SUFFIXES, '.c', '.S', '.s')
+    suffixes = (*CCFILE_SUFFIXES, '.c', '.S', '.s')
     return [Path(entry.path) for entry in sorted(cfg.vfs.scandir(path), key=lambda entry: entry.name)
             if entry.is_file and entry.name.endswith(suffixes)
-            and (tests or not entry.name.endswith(test_suffixes))]
+            and source_matches_target(Path(entry.path), cfg)
+            and is_test_source(Path(entry.path)) == tests]
 
 
 def expand_target_pattern(path: Path, cfg: BuildConfig, *, tests: bool = False) -> list[Path]:
@@ -1871,7 +1930,9 @@ def run_tool(tool_path: str, dirs: list[str], cfg: BuildConfig) -> None:
     target = Target(main_name, cfg)
     sources = [main_path]
     
-    for filename in find_files(dirs, suffixes = ('_test.cc', '_test.cpp'), vfs=cfg.vfs):
+    for filename in find_files(dirs, suffixes=CCFILE_SUFFIXES, vfs=cfg.vfs):
+        if not is_test_source(filename) or not source_matches_target(filename, cfg):
+            continue
         #print("building %s..." % filename)
         path = mkpath(filename, vfs=cfg.vfs)
         sources.append(path)
@@ -1896,7 +1957,9 @@ def run_tests(dirs: list[str], cfg: BuildConfig) -> None:
             for selected in expand_target_pattern(pattern, cfg, tests=True):
                 if selected.is_dir(cfg.vfs):
                     groups.setdefault(selected, set()).update(directory_sources(selected, cfg, tests=True))
-                elif selected.is_file(cfg.vfs) and selected.name.endswith(('_test.cc', '_test.cpp')):
+                elif selected.is_file(cfg.vfs) and is_test_source(selected):
+                    if not source_matches_target(selected, cfg):
+                        raise RuntimeError(f'Source {selected} requires inactive build tags')
                     groups.setdefault(selected.parent, set()).add(selected)
                 else:
                     raise RuntimeError(f'Expected a directory or test source: {selected}')
@@ -1976,7 +2039,8 @@ def generate_module_headers(path: Path, cfg: BuildConfig) -> list[Path]:
     if not root.is_dir(cfg.vfs):
         raise RuntimeError(f'Expected a directory for generate-module-headers: {path}')
     output_root = Path(cfg.vfs.abspath(root)).parent / 'generated-headers'
-    sources = list(module_header_sources(root, cfg.vfs))
+    sources = [source for source in module_header_sources(root, cfg.vfs)
+               if source_matches_target(source, cfg)]
     if not sources:
         print(f'No module interfaces found in {path}')
         return []
@@ -2017,6 +2081,8 @@ def _main(
     vfs: FileSystem = _DEFAULT_VFS,
     CLANG_CXXFLAGS: list[str] = [],
     CLANG_LDFLAGS: list[str] = [],
+    TAGS: Iterable[str] | None = None,
+    KNOWN_TAGS: Iterable[str] | None = None,
 ) -> None:
     """Parse CLI arguments with compiler/path/VFS defaults; CLANG_* flags apply only to Clang."""
 
@@ -2069,6 +2135,8 @@ def _main(
                                     help=argparse.SUPPRESS)
 
     for command_parser in (build_parser, run_parser, test_parser, bench_parser, ide_parser, headers_parser):
+        command_parser.add_argument('--tags', metavar='TAG,TAG',
+                                    help='replace active source tags (default: configured/native tags)')
         command_parser.add_argument('--verbose', '-v', action='store_true', default=argparse.SUPPRESS,
                                     help='print every command and compilation timings')
 
@@ -2124,6 +2192,13 @@ def _main(
     build_dir = "debug" if buildtype == Debug else "release"
     if USECLANG:
         build_dir += "+clang"
+    tags = TAGS if TAGS is not None else native_tags()
+    if getattr(args, 'tags', None) is not None:
+        tags = [tag.strip() for tag in args.tags.split(',')] if args.tags else []
+    tags = validate_tags(tags)
+    if tags != native_tags():
+        key = hashlib.sha256(json.dumps(sorted(tags)).encode()).hexdigest()[:12]
+        build_dir += '+tags-' + key
 
     cfg = BuildConfig(
         CC=CC,
@@ -2145,6 +2220,8 @@ def _main(
         STD_HEADER_UNIT=not getattr(args, 'no_std_header_unit', False),
         memory=MemoryBudget() if args.cmd in ('build', 'run', 'test', 'bench') else None,
         vfs=vfs,
+        TAGS=tags,
+        KNOWN_TAGS=KNOWN_TAGS,
     )
 
     # g['OBJDIR'] = Path(OBJDIR)

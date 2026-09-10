@@ -175,6 +175,18 @@ class Job:
                 self.session.slots.release()
 
 
+class ConcurrencyReporter:
+    def __init__(self) -> None:
+        """Track whether this invocation has printed its concurrency banner."""
+        self.reported = False
+
+    def write(self, message: str, output: TextIO) -> None:
+        """Write message to output once across all sessions sharing this reporter."""
+        if not self.reported:
+            output.write(message)
+            self.reported = True
+
+
 class BuildSession:
     def __init__(
         self,
@@ -182,12 +194,15 @@ class BuildSession:
         output: TextIO | None = None,
         memory: MemoryBudget | None = None,
         verbose: bool = False,
+        concurrency_reporter: ConcurrencyReporter | None = None,
     ) -> None:
-        """Limit jobs by memory; write to output, with launch commands when verbose."""
+        """Limit jobs by memory; output logs and share an optional invocation reporter."""
         if jobs < 1:
             raise ValueError('jobs must be at least 1')
         self.output = output if output is not None else sys.stdout
         self.verbose = verbose
+        self.concurrency_reporter = (concurrency_reporter if concurrency_reporter is not None
+                                     else ConcurrencyReporter())
         limit = jobs
         self.concurrency_message = ''
         self.compilation_started = False
@@ -207,7 +222,7 @@ class BuildSession:
     def report_concurrency(self) -> None:
         """Print the banner once before streamed output, after compilation starts."""
         if self.compilation_started and self.concurrency_message:
-            self.output.write(self.concurrency_message)
+            self.concurrency_reporter.write(self.concurrency_message, self.output)
             self.concurrency_message = ''
 
     def report_launch(self, command: str) -> None:

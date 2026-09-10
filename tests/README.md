@@ -186,6 +186,61 @@ recursive build artifacts and includes an optional real GCC build/test fixture
 (`BT_TEST_GCC=g++`). The existing recursive behavior of `ide`, `bench`, and
 `generate-module-headers` is unchanged.
 
+## Source build tags
+
+Qualify filenames with `+tag` to require active build tags. All qualifiers must
+be active: `usbio+zephyr+posix.cc` requires both `zephyr` and `posix`.
+Underscores have no selection meaning: `serial_linux.cc` is an ordinary source.
+Tags work with `.cc`, `.cpp`, `.c`, `.S`, and `.s`. Put qualifiers after the test
+suffix: `serial_test+linux.cpp`. Headers may use matching names so normal
+companion discovery finds their qualified sources; headers themselves are not
+filtered by buildtool.
+
+Configure the active set in the launcher or in Python:
+
+```python
+bt.main(TAGS={'zephyr', 'posix'})
+cfg = BuildConfig(TAGS={'zephyr', 'posix'})
+```
+
+Explicit tags replace the defaults; an empty set enables only unqualified files.
+Without explicit configuration, native defaults are used, for example
+`{'linux', 'posix'}` or `{'windows'}`. Tags have no implied relationships:
+`zephyr` does not automatically enable `posix`.
+
+```sh
+bt build --tags zephyr,posix deps/baselib/lib/serial
+bt test --tags linux,posix deps/baselib/lib/...
+bt ide --tags linux,posix
+bt build --tags '' src
+```
+
+The CLI `--tags` argument replaces the configured active set. It controls source
+selection, not compiler predefines, the cross-compiler, SDK, or target flags.
+Configure those separately. Nondefault tag sets get a stable
+`build/release+tags-<hash>` directory (or `release+clang+tags-<hash>`); tag ordering
+is irrelevant. Incremental metadata also records the active tags, preventing
+reuse of dependencies selected under a different tag set. Old metadata is
+rebuilt once when upgrading to this selection scheme.
+
+Tags are arbitrary names made of letters, digits, underscores, dots, and hyphens
+and must start with a letter, digit, or underscore. An inactive tag causes the
+file to be skipped. For typo detection, optionally supply a vocabulary:
+
+```python
+bt.main(TAGS={'zephyr', 'posix'},
+        KNOWN_TAGS={'linux', 'windows', 'zephyr', 'posix', 'debug-uart'})
+```
+
+With `KNOWN_TAGS`, unknown active tags and unknown filename qualifiers are
+errors. An explicit request for a source requiring inactive tags also errors.
+
+Selection is shared by directory and recursive builds, tests/benchmarks, header
+companion discovery, module lookup, IDE entries, and module-header generation.
+Recursive patterns omit directories whose sources are all inactive.
+`test_source_tags.py` covers selection, validation, native defaults, CLI
+configuration, and incremental cache identity using a virtual filesystem.
+
 ## Named module lookup
 
 `bt ide` refreshes the compilation database, including newly added interfaces and

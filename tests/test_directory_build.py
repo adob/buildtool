@@ -107,6 +107,29 @@ class DirectoryBuildTests(unittest.TestCase):
         self.assertFalse(any('nested/other.o' in arg for arg in self.links[0]))
         self.assertTrue(any('nested/other.o' in arg for arg in self.links[1]))
 
+    def test_recursive_build_reports_concurrency_once(self) -> None:
+        """Share the banner across packages, including when early packages are cached."""
+        self.cfg.memory = bt.MemoryBudget(available=lambda: 8 * 1024**3)
+
+        def compile_source(source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
+            """Emit a compiler status for source and simulate its object output."""
+            source.job.message(f'BUILDING {source.path}')
+            self.compile_source(source, target, cfg)
+
+        with mock.patch.object(bt.SourceFile.compile_gcc, 'side_effect', compile_source):
+            for state in ('fresh', 'cached', 'changed'):
+                with self.subTest(state=state):
+                    self.cfg.reset_build_state()
+                    if state == 'changed':
+                        self.fs.write_text('cmd/foo/nested/other.cc', 'main T 0 20\n')
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        bt.build_targets(bt.Path('cmd/foo/...'), self.cfg)
+                    text = output.getvalue()
+                    self.assertEqual(text.count('Concurrency:'), 0 if state == 'cached' else 1)
+                    if state != 'cached':
+                        self.assertLess(text.index('Concurrency:'), text.index('BUILDING'))
+
     def test_recursive_same_basename_has_distinct_artifacts(self) -> None:
         """Different packages named foo must not accidentally reuse the same binary."""
         self.fs.makedirs('other/foo')
