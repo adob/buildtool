@@ -482,7 +482,8 @@ class Target:
         for root in self.session.roots:
             visit(root)
 
-    def link(self) -> Path:
+    def link(self, *, publish: bool = True) -> Path:
+        """Link the target; publish updates bin's symlink, otherwise return the build artifact."""
         dirname = self.path.parent
         #buildvars = DirectoryConfig.get(dirname).buildvars
 
@@ -503,11 +504,25 @@ class Target:
             print("LINKING", ofile)
             shell(self.cfg.CXX, *extra_flags, *self.objs, *lflags, f"-o{ofile}",
                   verbose=self.cfg.VERBOSE)
+        if not publish:
+            return ofile
         self.cfg.vfs.makedirs(public_file.parent, exist_ok=True)
         link_target = os.path.relpath(self.cfg.vfs.abspath(ofile),
                                       self.cfg.vfs.abspath(public_file.parent))
         atomic_symlink(public_file, link_target, self.cfg.vfs)
         return public_file
+
+    def defines_main(self) -> bool:
+        """Check this target's compiled objects for an externally defined main function."""
+        if not self.objs:
+            return False
+        # Let the compiler select its toolchain's nm, including cross-toolchains.
+        nm = shell(self.cfg.CXX, '-print-prog-name=nm', verbose=self.cfg.VERBOSE).strip()
+        symbols = shell(nm, '--defined-only', '--extern-only', '--format=posix',
+                        *self.objs, verbose=self.cfg.VERBOSE)
+        return any(len(fields := line.split()) >= 2 and
+                   fields[0] == 'main' and fields[1] in ('T', 'W')
+                   for line in symbols.splitlines())
 
     def add_config(self, config: DirectoryConfig, parent: Job | None = None) -> None:
         """Record config at parent's discovery position, or add its linker flags."""
@@ -1562,12 +1577,27 @@ def debug_log(*text: object, log: Job | None = None) -> None:
         else:
             warn(*text)
 
-def build(path: Path, cfg: BuildConfig) -> Path:
-    name = path.with_suffix('')
+def build(path: Path, cfg: BuildConfig, *, publish: bool = True) -> Path | None:
+    """Build file/directory path with cfg; publish exposes executables in bin.
+
+    Directory builds compile immediate source files and return None if no main
+    is defined. Explicit shared-library builds still link without main.
+    """
+    directory = path.is_dir(cfg.vfs)
+    name = Path(cfg.vfs.abspath(path)) if directory else path.with_suffix('')
     target = Target(name, cfg)
-    target.compile(path)
+    if directory:
+        sources = [Path(entry.path) for entry in sorted(cfg.vfs.scandir(path), key=lambda entry: entry.name)
+                   if entry.is_file and entry.name.endswith((*CCFILE_SUFFIXES, '.c', '.S', '.s'))]
+        if not sources:
+            raise RuntimeError(f'No source files in {path}')
+        target.compile_many(sources)
+        if cfg.SUFFIX != '.so' and not target.defines_main():
+            return None
+    else:
+        target.compile(path)
     
-    return target.link()
+    return target.link(publish=publish)
 
 def make_compilation_database(paths: list[Path], cfg: BuildConfig) -> str:
     db = CompilationDatabase(paths)
@@ -1654,14 +1684,14 @@ def _main(
     subparsers = parser.add_subparsers(dest='cmd')
     
     build_parser = subparsers.add_parser('build', help='build the specified binary or library')
-    build_parser.add_argument('path', help="path/to/file.cc")
+    build_parser.add_argument('path', help='source file or directory')
     build_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
     build_parser.add_argument('--library', action='store_true', help='build in library mode')
     build_parser.add_argument('--clang', action='store_true', help='build with clang')
     build_parser.add_argument('args', nargs=argparse.REMAINDER)
 
     run_parser = subparsers.add_parser('run', help='run the specified binary')
-    run_parser.add_argument('path', help="path/to/file.cc")
+    run_parser.add_argument('path', help='source file or directory defining main')
     run_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
     run_parser.add_argument('--clang', action='store_true', help='build with clang')
     run_parser.add_argument('args', nargs=argparse.REMAINDER,
@@ -1773,7 +1803,10 @@ def _main(
         if ROOT != ".":
             oldwd = cfg.vfs.getcwd()
             cfg.vfs.chdir(ROOT)
-        bin = cfg.vfs.abspath(build(target, cfg))
+        executable = build(target, cfg, publish=False)
+        if executable is None:
+            raise RuntimeError(f'No main function defined in {target}')
+        bin = cfg.vfs.abspath(executable)
         if oldwd:
             cfg.vfs.chdir(oldwd)
         os.execv(bin, [bin] + args.args)

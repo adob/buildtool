@@ -8,6 +8,73 @@ import buildtool as bt
 
 
 class CompilerOutputTests(unittest.TestCase):
+    def test_run_uses_build_artifact_without_publishing(self) -> None:
+        """Run reuses artifacts and preserves public links across compiler/debug choices."""
+        for debug in (False, True):
+            with self.subTest(debug=debug), mock.patch.dict(vars(bt)):
+                fs = bt.MemoryFileSystem()
+                fs.write_text('main.cc', 'int main() {}\n')
+                compiled, linked = [], []
+                mode = 'debug' if debug else 'release'
+                binary = 'main+debug' if debug else 'main'
+
+                def compile_source(source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
+                    """Write source's fake object using cfg, recording actual compilation."""
+                    compiled.append(str(source.objpath))
+                    fs.write_text(source.objpath, cfg.CXX)
+
+                def link(*args: object, verbose: bool = False) -> str:
+                    """Write the executable named by args and record the link invocation."""
+                    output = next(str(arg)[2:] for arg in args if str(arg).startswith('-o'))
+                    fs.write_text(output, str(args[0]))
+                    linked.append(output)
+                    return ''
+
+                def invoke(command: str, clang: bool = False) -> None:
+                    """Invoke command with the selected compiler and this case's build mode."""
+                    argv = ['bt', command]
+                    if debug:
+                        argv.append('--debug')
+                    if clang:
+                        argv.append('--clang')
+                    argv.append('main.cc')
+                    if command == 'run':
+                        argv += ['--option', 'value']
+                    with mock.patch.object(sys, 'argv', argv):
+                        bt.main(vfs=fs)
+
+                with mock.patch.object(bt, 'ROOT', '.'), \
+                     mock.patch.object(bt.SourceFile, 'compile_gcc', autospec=True, side_effect=compile_source), \
+                     mock.patch.object(bt.SourceFile, 'compile_clang', autospec=True, side_effect=compile_source), \
+                     mock.patch.object(bt, 'shell', side_effect=link), \
+                     mock.patch.object(bt.os, 'execv') as execute:
+                    invoke('run')
+                    gcc_binary = fs.abspath(f'build/{mode}/bin/{binary}')
+                    execute.assert_called_with(gcc_binary, [gcc_binary, '--option', 'value'])
+                    self.assertFalse(fs.is_dir('bin'))
+                    invoke('run')
+                    self.assertEqual(len(compiled), 1)
+                    self.assertEqual(len(linked), 1)
+                    self.assertFalse(fs.is_dir('bin'))
+
+                    invoke('build')
+                    public = f'bin/{binary}'
+                    expected = f'../build/{mode}/bin/{binary}'
+                    self.assertEqual(fs.readlink(public), expected)
+                    self.assertEqual(len(compiled), 1)
+                    self.assertEqual(len(linked), 1)
+
+                    invoke('run', clang=True)
+                    clang_binary = fs.abspath(f'build/{mode}+clang/bin/{binary}')
+                    execute.assert_called_with(clang_binary, [clang_binary, '--option', 'value'])
+                    self.assertEqual(fs.readlink(public), expected)
+                    self.assertEqual(len(compiled), 2)
+                    self.assertEqual(len(linked), 2)
+                    invoke('run', clang=True)
+                    self.assertEqual(fs.readlink(public), expected)
+                    self.assertEqual(len(compiled), 2)
+                    self.assertEqual(len(linked), 2)
+
     def test_alternating_compilers_keeps_independent_outputs(self):
         for debug, verbose in [(False, False), (False, True), (True, False), (True, True)]:
             with self.subTest(debug=debug, verbose=verbose), mock.patch.dict(vars(bt)):

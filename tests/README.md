@@ -9,6 +9,24 @@ python3 -m unittest discover -s tests -v
 The tests use the Python standard library. No GCC, Clang, pkg-config, or
 third-party Python packages are required.
 
+## Building a directory
+
+`bt build cmd/foo` compiles every immediate `.cc`, `.cpp`, `.c`, `.S`, and `.s`
+source in that directory, in sorted order. Subdirectories are separate targets;
+normal dependency discovery can still add sources outside the directory.
+The toolchain's `nm` checks the compiled objects for a defined `main` function.
+If present, buildtool links `build/<config>/bin/foo` and publishes `bin/foo`.
+Debug builds retain the `+debug` suffix, and an explicit `OUTFILE` overrides the
+directory name. Explicit file builds retain their existing filename-based names.
+
+A directory without `main` is compiled successfully without linking or publishing
+an executable. An empty source directory reports an error. `--library` continues
+to link a shared library without requiring `main`. All matching source files,
+including files named `*_test.cc`, are included.
+
+`bt run cmd/foo --option` uses the same directory build but executes the artifact
+directly without publishing it. A directory without `main` cannot be run.
+
 ## Parallel compilation and output
 
 CLI builds use the CPU count as their requested concurrency. Available memory
@@ -132,10 +150,16 @@ separate by compiler.
 
 Real executables live under each build directory's `bin/`, for example
 `build/release/bin/hello` and `build/release+clang/bin/hello`. The public `bin/hello`
-is a relative symlink to the selected build. It is replaced atomically after a
-successful build, including when switching back to an existing build that
+is a relative symlink to the selected build. `bt build` replaces it atomically
+after a successful build, including when switching back to an existing build that
 requires no compilation or linking. Debug builds retain the `+debug` filename
 suffix. A failed link leaves the public symlink unchanged.
+
+`bt run` executes the real binary under `build/<config>/bin/` directly, reusing
+the same incremental artifacts as `bt build`. It does not create the project's
+`bin/` directory or create/update its public symlinks. An existing `bin/foo`
+keeps pointing to the build selected by the last `bt build`, even when `bt run`
+uses another compiler or configuration.
 
 Compiler and linker flags preserve their declared order and repeated arguments.
 Package flags are appended in `PKGCONFIG` order, and dependency traversal retains

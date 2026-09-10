@@ -24,6 +24,7 @@ class CliArgumentTests(unittest.TestCase):
                      mock.patch.object(bt.os, 'execv') as execute:
                     bt.main(vfs=fs)
                 path, cfg = build.call_args.args
+                self.assertEqual(build.call_args.kwargs, {'publish': False})
                 self.assertEqual(str(path), 'src/foo.cc')
                 self.assertEqual(cfg.VERBOSE, bool(flags))
                 self.assertEqual(cfg.REBUILD, bool(flags))
