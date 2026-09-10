@@ -50,7 +50,9 @@ COMPILE_FLAGS = ["-pthread", "-fnon-call-exceptions", "-g",
             "-Wno-sign-compare", "-Wno-deprecated", "-Wno-sign-conversion",
             "-Wno-missing-field-initializers",
             "-Werror=shift-count-overflow",
-            "-Werror=return-type", "-Wno-unused-parameter"
+            "-Wno-unused-parameter",
+            "-Wno-parentheses",
+            "-Werror=return-type",
 ]
 CFLAGS = COMPILE_FLAGS
 CLANG_CFLAGS = ["-Wno-logical-op-parentheses"]
@@ -507,8 +509,8 @@ class Target:
         for root in self.session.roots:
             visit(root)
 
-    def link(self, *, publish: bool = True) -> Path:
-        """Link the target; publish updates bin's symlink, otherwise return the build artifact."""
+    def link(self, *, publish: bool = True, artifact: Path | None = None) -> Path:
+        """Link to optional artifact; publish exposes the executable through bin's symlink."""
         dirname = self.path.parent
         #buildvars = DirectoryConfig.get(dirname).buildvars
 
@@ -519,7 +521,7 @@ class Target:
             name = self.path.name + suffix
         else:
             name = self.cfg.OUTFILE
-        ofile = self.cfg.OBJDIR / "bin" / name
+        ofile = artifact if artifact is not None else self.cfg.OBJDIR / "bin" / name
         public_file = self.cfg.BINDIR / name
 
         ofile_mtime = ofile.mtime(self.cfg.vfs)
@@ -1762,18 +1764,74 @@ def debug_log(*text: object, log: Job | None = None) -> None:
         else:
             warn(*text)
 
-def build(path: Path, cfg: BuildConfig, *, publish: bool = True) -> Path | None:
+def directory_sources(path: Path, cfg: BuildConfig, *, tests: bool = False) -> list[Path]:
+    """List immediate sources in path using cfg's VFS; tests selects only test sources."""
+    test_suffixes = ('_test.cc', '_test.cpp')
+    suffixes = test_suffixes if tests else (*CCFILE_SUFFIXES, '.c', '.S', '.s')
+    return [Path(entry.path) for entry in sorted(cfg.vfs.scandir(path), key=lambda entry: entry.name)
+            if entry.is_file and entry.name.endswith(suffixes)
+            and (tests or not entry.name.endswith(test_suffixes))]
+
+
+def expand_target_pattern(path: Path, cfg: BuildConfig, *, tests: bool = False) -> list[Path]:
+    """Expand a trailing /... into source directories; tests selects test-bearing directories."""
+    if path.name != '...':
+        return [path]
+    root = path.parent
+    if not root.is_dir(cfg.vfs):
+        raise RuntimeError(f'Not a directory: {root}')
+    excluded = {cfg.vfs.abspath(directory) for directory in (cfg.OBJDIR, cfg.DEPDIR, cfg.BINDIR)}
+    # Skip sibling build configurations too, unless their parent is the search root.
+    for directory in (cfg.OBJDIR.parent, cfg.DEPDIR.parent):
+        if cfg.vfs.abspath(directory) != cfg.vfs.abspath(root):
+            excluded.add(cfg.vfs.abspath(directory))
+
+    def visit(directory: Path) -> Iterator[Path]:
+        """Visit directory and eligible children in lexical order, without following symlinks."""
+        if directory_sources(directory, cfg, tests=tests):
+            yield directory
+        for entry in sorted(cfg.vfs.scandir(directory), key=lambda entry: entry.name):
+            if (entry.is_dir and not entry.is_symlink and not entry.name.startswith(('.', '_'))
+                    and entry.name not in ('testdata', 'vendor')
+                    and cfg.vfs.abspath(entry.path) not in excluded):
+                yield from visit(Path(entry.path))
+
+    targets = list(visit(root))
+    if not targets:
+        warn(f'Pattern {path} matched no {"test" if tests else "source"} directories')
+    return targets
+
+
+def package_artifact(path: Path, cfg: BuildConfig, *, sources: Sequence[Path] = ()) -> Path:
+    """Name a package binary by absolute path and optional test selection to avoid collisions."""
+    identity = [cfg.vfs.abspath(path), *sorted(cfg.vfs.abspath(source) for source in sources)]
+    key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:16]
+    name = Path(cfg.vfs.abspath(path)).name
+    return cfg.OBJDIR / ('tests' if sources else 'packages') / key / (name + cfg.SUFFIX)
+
+
+def build_targets(path: Path, cfg: BuildConfig) -> None:
+    """Build path or each directory selected by path/... independently using cfg."""
+    for selected in expand_target_pattern(path, cfg):
+        if path.name == '...':
+            build(selected, cfg, artifact=package_artifact(selected, cfg))
+        else:
+            build(selected, cfg)
+
+
+def build(path: Path, cfg: BuildConfig, *, publish: bool = True,
+          artifact: Path | None = None) -> Path | None:
     """Build file/directory path with cfg; publish exposes executables in bin.
 
     Directory builds compile immediate source files and return None if no main
-    is defined. Explicit shared-library builds still link without main.
+    is defined. artifact overrides the internal binary path for recursive targets.
+    Explicit shared-library builds still link without main.
     """
     directory = path.is_dir(cfg.vfs)
     name = Path(cfg.vfs.abspath(path)) if directory else path.with_suffix('')
     target = Target(name, cfg)
     if directory:
-        sources = [Path(entry.path) for entry in sorted(cfg.vfs.scandir(path), key=lambda entry: entry.name)
-                   if entry.is_file and entry.name.endswith((*CCFILE_SUFFIXES, '.c', '.S', '.s'))]
+        sources = directory_sources(path, cfg)
         if not sources:
             raise RuntimeError(f'No source files in {path}')
         target.compile_many(sources)
@@ -1782,7 +1840,7 @@ def build(path: Path, cfg: BuildConfig, *, publish: bool = True) -> Path | None:
     else:
         target.compile(path)
     
-    return target.link(publish=publish)
+    return target.link(publish=publish, artifact=artifact)
 
 def make_compilation_database(paths: list[Path], cfg: BuildConfig) -> str:
     db = CompilationDatabase(paths)
@@ -1827,7 +1885,47 @@ def run_tool(tool_path: str, dirs: list[str], cfg: BuildConfig) -> None:
 
 
 def run_tests(dirs: list[str], cfg: BuildConfig) -> None:
-    run_tool(TESTMAIN, dirs, cfg)
+    """Build and run a separate test binary per directory; only /... searches recursively."""
+    patterns = [Path(cfg.vfs.abspath(argument)) for argument in dirs]
+    previous = cfg.vfs.getcwd()
+    failed = False
+    try:
+        cfg.vfs.chdir(ROOT)
+        groups: dict[Path, set[Path]] = {}
+        for pattern in patterns:
+            for selected in expand_target_pattern(pattern, cfg, tests=True):
+                if selected.is_dir(cfg.vfs):
+                    groups.setdefault(selected, set()).update(directory_sources(selected, cfg, tests=True))
+                elif selected.is_file(cfg.vfs) and selected.name.endswith(('_test.cc', '_test.cpp')):
+                    groups.setdefault(selected.parent, set()).add(selected)
+                else:
+                    raise RuntimeError(f'Expected a directory or test source: {selected}')
+        main_path = mkpath(TESTMAIN, vfs=cfg.vfs)
+        for directory, files in groups.items():
+            label = mkpath(directory, vfs=cfg.vfs)
+            if not files:
+                print(f'? {label} [no test files]', flush=True)
+                continue
+            sources = [mkpath(file, vfs=cfg.vfs) for file in sorted(files, key=str)]
+            target = Target(directory, cfg)
+            try:
+                target.compile_many([main_path, *sources])
+                binary = target.link(publish=False,
+                    artifact=package_artifact(directory, cfg, sources=sources))
+                # A subprocess lets later packages run after a test failure; tests run in their own directory.
+                sys.stdout.flush()
+                result = subprocess.run([cfg.vfs.abspath(binary)], cwd=str(directory), check=False)
+                success = result.returncode == 0
+            except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+                if not getattr(error, 'buildtool_reported', False):
+                    warn(error)
+                success = False
+            print(f'{"ok" if success else "FAIL"} {label}', flush=True)
+            failed |= not success
+    finally:
+        cfg.vfs.chdir(previous)
+    if failed:
+        raise SystemExit(1)
 
 def run_benchmarks(dirs: list[str], cfg: BuildConfig) -> None:
     run_tool(BENCHMAIN, dirs, cfg)
@@ -1933,7 +2031,7 @@ def _main(
     subparsers = parser.add_subparsers(dest='cmd')
     
     build_parser = subparsers.add_parser('build', help='build the specified binary or library')
-    build_parser.add_argument('path', help='source file or directory')
+    build_parser.add_argument('path', help='source file, directory, or directory/... for recursive builds')
     build_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
     build_parser.add_argument('--library', action='store_true', help='build in library mode')
     build_parser.add_argument('--clang', action='store_true', help='build with clang')
@@ -1956,7 +2054,7 @@ def _main(
     headers_parser.add_argument('args', nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
     test_parser = subparsers.add_parser('test', help='run tests in the specified directories or files')
-    test_parser.add_argument('dirs', nargs='+')
+    test_parser.add_argument('dirs', nargs='+', help='test files, directories, or directory/... for recursive tests')
     test_parser.add_argument('--release', '-r', action='store_const', dest='buildtype', const='release', help='build in release mode')
     test_parser.add_argument('--clang', action='store_true', help='build with clang')
 
@@ -2065,7 +2163,7 @@ def _main(
             cfg.SUFFIX = '.so'
             cfg.LDFLAGS += ["-shared"]
         
-        build(target, cfg)
+        build_targets(target, cfg)
     
     elif args.cmd == 'run':
         file = args.path

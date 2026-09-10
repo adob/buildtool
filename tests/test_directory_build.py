@@ -96,6 +96,27 @@ class DirectoryBuildTests(unittest.TestCase):
         """An explicit main.cc target still produces main, not its directory name."""
         self.assertEqual(str(self.build('cmd/foo/main.cc')), 'bin/main')
 
+    def test_recursive_pattern_builds_independent_targets(self) -> None:
+        """Recursive directories with main link separately and exclude test sources."""
+        self.fs.write_text('cmd/foo/broken_test.cc', 'this test must not be built')
+        with contextlib.redirect_stdout(io.StringIO()):
+            bt.build_targets(bt.Path('cmd/foo/...'), self.cfg)
+        self.assertEqual(len(self.links), 2)
+        self.assertNotIn('cmd/foo/broken_test.cc', self.compiled)
+        self.assertEqual(self.compiled[-1], 'cmd/foo/nested/other.cc')
+        self.assertFalse(any('nested/other.o' in arg for arg in self.links[0]))
+        self.assertTrue(any('nested/other.o' in arg for arg in self.links[1]))
+
+    def test_recursive_same_basename_has_distinct_artifacts(self) -> None:
+        """Different packages named foo must not accidentally reuse the same binary."""
+        self.fs.makedirs('other/foo')
+        self.fs.write_text('other/foo/main.cc', 'main T 0 10\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            bt.build_targets(bt.Path('cmd/...'), self.cfg)
+            bt.build_targets(bt.Path('other/...'), self.cfg)
+        outputs = [next(arg for arg in link if arg.startswith('-o')) for link in self.links]
+        self.assertEqual(len(outputs), len(set(outputs)))
+
     def test_directory_without_main_cannot_run(self) -> None:
         """CLI run reports a missing entry point without attempting exec or publishing."""
         self.fs.write_text('cmd/foo/main.cc', '')
@@ -110,6 +131,43 @@ class DirectoryBuildTests(unittest.TestCase):
 
 
 class DirectoryCompilerTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get('BT_TEST_GCC'), 'set BT_TEST_GCC for GCC tests')
+    def test_recursive_build_and_test_packages(self) -> None:
+        """Real packages with identical basenames and symbols must build and run independently."""
+        with tempfile.TemporaryDirectory(prefix='buildtool-recursive-') as directory:
+            previous = os.getcwd()
+            os.chdir(directory)
+            self.addCleanup(os.chdir, previous)
+            Path('runner.cc').write_text('int check(); int main() { return check(); }\n')
+            for package in ('one/same', 'two/same'):
+                Path(package).mkdir(parents=True)
+                Path(package, 'main.cc').write_text('int main() { return 0; }\n')
+                Path(package, 'marker').write_text('fixture')
+                Path(package, 'case_test.cc').write_text(
+                    'extern "C" int access(const char *, int);\n'
+                    'int check() { return access("marker", 0); }\n')
+            cfg = bt.BuildConfig(CXX=os.environ['BT_TEST_GCC'], CXXFLAGS=['-std=c++20'],
+                                 LDFLAGS=shlex.split(os.environ.get('BT_TEST_GCC_LDFLAGS', '')),
+                                 STD_HEADER_UNIT=False)
+            with mock.patch.object(bt, 'ROOT', directory), mock.patch.object(bt, 'TESTMAIN', 'runner.cc'), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                bt.build_targets(bt.Path('one/...'), cfg)
+                bt.build_targets(bt.Path('two/...'), cfg)
+                binaries = list(Path('build/release/packages').glob('*/same'))
+                self.assertEqual(len(binaries), 2)
+                for binary in binaries:
+                    subprocess.run([str(binary.resolve())], check=True)
+                bt.run_tests(['one/...', 'two/...'], cfg)
+                self.assertEqual(len(list(Path('build/release/tests').glob('*/same'))), 2)
+                Path('one/same/case_test.cc').write_text('int check() { return 1; }\n')
+                cfg.reset_build_state()
+                # Preserve actual execution while counting the packages run after a failure.
+                with mock.patch.object(bt.subprocess, 'run', wraps=subprocess.run) as execute, \
+                     self.assertRaises(SystemExit):
+                    bt.run_tests(['one/...', 'two/...'], cfg)
+                tests = [call for call in execute.call_args_list if 'cwd' in call.kwargs]
+                self.assertEqual(len(tests), 2)
+
     def exercise(self, compiler: str, wrapper: str | None = None, ldflags: str = '') -> None:
         """Compile a mixed C/C++ directory with compiler and optional wrapper/linker flags."""
         with tempfile.TemporaryDirectory(prefix='buildtool-directory-') as directory:

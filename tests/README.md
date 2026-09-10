@@ -135,8 +135,9 @@ database and clangd's own module cache.
 
 ## Building a directory
 
-`bt build cmd/foo` compiles every immediate `.cc`, `.cpp`, `.c`, `.S`, and `.s`
-source in that directory, in sorted order. Subdirectories are separate targets;
+`bt build cmd/foo` compiles immediate `.cc`, `.cpp`, `.c`, `.S`, and `.s`
+sources in that directory, in sorted order, excluding `*_test.cc` and `*_test.cpp`.
+Subdirectories are separate targets;
 normal dependency discovery can still add sources outside the directory.
 The toolchain's `nm` checks the compiled objects for a defined `main` function.
 If present, buildtool links `build/<config>/bin/foo` and publishes `bin/foo`.
@@ -145,11 +146,45 @@ directory name. Explicit file builds retain their existing filename-based names.
 
 A directory without `main` is compiled successfully without linking or publishing
 an executable. An empty source directory reports an error. `--library` continues
-to link a shared library without requiring `main`. All matching source files,
-including files named `*_test.cc`, are included.
+to link a shared library without requiring `main`. Explicit source-file targets
+can still name a test source.
+
+Use `bt build cmd/...` to select source-bearing directories recursively, including
+`cmd` itself. Each directory is built independently, so separate `main` functions
+do not collide. Internal binaries use `build/<config>/packages/<identity>/<name>`;
+the identity includes the absolute directory path. Publishing retains buildtool's
+`bin/<name>` convention: if two packages share a name, that symlink points to the
+last built package. Their internal artifacts remain separate.
+
+Recursive patterns skip symlinked subdirectories, names beginning with `.` or
+`_`, `testdata`, `vendor`, and configured build/output directories. They traverse
+empty parent directories to find source-bearing descendants. An empty match
+prints a warning; a nonexistent root is an error. Only a trailing path component
+`...` is supported, such as `./...` or `cmd/...`.
 
 `bt run cmd/foo --option` uses the same directory build but executes the artifact
 directly without publishing it. A directory without `main` cannot be run.
+
+## Test directory patterns
+
+`bt test lib/foo` selects only immediate `*_test.cc` and `*_test.cpp` files.
+`bt test lib/foo/...` selects tests recursively. Explicit test-file arguments
+remain supported, and overlapping arguments are deduplicated. Each directory's
+selected test files and their discovered dependencies link with the test runner
+into a separate executable; ordinary source dependency discovery is unchanged.
+
+Test binaries live in `build/<config>/tests/<identity>/<directory-name>`, without
+publishing to `bin`. The identity includes the directory and selected test files,
+so an explicit subset cannot reuse a binary with extra tests. Tests execute in
+their source directory, in deterministic directory order. A failed package is
+reported and subsequent packages still run; any failure makes the overall command
+fail. An explicit directory without tests reports `[no test files]`.
+
+`test_target_patterns.py` exercises pattern selection and test execution with a
+fake filesystem and mock processes. `test_directory_build.py` checks independent
+recursive build artifacts and includes an optional real GCC build/test fixture
+(`BT_TEST_GCC=g++`). The existing recursive behavior of `ide`, `bench`, and
+`generate-module-headers` is unchanged.
 
 ## Named module lookup
 
