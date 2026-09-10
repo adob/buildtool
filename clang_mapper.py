@@ -1,46 +1,44 @@
-"""Synchronous JSON-line transport to the patched Clang frontend wrapper."""
+"""JSON-line transport to the patched Clang frontend wrapper."""
 
-import json
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable, Callable, Sequence
 import os
-import shlex
+import inspect
+import json
 import shutil
-import subprocess
+
+if __package__:
+    from .compiler import mapper_pipe, run_compiler
+    from .scheduler import BuildSession, Job
+else:
+    from compiler import mapper_pipe, run_compiler
+    from scheduler import BuildSession, Job
 
 
-def compile_with_mapper(wrapper, command, resolve):
-    """Run one compile; resolve(request) returns a PCM path or raises.
-
-    Each invocation owns its pipes, so resolve can recursively compile imports.
-    The resolver is separate from process execution for in-memory unit tests.
-    """
+async def compile_with_mapper_async(
+    job: Job,
+    wrapper: str | os.PathLike[str],
+    command: Sequence[str | os.PathLike[str]],
+    resolve: Callable[[object], Awaitable[str | os.PathLike[str]]],
+) -> None:
+    """Run wrapper/command in job; await resolve(request) for each PCM path."""
     command = list(map(str, command))
-    # Clang's driver API uses argv[0] to locate its resource headers.
     command[0] = shutil.which(command[0]) or command[0]
-    parent_read, child_write = os.pipe()
-    child_read, parent_write = os.pipe()
-    process = None
-    try:
-        wrapper_command = [str(wrapper), "--mapper-fds", str(child_read),
-                           str(child_write), "--", *command]
-        print(shlex.join(wrapper_command), flush=True)
-        process = subprocess.Popen(
-            wrapper_command,
-            pass_fds=(child_read, child_write),
-        )
-    finally:
-        os.close(child_read)
-        os.close(child_write)
-        if process is None:
-            os.close(parent_read)
-            os.close(parent_write)
-    try:
-        with os.fdopen(parent_read, "r") as requests, os.fdopen(parent_write, "w") as replies:
-            for line in requests:
+    async with mapper_pipe() as (requests, replies, child_input, child_output):
+        read_fd, write_fd = child_input.fileno(), child_output.fileno()
+        wrapper_command = [str(wrapper), "--mapper-fds", str(read_fd),
+                           str(write_fd), "--", *command]
+
+        async def protocol(process: asyncio.subprocess.Process) -> None:
+            """Serve process's requests; close parent copies so EOF is observable."""
+            child_input.close()
+            child_output.close()
+            while line := await requests.readline():
                 try:
-                    reply = {"pcm": str(resolve(json.loads(line)))}
-                except BaseException as error:
-                    # Includes SystemExit from existing buildtool failures.
-                    # Wake the blocked child before propagating the failure.
+                    reply = {"pcm": str(await resolve(json.loads(line)))}
+                except Exception as error:
                     try:
                         replies.write(json.dumps({"error": str(error)}) + "\n")
                         replies.flush()
@@ -49,14 +47,31 @@ def compile_with_mapper(wrapper, command, resolve):
                     raise
                 replies.write(json.dumps(reply) + "\n")
                 replies.flush()
-        code = process.wait()
-        if code:
-            raise subprocess.CalledProcessError(code, command)
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
+
+        await run_compiler(job, wrapper_command, protocol=protocol,
+                           pass_fds=(read_fd, write_fd), color_diagnostics=True)
+
+
+def compile_with_mapper(
+    wrapper: str | os.PathLike[str],
+    command: Sequence[str | os.PathLike[str]],
+    resolve: Callable[[object], str | os.PathLike[str] | Awaitable[str | os.PathLike[str]]],
+) -> None:
+    """Synchronous entry point; resolve(request) may return a path or awaitable."""
+    async def run() -> None:
+        """Create a one-job session for this standalone mapper invocation."""
+        session = BuildSession()
+
+        async def resolve_async(request: object) -> str | os.PathLike[str]:
+            """Adapt this caller's resolver for the asynchronous transport."""
+            result = resolve(request)
+            return await result if inspect.isawaitable(result) else result
+
+        async def work(job: Job) -> None:
+            """Execute the supplied wrapper command within job's output stream."""
+            await compile_with_mapper_async(job, wrapper, command, resolve_async)
+
+        session.schedule(str(command), work)
+        await session.finish()
+
+    asyncio.run(run())

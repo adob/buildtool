@@ -1,5 +1,6 @@
 """Command flags preserve caller order across processes and cached builds."""
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -110,7 +111,7 @@ print(json.dumps({"command": command, "need_recompile": source.need_recompile}))
         source = bt.SourceFile.get(bt.Path("main.cc"), cfg)
         source.check_up_to_date(cfg)
         target = bt.Target(bt.Path("main"), cfg)
-        source.build_deps(target, cfg)
+        asyncio.run(source.build_deps(target, cfg))
         self.assertEqual(target.get_linkflags(), ["-lz", "-la", "-lm"])
 
     def test_old_unordered_directory_cache_is_regenerated(self):

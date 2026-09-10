@@ -18,7 +18,8 @@ llvm_config = os.environ.get(
     "BT_LLVM_CONFIG", str(Path.home() / "Downloads/LLVM-23.1.0-Linux-X64/bin/llvm-config"))
 
 
-def llvm_flags(*args):
+def llvm_flags(*args: str) -> list[str]:
+    """Return LLVM flags from llvm-config invoked with args."""
     return shlex.split(subprocess.check_output([llvm_config, *args], text=True))
 
 

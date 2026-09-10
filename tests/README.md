@@ -9,8 +9,91 @@ python3 -m unittest discover -s tests -v
 The tests use the Python standard library. No GCC, Clang, pkg-config, or
 third-party Python packages are required.
 
+## Parallel compilation and output
+
+CLI builds use the CPU count as their requested concurrency. Available memory
+caps this at an estimated **2 GiB per active compiler**, with a minimum of one.
+Startup prints the selected limit, requested limit, and available memory.
+Set an explicit upper limit with:
+
+```sh
+bt build -j4 cmd/hello.cc
+bt build --clang -j4 cmd/hello.cc
+```
+
+`run`, `test`, and `bench` accept the same `-j` / `--jobs` option. The Python
+API accepts `BuildConfig(JOBS=4)`; its default remains one active compiler.
+Pass `memory=MemoryBudget()` to enable the same memory policy and startup report
+in the Python API. Tests can inject `MemoryBudget(available=callable)` returning
+available bytes (or `None` for unknown capacity).
+
+Before granting another compiler slot, the scheduler checks available memory
+again, reserving 2 GiB for each active compiler plus the new one. This
+conservatively allows for growth in running compilers. It retries every half
+second while memory blocks queued work. Running compilers are not killed.
+Linux accounting uses `/proc/meminfo`'s `MemAvailable`, further constrained by
+readable cgroup-v2 limits under `/sys/fs/cgroup`. If accounting is unavailable,
+the requested concurrency applies. The startup cap stays fixed for that build;
+later checks can temporarily reduce concurrency further.
+
+This is a soft estimate: a compiler may need more than 2 GiB, and blocked
+importers retain memory. One active compiler is always allowed so a build can
+make progress, including nested module imports, even below the estimate.
+
+`Target.compile_many(paths)` and package-level `build([paths...], cfg)` schedule
+multiple roots together. `Target.compile(path)` remains a synchronous entry
+point for one root and its dynamically discovered dependencies.
+
+Compilation order and output order are independent. The reporter starts with
+the target's root job and streams its output immediately. When that job
+finishes successfully, its discovered jobs enter the back of the reporting
+queue. Each job's complete stream is printed before the next job's stream.
+Shared dependencies appear once, in breadth-first discovery order, even if
+another importer happened to start building them first. Compiler stdout and
+stderr share a stream; other jobs' output is buffered, spilling to temporary
+files above 1 MiB per job. Warning output follows the same rules as other output.
+Compiler diagnostics retain colors when the reporter writes to a terminal.
+Redirected output, `TERM=dumb`, and nonempty `NO_COLOR` disable automatic color
+forcing; explicit compiler color flags are preserved. The automatic color flag
+is applied only at execution time, so terminal detection does not affect build
+metadata or trigger recompilation.
+
+When the job being printed fails, reporting stops and remaining processes are
+terminated and reaped. A failure in a later queued job does not interrupt the
+current stream. If a module failure causes its importer to fail, the underlying
+module diagnostic is included in the importer's stream so stopping there does
+not hide the cause. Linking and the public symlink update require every job to
+succeed. Keyboard interruption also cancels outstanding work.
+
+The scheduler runs on one asyncio event loop, keeping cache mutations on one
+thread. Jobs that wait for modules release their compiler slots and reacquire
+them before their compiler resumes. Dependencies and resumptions have priority
+over unrelated queued sources. Blocked compiler processes still occupy memory:
+`-j` limits active compilation, not the total number of resident processes.
+Compiler subprocesses run in separate process groups so cancellation can also
+stop children launched by a compiler driver.
+
+Output order is stable for the same root/dependency encounter order, rather
+than sorted by completion time. Individual compilers can discover dependencies
+in different orders. Commands include actual runtime pipe descriptors, and
+elapsed times naturally vary. Directory linker flags and object inputs are
+collected by deterministic traversal, independently of completion order.
+
+For review, the implementation is divided into:
+
+1. `scheduler.py`: shared jobs, execution slots and the streaming output queue.
+2. `compiler.py` and `clang_mapper.py`: subprocess lifetime, output capture and
+   mapper transport.
+3. `buildtool.py`: async dependency traversal, backend integration, deterministic
+   link inputs and CLI wiring.
+
 `test_clang_wrapper.py` also has opt-in real compiler tests for the patched
 Clang wrapper. See [build and test instructions](../clang-wrapper/README.md).
+`test_parallel_compilers.py` exercises concurrent sources importing a shared
+named module and header unit, including no-op and changed-header rebuilds.
+Set `BT_TEST_GCC` to a GCC executable to enable its GCC case; its Clang case
+uses the same environment variables as the wrapper tests. Optional
+`BT_TEST_GCC_LDFLAGS` and `BT_TEST_CLANG_LDFLAGS` supply linker flags.
 
 CLI builds use `build/release` and `build/debug` for GCC, and `build/release+clang`
 and `build/debug+clang` for Clang. Custom object and dependency roots receive the
@@ -117,5 +200,7 @@ with a fake that reads and writes through the injected filesystem.
   configuration cache isolation, and source
   discovery/compilation-database generation without host file access.
 
-Only the real-filesystem contract tests use temporary directories. Incremental
-build tests need no disk writes, sleeps, filesystem mocks, or clock patches.
+Subprocess transport tests launch tiny Python programs without a C++ compiler.
+Incremental VFS build tests need no disk writes, sleeps, filesystem mocks, or
+clock patches. Real filesystem, subprocess and opt-in compiler tests use
+temporary storage.

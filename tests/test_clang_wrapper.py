@@ -1,5 +1,6 @@
 """Mapper protocol tests, plus opt-in end-to-end tests with patched Clang."""
 
+import asyncio
 import contextlib
 import io
 import json
@@ -27,9 +28,9 @@ class ClangMapperTests(unittest.TestCase):
             ({"kind": "module", "name": "math:detail"}, "math:detail"),
         ]:
             module = mock.Mock(cmpath=bt.Path("build/test.pcm"))
-            module.build.return_value = "hash"
+            module.build = mock.AsyncMock(return_value="hash")
             with mock.patch.object(bt.CompiledModule, "get", return_value=module) as get:
-                self.assertEqual(source.resolve_clang_module(request, target, cfg),
+                self.assertEqual(asyncio.run(source.resolve_clang_module(request, target, cfg)),
                                  "/workspace/build/test.pcm")
             get.assert_called_once_with(name, cfg,
                                         bt.SourceType.USER_HEADER if request['kind'] == 'header' else None)
@@ -44,7 +45,7 @@ class ClangMapperTests(unittest.TestCase):
         for request in [None, {}, {"kind": "header", "path": "relative.h"},
                         {"kind": "module", "name": "../escape"}]:
             with self.subTest(request=request), self.assertRaises(ValueError):
-                source.resolve_clang_module(request, None, cfg)
+                asyncio.run(source.resolve_clang_module(request, None, cfg))
 
     def test_header_command_keeps_package_flags_and_depfile(self):
         fs = bt.MemoryFileSystem()

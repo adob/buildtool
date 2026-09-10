@@ -1,5 +1,7 @@
 """Filesystem operations used by buildtool, with real and in-memory backends."""
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 import errno
@@ -20,41 +22,41 @@ class DirectoryEntry:
 
 class FileSystem(ABC):
     @abstractmethod
-    def stat(self, path) -> os.stat_result:
+    def stat(self, path: str | os.PathLike[str]) -> os.stat_result:
         pass
 
     @abstractmethod
-    def read_bytes(self, path) -> bytes:
+    def read_bytes(self, path: str | os.PathLike[str]) -> bytes:
         pass
 
     @abstractmethod
-    def write_bytes(self, path, data: bytes):
+    def write_bytes(self, path: str | os.PathLike[str], data: bytes) -> None:
         pass
 
     @abstractmethod
-    def makedirs(self, path, exist_ok=False):
+    def makedirs(self, path: str | os.PathLike[str], exist_ok: bool = False) -> None:
         pass
 
     @abstractmethod
-    def replace(self, source, destination):
+    def replace(self, source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
         """Atomically replace a file with another file on the same filesystem."""
         pass
 
     @abstractmethod
-    def unlink(self, path):
+    def unlink(self, path: str | os.PathLike[str]) -> None:
         pass
 
     @abstractmethod
-    def symlink(self, target, path):
+    def symlink(self, target: str | os.PathLike[str], path: str | os.PathLike[str]) -> None:
         """Create a symbolic link, preserving the target's relative spelling."""
         pass
 
     @abstractmethod
-    def readlink(self, path) -> str:
+    def readlink(self, path: str | os.PathLike[str]) -> str:
         pass
 
     @abstractmethod
-    def scandir(self, path) -> list[DirectoryEntry]:
+    def scandir(self, path: str | os.PathLike[str]) -> list[DirectoryEntry]:
         pass
 
     @abstractmethod
@@ -62,73 +64,73 @@ class FileSystem(ABC):
         pass
 
     @abstractmethod
-    def chdir(self, path):
+    def chdir(self, path: str | os.PathLike[str]) -> None:
         pass
 
-    def abspath(self, path) -> str:
+    def abspath(self, path: str | os.PathLike[str]) -> str:
         return os.path.normpath(os.path.join(self.getcwd(), os.fspath(path)))
 
-    def read_text(self, path) -> str:
+    def read_text(self, path: str | os.PathLike[str]) -> str:
         return self.read_bytes(path).decode("utf-8")
 
-    def write_text(self, path, text: str):
+    def write_text(self, path: str | os.PathLike[str], text: str) -> None:
         self.write_bytes(path, text.encode("utf-8"))
 
-    def is_file(self, path) -> bool:
+    def is_file(self, path: str | os.PathLike[str]) -> bool:
         try:
             return stat.S_ISREG(self.stat(path).st_mode)
         except (FileNotFoundError, NotADirectoryError):
             return False
 
-    def is_dir(self, path) -> bool:
+    def is_dir(self, path: str | os.PathLike[str]) -> bool:
         try:
             return stat.S_ISDIR(self.stat(path).st_mode)
         except (FileNotFoundError, NotADirectoryError):
             return False
 
-    def sha256(self, path) -> str:
+    def sha256(self, path: str | os.PathLike[str]) -> str:
         return hashlib.sha256(self.read_bytes(path)).hexdigest()
 
 
 class RealFileSystem(FileSystem):
-    def stat(self, path):
+    def stat(self, path: str | os.PathLike[str]) -> os.stat_result:
         return os.stat(path)
 
-    def read_bytes(self, path):
+    def read_bytes(self, path: str | os.PathLike[str]) -> bytes:
         return Path(path).read_bytes()
 
-    def write_bytes(self, path, data):
+    def write_bytes(self, path: str | os.PathLike[str], data: bytes) -> None:
         Path(path).write_bytes(data)
 
-    def makedirs(self, path, exist_ok=False):
+    def makedirs(self, path: str | os.PathLike[str], exist_ok: bool = False) -> None:
         os.makedirs(path, exist_ok=exist_ok)
 
-    def replace(self, source, destination):
+    def replace(self, source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
         os.replace(source, destination)
 
-    def unlink(self, path):
+    def unlink(self, path: str | os.PathLike[str]) -> None:
         os.unlink(path)
 
-    def symlink(self, target, path):
+    def symlink(self, target: str | os.PathLike[str], path: str | os.PathLike[str]) -> None:
         os.symlink(target, path)
 
-    def readlink(self, path):
+    def readlink(self, path: str | os.PathLike[str]) -> str:
         return os.readlink(path)
 
-    def scandir(self, path):
+    def scandir(self, path: str | os.PathLike[str]) -> list[DirectoryEntry]:
         with os.scandir(path) as entries:
             return [DirectoryEntry(
                 entry.path, entry.name, entry.is_file(), entry.is_dir(),
                 entry.is_symlink(),
             ) for entry in entries]
 
-    def getcwd(self):
+    def getcwd(self) -> str:
         return os.getcwd()
 
-    def chdir(self, path):
+    def chdir(self, path: str | os.PathLike[str]) -> None:
         os.chdir(path)
 
-    def sha256(self, path):
+    def sha256(self, path: str | os.PathLike[str]) -> str:
         # Header-unit PCMs can be hundreds of MB: stream rather than copy them.
         with open(path, "rb", buffering=0) as source:
             return hashlib.file_digest(source, "sha256").hexdigest()
@@ -148,20 +150,27 @@ class MemoryFileSystem(FileSystem):
     This backend does not emulate permissions or external processes.
     """
 
-    def __init__(self, cwd="/workspace"):
+    def __init__(self, cwd: str | os.PathLike[str] = '/workspace') -> None:
         self._clock = 1000.0
         self._cwd = os.sep
         self._entries = {self._cwd: _MemoryEntry(None, self._clock)}
         self.makedirs(cwd, exist_ok=True)
         self.chdir(cwd)
 
-    def advance(self, seconds=1):
+    def advance(self, seconds: float = 1) -> float:
         if seconds < 0:
             raise ValueError("The filesystem clock cannot move backwards")
         self._clock += seconds
         return self._clock
 
-    def _resolve(self, path, *, follow_final=True, missing_ok=False, links=0):
+    def _resolve(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        follow_final: bool = True,
+        missing_ok: bool = False,
+        links: int = 0,
+    ) -> str:
         parts = self.abspath(path).split(os.sep)[1:]
         current = os.sep
         for index, part in enumerate(parts):
@@ -183,34 +192,34 @@ class MemoryFileSystem(FileSystem):
                 raise NotADirectoryError(current)
         return current
 
-    def _entry(self, path):
+    def _entry(self, path: str | os.PathLike[str]) -> _MemoryEntry:
         return self._entries[self._resolve(path)]
 
-    def _require_directory(self, path):
+    def _require_directory(self, path: str | os.PathLike[str]) -> None:
         if self._entry(path).data is not None:
             raise NotADirectoryError(os.fspath(path))
 
-    def stat(self, path):
+    def stat(self, path: str | os.PathLike[str]) -> os.stat_result:
         entry = self._entry(path)
         mode = stat.S_IFDIR | 0o755 if entry.data is None else stat.S_IFREG | 0o644
         size = 0 if entry.data is None else len(entry.data)
         return os.stat_result((mode, 0, 0, 1, 0, 0, size,
                                entry.mtime, entry.mtime, entry.mtime))
 
-    def read_bytes(self, path):
+    def read_bytes(self, path: str | os.PathLike[str]) -> bytes:
         entry = self._entry(path)
         if entry.data is None:
             raise IsADirectoryError(os.fspath(path))
         return entry.data
 
-    def write_bytes(self, path, data):
+    def write_bytes(self, path: str | os.PathLike[str], data: bytes) -> None:
         path = self._resolve(path, missing_ok=True)
         self._require_directory(os.path.dirname(path))
         if self.is_dir(path):
             raise IsADirectoryError(path)
         self._entries[path] = _MemoryEntry(bytes(data), self.advance())
 
-    def makedirs(self, path, exist_ok=False):
+    def makedirs(self, path: str | os.PathLike[str], exist_ok: bool = False) -> None:
         path = self._resolve(path, missing_ok=True)
         if path in self._entries:
             if not exist_ok or self._entries[path].data is not None:
@@ -222,7 +231,7 @@ class MemoryFileSystem(FileSystem):
         self.makedirs(parent, exist_ok=True)
         self._entries[path] = _MemoryEntry(None, self.advance())
 
-    def replace(self, source, destination):
+    def replace(self, source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
         source = self._resolve(source, follow_final=False)
         destination = self._resolve(destination, follow_final=False, missing_ok=True)
         entry = self._entries[source]
@@ -237,7 +246,7 @@ class MemoryFileSystem(FileSystem):
             del self._entries[source]
             self.advance()
 
-    def unlink(self, path):
+    def unlink(self, path: str | os.PathLike[str]) -> None:
         path = self._resolve(path, follow_final=False)
         entry = self._entries[path]
         if entry.data is None and entry.target is None:
@@ -245,21 +254,21 @@ class MemoryFileSystem(FileSystem):
         del self._entries[path]
         self.advance()
 
-    def symlink(self, target, path):
+    def symlink(self, target: str | os.PathLike[str], path: str | os.PathLike[str]) -> None:
         path = self._resolve(path, follow_final=False, missing_ok=True)
         self._require_directory(os.path.dirname(path))
         if path in self._entries:
             raise FileExistsError(path)
         self._entries[path] = _MemoryEntry(None, self.advance(), os.fspath(target))
 
-    def readlink(self, path):
+    def readlink(self, path: str | os.PathLike[str]) -> str:
         path = self._resolve(path, follow_final=False)
         target = self._entries[path].target
         if target is None:
             raise OSError(errno.EINVAL, "Not a symbolic link", path)
         return target
 
-    def scandir(self, path):
+    def scandir(self, path: str | os.PathLike[str]) -> list[DirectoryEntry]:
         self._require_directory(path)
         absolute = self._resolve(path)
         return [DirectoryEntry(
@@ -269,9 +278,9 @@ class MemoryFileSystem(FileSystem):
         ) for name, entry in sorted(self._entries.items())
                 if name != absolute and os.path.dirname(name) == absolute]
 
-    def getcwd(self):
+    def getcwd(self) -> str:
         return self._cwd
 
-    def chdir(self, path):
+    def chdir(self, path: str | os.PathLike[str]) -> None:
         self._require_directory(path)
         self._cwd = self._resolve(path)

@@ -157,13 +157,15 @@ int main(int Argc, char **Argv) {
   llvm::InitializeNativeTargetAsmPrinter();
   llvm::InitializeNativeTargetAsmParser();
 
-  DiagnosticOptions DiagOpts;
-  DiagnosticsEngine Diags(DiagnosticIDs::create(), DiagOpts,
-                          new TextDiagnosticPrinter(llvm::errs(), DiagOpts));
+  auto DriverArgs = llvm::ArrayRef<const char *>(Argv + 5, Argc - 5);
+  // The driver forwards color settings from its diagnostic options to cc1.
+  // Parse argv as the regular Clang driver does instead of using defaults.
+  auto DiagOpts = CreateAndPopulateDiagOpts(DriverArgs);
+  DiagnosticsEngine Diags(DiagnosticIDs::create(), *DiagOpts,
+                          new TextDiagnosticPrinter(llvm::errs(), *DiagOpts));
   // Use the real driver's path for builtin headers and toolchain discovery.
   driver::Driver Driver(Argv[5], llvm::sys::getDefaultTargetTriple(), Diags);
-  std::unique_ptr<driver::Compilation> Jobs(Driver.BuildCompilation(
-      llvm::ArrayRef<const char *>(Argv + 5, Argc - 5)));
+  std::unique_ptr<driver::Compilation> Jobs(Driver.BuildCompilation(DriverArgs));
   if (!Jobs || Diags.hasErrorOccurred())
     return 1;
   // Validate before executing anything; links/offloading/multiple inputs need

@@ -1,5 +1,6 @@
 """Build scheduling tests; no installed C++ compiler is required."""
 
+import asyncio
 import json
 import unittest
 from unittest import mock
@@ -32,6 +33,7 @@ class BuildDecisionTests(unittest.TestCase):
             side_effect=lambda *args: self.events.append("update"),
         ))
         self.module = mock.Mock()
+        self.module.build = mock.AsyncMock()
         self.enterContext(mock.patch.object(
             bt.CompiledModule, "get", return_value=self.module
         ))
@@ -42,7 +44,7 @@ class BuildDecisionTests(unittest.TestCase):
             return digest
 
         self.module.build.side_effect = build_dependency
-        self.source.build(self.target, self.cfg)
+        asyncio.run(self.source.build(self.target, self.cfg))
 
     def test_changed_module_is_checked_before_importer_recompile(self):
         self.build_with_dependency_hash("new-hash")
@@ -83,7 +85,8 @@ class IncrementalModuleTests(unittest.TestCase):
     def source(self, name, **contents):
         self.write(bt.Path(name + ".cc"), json.dumps(contents), vfs=self.fs)
 
-    def fake_compile(self, source, target, cfg):
+    async def fake_compile(self, source, target, cfg):
+        """Compile JSON source through cfg VFS, awaiting target module jobs."""
         name = str(source.path)
         if name == self.fail_source:
             raise RuntimeError("compiler failed: " + name)
@@ -92,7 +95,7 @@ class IncrementalModuleTests(unittest.TestCase):
         source.deps = {}
         for imported in contents.get("imports", []):
             module = bt.CompiledModule.get(imported, cfg)
-            digest = module.build(target, inherited_dircfg=source.dircfg())
+            digest = await module.build(target, inherited_dircfg=source.dircfg(), parent=source.job)
             source.deps[bt.ModuleDep(imported, digest)] = None
             value += int(cfg.vfs.read_text(module.cmpath))
         self.calls.append(name)

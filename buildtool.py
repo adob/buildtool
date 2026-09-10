@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import os
+import asyncio
 import json
 import subprocess
 import shlex
@@ -10,7 +11,9 @@ import sys
 import re
 from datetime import datetime
 import time
-from typing import Dict, Set
+from collections.abc import Iterable, Iterator, Sequence
+from types import NotImplementedType
+from typing import Any
 import pathlib
 from enum import Enum, StrEnum
 from dataclasses import dataclass
@@ -18,10 +21,16 @@ from uuid import uuid4
 
 if __package__:
     from .vfs import FileSystem, RealFileSystem, MemoryFileSystem
-    from .clang_mapper import compile_with_mapper
+    from .clang_mapper import compile_with_mapper_async
+    from .compiler import mapper_pipe, run_compiler
+    from .scheduler import BuildSession, Job
+    from .memory import MemoryBudget
 else:
     from vfs import FileSystem, RealFileSystem, MemoryFileSystem
-    from clang_mapper import compile_with_mapper
+    from clang_mapper import compile_with_mapper_async
+    from compiler import mapper_pipe, run_compiler
+    from scheduler import BuildSession, Job
+    from memory import MemoryBudget
 
 _DEFAULT_VFS = RealFileSystem()
 
@@ -92,33 +101,53 @@ HFILE_SUFFIXES  = ('.h', '.hpp', '.hh')
 
 THIS_MTIME = 0
 
-def auto_str(cls):
-    def __str__(self):
-        clsname = cls.__name__
-        attrs = ", ".join(f"{k}={v!r}" for k, v in self.__dict__.items())
-        return f"{clsname}({attrs})"
-    cls.__str__ = __str__
-    return cls
-
-@auto_str
+# Generate the representation while retaining custom initialization and identity.
+@dataclass(init=False, eq=False)
 class BuildConfig:
-    def __init__(self,
-                 CC=CC,
-                 CXX=CXX,
-                 COMPILE_FLAGS=[],
-                 CFLAGS=Release.CFLAGS,
-                 CXXFLAGS=CXXFLAGS,
-                 LDFLAGS=LDFLAGS,
-                 OBJDIR=Release.OBJDIR, 
-                 DEPDIR=Release.DEPDIR, 
-                 SRCDIR=SRCDIR, 
-                 BINDIR=BINDIR, 
-                 INCFLAGS=INCFLAGS,
-                 SUFFIX="",
-                 OUTFILE=None,
-                 USECLANG=False,
-                 CLANG_WRAPPER=None,
-                 vfs: FileSystem = _DEFAULT_VFS):
+    vfs: FileSystem
+    CC: str
+    CXX: str
+    CFLAGS: list[str]
+    CXXFLAGS: list[str]
+    LDFLAGS: list[str]
+    OBJDIR: Path
+    DEPDIR: Path
+    SRCDIR: Path
+    BINDIR: Path
+    INCFLAGS: list[str]
+    SUFFIX: str
+    OUTFILE: str | None
+    USECLANG: bool
+    CLANG_WRAPPER: str | None
+    JOBS: int
+    memory: MemoryBudget | None
+    source_files: dict[Path, SourceFile]
+    compiled_modules: dict[str, CompiledModule]
+    directory_configs: dict[Path, DirectoryConfig]
+    header_deps: dict[Path, HeaderDep]
+    compiler_commands: dict[SourceFile, list[str]]
+
+    def __init__(
+        self,
+        CC: str = CC,
+        CXX: str = CXX,
+        COMPILE_FLAGS: list[str] = [],
+        CFLAGS: list[str] = Release.CFLAGS,
+        CXXFLAGS: list[str] = CXXFLAGS,
+        LDFLAGS: list[str] = LDFLAGS,
+        OBJDIR: str | os.PathLike[str] = Release.OBJDIR,
+        DEPDIR: str | os.PathLike[str] = Release.DEPDIR,
+        SRCDIR: str | os.PathLike[str] = SRCDIR,
+        BINDIR: str | os.PathLike[str] = BINDIR,
+        INCFLAGS: list[str] = INCFLAGS,
+        SUFFIX: str = '',
+        OUTFILE: str | None = None,
+        USECLANG: bool = False,
+        CLANG_WRAPPER: str | None = None,
+        JOBS: int = 1,
+        memory: MemoryBudget | None = None,
+        vfs: FileSystem = _DEFAULT_VFS,
+    ) -> None:
         self.vfs = vfs
         self.CC = CC
         self.CXX = CXX
@@ -134,14 +163,17 @@ class BuildConfig:
         self.OUTFILE = OUTFILE
         self.USECLANG = USECLANG
         self.CLANG_WRAPPER = CLANG_WRAPPER
-        self.active_modules = set()
-        self.source_files: dict[Path, SourceFile] = {}
-        self.compiled_modules: dict[str, CompiledModule] = {}
-        self.directory_configs: dict[Path, DirectoryConfig] = {}
-        self.header_deps: dict[Path, HeaderDep] = {}
-        self.compiler_commands: dict[SourceFile, list[str]] = {}
+        if JOBS < 1:
+            raise ValueError("JOBS must be at least 1")
+        self.JOBS = JOBS
+        self.memory = memory
+        self.source_files = {}
+        self.compiled_modules = {}
+        self.directory_configs = {}
+        self.header_deps = {}
+        self.compiler_commands = {}
 
-    def reset_build_state(self):
+    def reset_build_state(self) -> None:
         """Clear this configuration's caches, retaining filesystem contents.
 
         Create new targets and sources before starting the next build.
@@ -151,7 +183,6 @@ class BuildConfig:
         self.directory_configs.clear()
         self.header_deps.clear()
         self.compiler_commands.clear()
-        self.active_modules.clear()
 
 class TargetType(Enum):
     EXECUTABLE = 1
@@ -185,7 +216,7 @@ class Path():
     #    print("INIT")
         
     
-    def __init__(self, *paths: str):
+    def __init__(self, *paths: str | os.PathLike[str]) -> None:
         #paths = [str(p) for p in paths]
         #normalized = os.path.normpath('/'.join(paths))
 
@@ -201,7 +232,7 @@ class Path():
         self.name = self.path.name
 
     @property
-    def parent(self):
+    def parent(self) -> Path:
         parent = self.path.parent
         if parent is None:
             return None
@@ -209,11 +240,11 @@ class Path():
         return Path(parent)
     
     @property
-    def stem(self):
+    def stem(self) -> str:
         return self.path.stem
 
     @property
-    def anchor(self):
+    def anchor(self) -> str:
         return self.path.anchor
 
     #    paths = [str(p) for p in paths]
@@ -225,25 +256,25 @@ class Path():
     def with_extra_suffix(self, suffix: str) -> 'Path':
         return self.with_name(self.name + suffix)
     
-    def try_stat(self, vfs: FileSystem):
+    def try_stat(self, vfs: FileSystem) -> os.stat_result | None:
         try:
             return vfs.stat(self.path)
         except FileNotFoundError:
             return None
         
-    def mtime(self, vfs: FileSystem):
+    def mtime(self, vfs: FileSystem) -> float:
         stat = self.try_stat(vfs)
         if stat is None:
             return 0
         return stat.st_mtime
     
-    def exists(self, vfs: FileSystem):
+    def exists(self, vfs: FileSystem) -> bool:
         return self.try_stat(vfs) is not None
     
-    def __str__(self):
+    def __str__(self) -> str:
         return  str(self.path)
     
-    def __truediv__(self, other):
+    def __truediv__(self, other: str | os.PathLike[str]) -> Path:
         if not isinstance(other, Path):
             other = Path(other)
 
@@ -253,13 +284,13 @@ class Path():
 
         return Path(self.path / p)
     
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other: str | os.PathLike[str]) -> Path:
         if isinstance(other, Path):
             return other / self
             
         return Path(other / self.path)
     
-    def relative_to(self, other):
+    def relative_to(self, other: str | os.PathLike[str]) -> Path:
         if isinstance(other, Path):
             #print("relative_to", self.path, other, Path(self.path.relative_to(other.path)))
             return Path(self.path.relative_to(other.path))
@@ -267,39 +298,39 @@ class Path():
         #print("relative_to", self.path, other, Path(self.path.relative_to(other)))
         return Path(self.path.relative_to(other))
     
-    def with_suffix(self, suffix):
+    def with_suffix(self, suffix: str) -> Path:
         return Path(self.path.with_suffix(suffix))
     
-    def with_name(self, name):
+    def with_name(self, name: str) -> Path:
         return Path(self.path.with_name(name))
     
-    def read_text(self, vfs: FileSystem):
+    def read_text(self, vfs: FileSystem) -> str:
         return vfs.read_text(self.path)
     
-    def is_dir(self, vfs: FileSystem):
+    def is_dir(self, vfs: FileSystem) -> bool:
         return vfs.is_dir(self.path)
     
-    def is_file(self, vfs: FileSystem):
+    def is_file(self, vfs: FileSystem) -> bool:
         return vfs.is_file(self.path)
     
-    def is_absolute(self):
+    def is_absolute(self) -> bool:
         return self.path.is_absolute()
     
     def __fspath__(self) -> str:
         return self.path.__fspath__()
     
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool | NotImplementedType:
         if isinstance(other, Path):
             return self.path == other.path
         
         return NotImplemented
     
-    def __hash__(self):
+    def __hash__(self) -> int:
         return hash(self.path)
 
 class CompiledModule:
     @staticmethod
-    def get(name: str, cfg: BuildConfig, type=None):
+    def get(name: str, cfg: BuildConfig, type: SourceType | None = None) -> CompiledModule:
         mod = cfg.compiled_modules.get(name)
         if mod:
             return mod
@@ -307,7 +338,7 @@ class CompiledModule:
         cfg.compiled_modules[name] = mod
         return mod
     
-    def __init__(self, name: str, type:SourceType = None):
+    def __init__(self, name: str, type: SourceType | None = None) -> None:
         self.name = name
         if type is not None:
             self.type = type
@@ -322,26 +353,24 @@ class CompiledModule:
         # self.cmfile = mod2cm(name)
         # self.cmfile_path = OBJDIR / self.cmfile
 
-    def build(self, target, inherited_dircfg: DirectoryConfig):
-        debug_log("CompiledModule.build()")
-        if self.cmhash:
-            return self.cmhash
-        
-        if self.name in target.cfg.active_modules:
-            raise RuntimeError(f"Cyclic module import: {self.name}")
-        target.cfg.active_modules.add(self.name)
-        try:
-            self.srcpath = target.mod2src(self.name, self.type)
-            self.srcfile = target.compile(self.srcpath, type=self.type, modname=self.name, inherited_dircfg=inherited_dircfg)
-        finally:
-            target.cfg.active_modules.remove(self.name)
+    async def build(self, target: Target, inherited_dircfg: DirectoryConfig | None, parent: Job) -> str:
+        """Build this module for target using inherited_dircfg's flags.
 
+        Runs in the importing parent job, which waits for the module job.
+        """
+        self.srcpath = target.mod2src(self.name, self.type)
+        module_job = target.schedule_compilation_job(
+            self.srcpath, type=self.type, modname=self.name,
+            inherited_dircfg=inherited_dircfg, parent=parent)
+        await parent.wait_for_dependency(module_job)
+        self.srcfile = target.job_sources[module_job]
         self.cmpath = self.srcfile.cmpath
-        self.cmhash = sha256_file(self.cmpath, target.cfg.vfs)
+        if self.cmhash is None:
+            self.cmhash = sha256_file(self.cmpath, target.cfg.vfs)
         return self.cmhash
 
 class Target:
-    def __init__(self, path: Path, cfg: BuildConfig):
+    def __init__(self, path: Path, cfg: BuildConfig) -> None:
         self.path = path
         self.srcfiles = set()
         self.objs = []
@@ -350,37 +379,103 @@ class Target:
         self.most_recent_output_mtime = 0
         self.extra_linkflags = []
         self.cfg = cfg
+        self.session = None
 
-    def compile(self, path: Path, type=None, modname: str=None, inherited_dircfg: DirectoryConfig=None):
-        if type is not None:
-            pass
-        elif path.suffix in CCFILE_SUFFIXES:
-            type = SourceType.CPP
-        elif path.suffix in ('.c'):
-            type = SourceType.C
-        elif path.suffix in ('.S', '.s'):
-            type = SourceType.ASM
-        else:
-            warn("unrecognized file type: %s" % path)
-            exit(1)
+    def compile(
+        self,
+        path: Path,
+        type: SourceType | None = None,
+        modname: str | None = None,
+        inherited_dircfg: DirectoryConfig | None = None,
+    ) -> SourceFile:
+        """Build path synchronously; optional type/name/flags describe a module."""
+        self.compile_many([(path, type, modname, inherited_dircfg)])
+        return SourceFile.get(path, self.cfg)
 
-        file = SourceFile.get(path, self.cfg, type=type, modname=modname, inherited_dircfg=inherited_dircfg)
-        if file in self.processed_files:
-            return
-        self.processed_files.add(file)
+    def compile_many(
+        self,
+        sources: Iterable[Path | tuple[Path, SourceType | None, str | None, DirectoryConfig | None]],
+    ) -> None:
+        """Build source paths or (path, type, module name, directory config) tuples."""
+        async def run() -> None:
+            """Schedule this target's roots and consume their ordered output."""
+            self.session = BuildSession(self.cfg.JOBS, memory=self.cfg.memory)
+            self.job_sources = {}
+            self.link_events = {}
+            try:
+                for source in sources:
+                    if isinstance(source, tuple):
+                        path, kind, name, directory = source
+                        self.schedule_compilation_job(path, kind, name, directory)
+                    else:
+                        self.schedule_compilation_job(source)
+                await self.session.finish()
+                self.collect_link_inputs()
+            finally:
+                # Scheduling can fail before finish() takes ownership of cleanup.
+                await self.session.close()
+                self.session = None
 
-        debug_log(f"processing {path} type={type}")
-        file.build(self, self.cfg)
+        asyncio.run(run())
 
-        if type not in [SourceType.SYSTEM_HEADER, SourceType.USER_HEADER]:
-            self.objs.append(file.objpath)
+    def schedule_compilation_job(
+        self,
+        path: Path,
+        type: SourceType | None = None,
+        modname: str | None = None,
+        inherited_dircfg: DirectoryConfig | None = None,
+        parent: Job | None = None,
+    ) -> Job:
+        """Schedule path once, recording parent order and optional module settings."""
+        if type is None:
+            if path.suffix in CCFILE_SUFFIXES:
+                type = SourceType.CPP
+            elif path.suffix == '.c':
+                type = SourceType.C
+            elif path.suffix in ('.S', '.s'):
+                type = SourceType.ASM
+            else:
+                raise ValueError(f'unrecognized file type: {path}')
+        source = SourceFile.get(path, self.cfg, type=type, modname=modname,
+                                inherited_dircfg=inherited_dircfg)
 
-        if file.output_mtime > self.most_recent_output_mtime:
-            self.most_recent_output_mtime = file.output_mtime
-        
-        return file
+        async def work(job: Job) -> None:
+            """Associate source with job before building through the shared caches."""
+            source.job = job
+            await source.build(self, self.cfg)
 
-    def link(self):
+        job = self.session.schedule(str(source.output_path), work, parent=parent)
+        self.job_sources[job] = source
+        self.link_events.setdefault(job, [])
+        if parent is not None and job not in self.link_events[parent]:
+            self.link_events[parent].append(job)
+        return job
+
+    def collect_link_inputs(self) -> None:
+        """Collect objects and flags in dependency encounter order, not finish order."""
+        visited = set()
+
+        def visit(job: Job) -> None:
+            """Replay job's configuration/dependency events and append its object."""
+            if job in visited:
+                return
+            visited.add(job)
+            for event in self.link_events[job]:
+                if isinstance(event, DirectoryConfig):
+                    self.add_config(event)
+                else:
+                    visit(event)
+            source = self.job_sources[job]
+            if source.type not in (SourceType.SYSTEM_HEADER, SourceType.USER_HEADER):
+                if source.objpath not in self.objs:
+                    self.objs.append(source.objpath)
+            self.most_recent_output_mtime = max(
+                self.most_recent_output_mtime, source.output_mtime)
+
+        for root in self.session.roots:
+            visit(root)
+
+    def link(self) -> Path:
         dirname = self.path.parent
         #buildvars = DirectoryConfig.get(dirname).buildvars
 
@@ -406,7 +501,11 @@ class Target:
         atomic_symlink(public_file, link_target, self.cfg.vfs)
         return public_file
 
-    def add_config(self, config):
+    def add_config(self, config: DirectoryConfig, parent: Job | None = None) -> None:
+        """Record config at parent's discovery position, or add its linker flags."""
+        if parent is not None:
+            self.link_events[parent].append(config)
+            return
         if config in self.configs:
             return
         self.configs.add(config)
@@ -415,7 +514,7 @@ class Target:
             self.extra_linkflags.extend(config.linkflags)
 
 
-    def get_linkflags(self):
+    def get_linkflags(self) -> list[str]:
         lflags = list(self.cfg.LDFLAGS) + self.extra_linkflags
 
         extra = []
@@ -428,10 +527,8 @@ class Target:
         return lflags + extra
     
 
-    def mod2src(self, modname: str, type: SourceType):
-        debug_log("mod2src", modname, type)
+    def mod2src(self, modname: str | None, type: SourceType) -> Path:
         path = mod2path(modname, type)
-        debug_log("TRYING TO FIND module source file", path)
         failed = []
 
         if path.is_absolute():
@@ -445,7 +542,6 @@ class Target:
                     base_path = Path(base_path)
 
                 full_path = base_path / path
-                debug_log("TRYING", full_path)
                 if full_path.exists(self.cfg.vfs):
                     return full_path
                 
@@ -456,12 +552,17 @@ class Target:
                         return srcfile2
                 failed.append(str(srcfile2))
 
-        warn(f"FATAL: Unable to locate module {modname}: the following files do not exist: %s" % ', '.join(failed))
-        exit(1)
+        raise RuntimeError(f"Unable to locate module {modname}: " + ", ".join(failed))
 
 class SourceFile:
     @staticmethod
-    def get(path: Path, cfg: BuildConfig, type: SourceType=None, modname: str=None, inherited_dircfg: DirectoryConfig=None):
+    def get(
+        path: Path,
+        cfg: BuildConfig,
+        type: SourceType | None = None,
+        modname: str | None = None,
+        inherited_dircfg: DirectoryConfig | None = None,
+    ) -> SourceFile:
         file = cfg.source_files.get(path)
         if file:
             if type and file.type and type != file.type:
@@ -473,13 +574,21 @@ class SourceFile:
         cfg.source_files[path] = file
         return file
 
-    def __init__(self, path: Path, type: SourceType, modname: str, cfg: BuildConfig, inherited_dircfg: DirectoryConfig=None):
+    def __init__(
+        self,
+        path: Path,
+        type: SourceType | None,
+        modname: str | None,
+        cfg: BuildConfig,
+        inherited_dircfg: DirectoryConfig | None = None,
+    ) -> None:
         self.cfg = cfg
         self.path         = path
         self.dirname      = path.parent
         self.type         = type
         self.modname      = modname
         self.processed    = False
+        self.job = None
         self.output_mtime = 0
         self.inherited_dircfg = inherited_dircfg
 
@@ -516,7 +625,7 @@ class SourceFile:
             else:
                 raise Exception('Unrecognized file type: %s' % str(path))
 
-    def check_up_to_date(self, cfg: BuildConfig):
+    def check_up_to_date(self, cfg: BuildConfig) -> None:
         if self.up_to_date is not None:
             return
         
@@ -524,7 +633,7 @@ class SourceFile:
         if self.mtime >= infofile_mtime:
             self.up_to_date = False
             self.need_recompile = True
-            debug_log(f"#{self.path} NEED RECOMPILE BECAUSE MTIME={self.mtime} > INFOFILE_MTIME={infofile_mtime}")
+            debug_log(f"#{self.path} NEED RECOMPILE BECAUSE MTIME={self.mtime} > INFOFILE_MTIME={infofile_mtime}", log=self.job)
             return
         
         self.output_mtime = infofile_mtime
@@ -539,7 +648,7 @@ class SourceFile:
         if data['command'] != self.compiler_cmd(cfg):
             self.up_to_date = False
             self.need_recompile = True
-            debug_log("compiler command changed %s != %s" % (data['command'], self.compiler_cmd(cfg)))
+            debug_log("compiler command changed %s != %s" % (data['command'], self.compiler_cmd(cfg)), log=self.job)
             return
         
         self.need_recompile = False
@@ -572,48 +681,49 @@ class SourceFile:
         if self.up_to_date is None:
             self.up_to_date = True
 
-    def build(self, target, cfg: BuildConfig):
+    async def build(self, target: Target, cfg: BuildConfig) -> None:
+        """Build this source for target/cfg; publish metadata only after success."""
+        target.add_config(self.dircfg(), parent=self.job)
         if self.processed:
+            await self.build_deps(target, cfg)
             return
+
+        self.check_up_to_date(cfg)
+        if not self.up_to_date:
+            # Schedule cached dependencies together before checking their hashes.
+            if not self.need_recompile:
+                await self.build_deps(target, cfg)
+            if self.need_recompile:
+                cfg.vfs.makedirs(self.objpath.parent, exist_ok=True)
+                await self.compile(target, cfg)
+                self.update(cfg)
+                self.output_mtime = self.output_path.mtime(cfg.vfs)
+                for header_dep in self.header_deps:
+                    header_dep.build(target, parent=self.job)
         self.processed = True
 
-        target.add_config(self.dircfg())
-
-        self.check_up_to_date(target.cfg)
-        if self.up_to_date:
-            return
-
-        # A dependency build can discover a changed module interface. Check it
-        # before deciding whether the importing source needs recompilation.
-        if not self.need_recompile:
-            self.build_deps(target, cfg)
-        
-        if self.need_recompile:
-            objdir = self.objpath.parent
-            cfg.vfs.makedirs(objdir, exist_ok=True)
-            self.compile(target, cfg)
-            self.update(target.cfg)
-            self.output_mtime = self.output_path.mtime(cfg.vfs)
-
-            for header_dep in self.header_deps:
-                header_dep.build(target)
-
-    def build_deps(self, target, cfg: BuildConfig):
+    async def build_deps(self, target: Target, cfg: BuildConfig) -> None:
+        """Schedule recorded dependencies for target/cfg, then compare module hashes."""
+        modules = []
         for dep in self.deps:
             if isinstance(dep, ModuleDep):
                 mod = CompiledModule.get(dep.name, cfg, dep.type)
-                new_hash = mod.build(target, inherited_dircfg=self.dircfg())
-
-                if new_hash != dep.sha256:
-                    self.need_recompile = True
-
+                path = target.mod2src(mod.name, mod.type)
+                target.schedule_compilation_job(
+                    path, type=mod.type, modname=mod.name,
+                    inherited_dircfg=self.dircfg(), parent=self.job)
+                modules.append((dep, mod))
             elif isinstance(dep, HeaderDep):
-                dep.build(target)
-
+                dep.build(target, parent=self.job)
             else:
-                raise Exception(f"unrecognized dep {dep}")
+                raise ValueError(f'unrecognized dep {dep}')
+        for dep, mod in modules:
+            new_hash = await mod.build(target, inherited_dircfg=self.dircfg(),
+                                       parent=self.job)
+            if new_hash != dep.sha256:
+                self.need_recompile = True
 
-    def update(self, cfg: BuildConfig):
+    def update(self, cfg: BuildConfig) -> None:
         deps = []
         for dep in self.deps:
 
@@ -635,13 +745,13 @@ class SourceFile:
         #print(out)
         atomic_write(self.infofile, json.dumps(out, indent=2) + '\n', cfg.vfs)
 
-    def dircfg(self):
+    def dircfg(self) -> DirectoryConfig | None:
         if self.dirname.is_absolute():
             return self.inherited_dircfg
         
-        return DirectoryConfig.get(self.dirname, self.cfg)
+        return DirectoryConfig.get(self.dirname, self.cfg, log=self.job)
 
-    def compiler_cmd(self, cfg: BuildConfig):
+    def compiler_cmd(self, cfg: BuildConfig) -> list[str]:
         if self in cfg.compiler_commands:
             return cfg.compiler_commands[self]
         if cfg.USECLANG:
@@ -657,7 +767,7 @@ class SourceFile:
         return cmd
     
     IFLAG_RE = re.compile('^-I')
-    def compiler_extra_args(self):
+    def compiler_extra_args(self) -> list[str]:
         flags = []
 
         buildvars = self.dircfg().buildvars
@@ -677,7 +787,7 @@ class SourceFile:
 
         return flags
     
-    def add_include(self, dirparts, flags):
+    def add_include(self, dirparts: list[str], flags: list[str]) -> None:
         index = -1
 
         try: index = dirparts.index('src')
@@ -701,7 +811,7 @@ class SourceFile:
             return
         
 
-    def compiler_cmd_clang(self, cfg: BuildConfig, extra_args=[]):
+    def compiler_cmd_clang(self, cfg: BuildConfig, extra_args: list[str] = []) -> list[str]:
         extra_args1 = self.compiler_extra_args()
         header_units = []
 
@@ -741,7 +851,7 @@ class SourceFile:
         raise Exception("unrecognized type: %s" % self.type)
                     
 
-    def compiler_cmd_gcc(self, cfg: BuildConfig):
+    def compiler_cmd_gcc(self, cfg: BuildConfig) -> list[str]:
         cmd = cfg.CXX
         args = [cmd]
         if self.type in (SourceType.C, SourceType.ASM):
@@ -773,194 +883,110 @@ class SourceFile:
 
         return args
 
-    def compile(self, target, cfg: BuildConfig):
+    async def compile(self, target: Target, cfg: BuildConfig) -> None:
+        """Compile for target/cfg using its selected asynchronous backend."""
         self.header_deps = {}
 
         if cfg.USECLANG:
-            self.compile_clang(target, cfg)
+            await self.compile_clang(target, cfg)
         else:
-            self.compile_gcc(target, cfg)
+            await self.compile_gcc(target, cfg)
 
     MODULE_MAPPER_LINE_RE = re.compile(r'^([A-Z-]+)\b(.*)')
-    def compile_gcc(self, target, cfg: BuildConfig):
+    async def compile_gcc(self, target: Target, cfg: BuildConfig) -> None:
+        """Compile with GCC, resolving mapper dependencies through target's jobs."""
         if self.type in (SourceType.C, SourceType.ASM):
-            self.compile_gcc_c(cfg)
+            await self.compile_gcc_c(cfg)
             return
-        
-        # https://splichal.eu/scripts/sphinx/gcc/_build/html/gcc-command-options/c%2B%2B-modules.html
-        # https://github.com/urnathan/libcody
-        # https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2020/p1184r2.pdf
-        print(f"BUILDING {self.type} {self.path}...")
+        self.job.message(f"BUILDING {self.type} {self.path}...")
         start = time.perf_counter()
-        if ".." in str(self.path):
-            print("TYPE", type(self.path), self.path, id(self.path))
-            raise "dots in path"
-
-        mapper_read, compiler_write = os.pipe()
-        compiler_read, mapper_write = os.pipe()
-
-        cmd = self.compiler_cmd(target.cfg) + [f"-fmodule-mapper=<{compiler_read}>{compiler_write}"]
-
-        cmdline = " ".join(shlex.quote(item) for item in cmd)
-        print(cmdline)
-
-        env = dict(os.environ)
-        env['SOURCE_DATE_EPOCH'] = '0'
-
-        process = subprocess.Popen(
-            cmd,
-            env=env,
-            pass_fds=(compiler_read, compiler_write),
-            stdin=0, stdout=1, stderr=2)
-        
-        #pid = os.spawn({ 'SOURCE_DATE_EPOCH': '0' }, cmdline, {3: compiler_read, 4: compiler_write})
-
-        os.close(compiler_read)
-        os.close(compiler_write)
-        mapper_read = os.fdopen(mapper_read, 'r')
-        mapper_write = os.fdopen(mapper_write, 'w')
-
         self.deps = {}
         self.vcpkgs = set()
+        async with mapper_pipe() as (requests, replies, child_input, child_output):
+            read_fd, write_fd = child_input.fileno(), child_output.fileno()
+            command = self.compiler_cmd(cfg) + [f"-fmodule-mapper=<{read_fd}>{write_fd}"]
 
-        try:
-            eof = False
-            while not eof:
-                lines = []
+            async def protocol(process: asyncio.subprocess.Process) -> None:
+                """Serve GCC process's batched mapper messages without blocking I/O."""
+                child_input.close()
+                child_output.close()
                 while True:
-                    line = mapper_read.readline()
-                    if line == "":
-                        eof = True
-                        break
-                    
-                    line = line.strip()
-                    # debug_log("GOT LINE <%s>" % line)
+                    responses = []
+                    while True:
+                        line = await requests.readline()
+                        if not line:
+                            return
+                        match = self.MODULE_MAPPER_LINE_RE.match(line.decode().strip())
+                        if match is None:
+                            raise RuntimeError(f'Invalid GCC mapper request: {line!r}')
+                        verb, args = match.groups()
+                        args = shlex.split(args)
+                        continuation = bool(args and args[-1] == ';')
+                        if continuation:
+                            args.pop()
+                        responses.append(await self.gcc_mapper_request(verb, args, target, cfg))
+                        if not continuation:
+                            break
+                    replies.write(' ;\n'.join(responses) + '\n')
+                    replies.flush()
 
-                    m = re.match(self.MODULE_MAPPER_LINE_RE, line)
-                    cmd, args = m.groups()
-                    args = args.strip().split()
-                    # debug_log("ARGS", args)
-                    lines.append((cmd, args))
-                    
-                    if len(args) == 0 or args[-1] != ';':
-                        break
+            await run_compiler(self.job, command, protocol=protocol,
+                               pass_fds=(read_fd, write_fd),
+                               env=dict(os.environ, SOURCE_DATE_EPOCH='0'),
+                               color_diagnostics=True)
+        self.job.message(f"{self.path} done in {time.perf_counter() - start:.2f} seconds")
 
-                out = []
+    async def gcc_mapper_request(self, verb: str, args: list[str], target: Target, cfg: BuildConfig) -> str:
+        """Answer one GCC verb/args request, scheduling imports under target/cfg."""
+        if verb == 'HELLO':
+            return 'HELLO 1 buildtool.py'
+        if verb == 'INCLUDE-TRANSLATE':
+            if not args[0].startswith('/'):
+                header = HeaderDep.get(Path(args[0]), cfg)
+                self.deps[header] = None
+                self.header_deps[header] = None
+            return 'BOOL TRUE'
+        if verb == 'MODULE-REPO':
+            return f'PATHNAME {cfg.OBJDIR}'
+        if verb == 'MODULE-IMPORT':
+            name = args[0]
+            module = CompiledModule.get(name, cfg)
+            digest = await module.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
+            self.deps[ModuleDep(name, digest)] = None
+            return f'PATHNAME {module.cmpath.relative_to(cfg.OBJDIR)}'
+        if verb == 'MODULE-EXPORT':
+            # Path joining maps absolute header names under SYSTEM/, matching
+            # SourceFile.cmpath. GCC expects a path relative to MODULE-REPO.
+            module_path = cfg.OBJDIR / mod2cm(args[0], cfg.SRCDIR)
+            return f'PATHNAME {module_path.relative_to(cfg.OBJDIR)}'
+        if verb == 'MODULE-COMPILED':
+            return 'OK'
+        raise RuntimeError(f'Unknown GCC mapper request: {verb}')
 
-                for line in lines:
-                    cmd, args = line
-                    # debug_log("CMD", cmd, args)
-
-                    if cmd == "HELLO":
-                        out.append("HELLO 1 buildtool.py")
-                        
-                    elif cmd == "INCLUDE-TRANSLATE":
-                        file = args[0]
-                        if not file.startswith('/'):
-                            debug_log(f"INCLUDE-TRANSLATE {file}")
-                            path = Path(file)
-                            header_dep = HeaderDep.get(path, cfg)
-
-                            self.deps[header_dep] = None
-                            self.header_deps[header_dep] = None
-
-                        out.append("BOOL TRUE")
-
-                    elif cmd == "MODULE-REPO":
-                        debug_log(f"MODULE-REPO => PATHNAME {cfg.OBJDIR}")
-                        out.append(f"PATHNAME {cfg.OBJDIR}")
-
-                    elif cmd == "MODULE-IMPORT":
-                        modname = args[0].replace("'", '')
-                        mod = CompiledModule.get(modname, cfg)
-                        cmhash = mod.build(target, inherited_dircfg=self.dircfg())
-                        self.deps[ModuleDep(modname, cmhash)] = None
-                        
-                        path = mod.cmpath.relative_to(cfg.OBJDIR)
-                        debug_log(f"MODULE-IMPORT {self.path}: {args} => PATHNAME {path}")
-                        out.append(f"PATHNAME {path}")
-
-                    elif cmd == "MODULE-EXPORT":
-                        modname = args[0]
-                        #debug_log(f"MODULE-EXPORT {modname}")
-                        file = modname.replace("'", '')
-                        cmfile = Path(".") / mod2cm(file, cfg.SRCDIR)
-                        # .replace(':', '-')
-                        # if file.startswith('/'):
-                        #     file = "system" + file + ".pcm"
-                        # elif file.startswith("./"):
-                        #     file = file[2:] + ".pcm"
-                        # else:
-                        #     file = file.replace('.', '/') + ".pcm"
-                        debug_log(f"MODULE-EXPORT {modname} => {cmfile}")
-                        out.append(f"PATHNAME {cmfile}")
-
-                    elif cmd == "MODULE-COMPILED":
-                        out.append("OK")
-
-                    else:
-                        warn(f"unknown command: {cmd}")
-
-                if len(out) == 0:
-                    continue
-
-                s = " ;\n".join(out) + '\n'
-                # debug_log("WRITING <%s>" % s)
-                mapper_write.write(s)
-                mapper_write.flush()
-
-        except EOFError as ex:
-            debug_log("got exception", ex)
-            pass
-
-        mapper_read.close()
-        mapper_write.close()
-        
-        exitcode = process.wait()
-        if exitcode != 0:
-            exit(exitcode)
-
-        end = time.perf_counter()
-        print(f"{self.path} done in {end - start:.2f} seconds")
-
-    def compile_gcc_c(self, cfg: BuildConfig):
-        print(f"BUILDING {self.type} {self.path}...")
-        
-        start = time.perf_counter()
-        shell(*self.compiler_cmd(cfg))
+    async def compile_gcc_c(self, cfg: BuildConfig) -> None:
+        """Compile a C/assembly input with cfg and load its header depfile."""
+        self.job.message(f"BUILDING {self.type} {self.path}...")
+        await run_compiler(self.job, self.compiler_cmd(cfg), color_diagnostics=True)
         self.process_makefile_deps()
-        end = time.perf_counter()
-        #print(f"done in {end - start:.2f} seconds")
 
-    def compile_clang(self, target, cfg: BuildConfig):
+    async def compile_clang(self, target: Target, cfg: BuildConfig) -> dict[ModuleDep | HeaderDep, None]:
+        """Compile using cfg's wrapper or legacy scanner, scheduling under target."""
+        self.job.message(f"BUILDING {self.type} {self.path}...")
         if cfg.CLANG_WRAPPER:
             self.deps = {}
             self.vcpkgs = set()
-            print(f"BUILDING {self.type} {self.path}...")
             cfg.vfs.makedirs(self.cmpath.parent, exist_ok=True)
-            compile_with_mapper(
-                cfg.CLANG_WRAPPER, self.compiler_cmd_clang(cfg),
+            await compile_with_mapper_async(
+                self.job, cfg.CLANG_WRAPPER, self.compiler_cmd_clang(cfg),
                 lambda request: self.resolve_clang_module(request, target, cfg))
-            self.process_makefile_deps()
-            return self.deps
-        deps, header_units = self.clang_get_deps(target, cfg)
-        
-        print(f"BUILDING {self.type} {self.path}...")
-        start = time.perf_counter()
-        cmdline = self.compiler_cmd(cfg)
-        print(*cmdline)
-        
-        result = subprocess.run(cmdline, check=False)
-        if result.returncode != 0:
-            exit(result.returncode)
-
-        end = time.perf_counter()
-        #print(f"done in {end - start:.2f} seconds")
-
+        else:
+            await self.clang_get_deps(target, cfg)
+            await run_compiler(self.job, self.compiler_cmd(cfg), color_diagnostics=True)
         self.process_makefile_deps()
-        return deps
+        return self.deps
 
-    def resolve_clang_module(self, request, target, cfg):
+    async def resolve_clang_module(self, request: object, target: Target, cfg: BuildConfig) -> str:
+        """Resolve a wrapper request to a built PCM path using target/cfg."""
         source_type = None
         if not isinstance(request, dict):
             raise ValueError("Invalid Clang mapper request")
@@ -979,12 +1005,17 @@ class SourceFile:
         else:
             raise ValueError("Unknown Clang mapper request kind")
         module = CompiledModule.get(name, cfg, source_type)
-        cmhash = module.build(target, inherited_dircfg=self.dircfg())
+        cmhash = await module.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
         self.deps[ModuleDep(name, cmhash, source_type)] = None
         return cfg.vfs.abspath(module.cmpath)
 
-    def clang_get_deps(self, target, cfg: BuildConfig):
-        print("clang_get_deps", self.path)
+    async def clang_get_deps(
+        self,
+        target: Target,
+        cfg: BuildConfig,
+    ) -> tuple[dict[ModuleDep | HeaderDep, None], list[Path]] | None:
+        """Run the legacy dependency scanner for this source under target/cfg."""
+        self.job.message("clang_get_deps", self.path)
         self.deps = {}
         self.vcpkgs = set()
 
@@ -995,7 +1026,7 @@ class SourceFile:
         args = [CLANG_PATH + CLANG_SCAND_DEPS, "-format=p1689", "--", cfg.CXX, *extra_args, f"-fprebuilt-module-path={cfg.OBJDIR}", *CXXFLAGS, *INCFLAGS, "-o"+str(self.objpath), "-c", self.path]
 
         #print("running", *args)
-        result = subprocess.run(args, capture_output=True)
+        result = await run_compiler(self.job, args, capture=True)
         #print(result.stdout.decode(), result.stderr.decode())
         header_units = []
         #line_match = re.compile('^[a-zA-Z0-9\-_.\/]+:\d+:\d+: error: header file (["<])([a-zA-Z0-9\-_.\/]+)[">] \(aka \'([a-zA-Z0-9\-_.\/]+)\'\) cannot be imported because it is not known to be a header unit\n$')
@@ -1009,7 +1040,7 @@ class SourceFile:
 
                     #print("GOT HEADER PATH", header_path)
                     mod = CompiledModule.get(header_path, cfg, type)
-                    cmhash = mod.build(target, inherited_dircfg=self.dircfg())
+                    cmhash = await mod.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
                     dep = ModuleDep(header_path, cmhash)
                     self.deps[dep] = None
                     header_units.append(mod.cmpath)
@@ -1026,12 +1057,11 @@ class SourceFile:
             clang_args = self.compiler_cmd_clang(cfg, extra_args=extra_args)
             #args = ["clang-scan-deps", "-format=p1689", "--", cfg.CXX, *extra_args,  *CCFLAGS, *CXXFLAGS, *INCFLAGS, "-o"+str(self.objpath), "-c", self.path]
             args = ["clang-scan-deps", "-format=p1689", "--", *clang_args]
-            result = subprocess.run(args, capture_output=True)
+            result = await run_compiler(self.job, args, capture=True)
 
             if result.returncode != 0:
-                warn("SCANDEPS failed with cmd line:", *args)
-                warn(result.stderr.decode())
-                exit(1)
+                self.job.write(result.stderr)
+                raise subprocess.CalledProcessError(result.returncode, args)
 
 
         p1689 = json.loads(result.stdout.decode())
@@ -1041,25 +1071,23 @@ class SourceFile:
             if self.type == 'module':
                 provides = rule["provides"]
                 if not provides or len(provides) != 1:
-                    warn(f"wanted module with name {self.modname} in file {self.path} but got something else")
-                    exit(1)
+                    raise RuntimeError(f"wanted module {self.modname} in {self.path}")
 
                 name = provides[0]["logical-name"]
                 if name != self.modname:
-                    warn(f"wanted module with name {self.modname} in file {self.path} but got {name}")
-                    exit(1)
+                    raise RuntimeError(f"wanted module {self.modname} in {self.path} but got {name}")
 
             if "requires" in rule:
                 reqs = rule["requires"]
                 for req in reqs:
                     modname = req["logical-name"]
-                    print(f"about to build dep module {modname}")
+                    self.job.message(f"about to build dep module {modname}")
                     mod = CompiledModule.get(modname, cfg)
-                    cmhash = mod.build(target, inherited_dircfg=self.dircfg())
+                    cmhash = await mod.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
                     self.deps[ModuleDep(modname, cmhash)] = None
             return self.deps, header_units
 
-    def process_makefile_deps(self):
+    def process_makefile_deps(self) -> None:
         if not self.cfg.CLANG_WRAPPER and self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER]:
             return
         text = self.makefile.read_text(self.cfg.vfs)
@@ -1088,7 +1116,7 @@ class SourceFile:
 
 
 class ModuleDep:
-    def __init__(self, name, sha256, type=None):
+    def __init__(self, name: str, sha256: str, type: SourceType | None = None) -> None:
         self.name = name
         self.sha256 = sha256
         self.type = type
@@ -1097,15 +1125,16 @@ class DirectoryConfig:
     CACHE_VERSION = 1
 
     @classmethod
-    def get(cls, path: Path, cfg: BuildConfig):
+    def get(cls, path: Path, cfg: BuildConfig, log: Job | None = None) -> DirectoryConfig:
+        """Load/cache path's build settings; send setup diagnostics to optional log."""
         if path in cfg.directory_configs:
             return cfg.directory_configs[path]
         directory = cls(path, cfg)
-        directory.process()
+        directory.process(log=log)
         cfg.directory_configs[path] = directory
         return directory
 
-    def __init__(self, path: Path, cfg: BuildConfig):
+    def __init__(self, path: Path, cfg: BuildConfig) -> None:
         self.cfg = cfg
         if path.is_absolute():
             self.dir = None
@@ -1113,7 +1142,8 @@ class DirectoryConfig:
         
         self.dir = path.relative_to(cfg.SRCDIR)
 
-    def process(self):
+    def process(self, log: Job | None = None) -> None:
+        """Read this directory's settings, writing setup diagnostics to optional log."""
         if self.dir is None:
             self.buildvars = {}
             self.linkflags = []
@@ -1134,8 +1164,7 @@ class DirectoryConfig:
             try:
                 cached = json.loads(json_file.read_text(self.cfg.vfs))
             except Exception as ex:
-                warn("error reading JSON %s: %s" % (json_file, str(ex)))
-                exit(1)
+                raise RuntimeError(f"error reading JSON {json_file}: {ex}") from ex
 
         if cached is None or cached.get('version') != self.CACHE_VERSION:
             text = try_read(buildpy_file, self.cfg.vfs)
@@ -1156,7 +1185,7 @@ class DirectoryConfig:
 
             self.buildvars = out
 
-            self.handle_pkgconfig(self.buildvars)
+            self.handle_pkgconfig(self.buildvars, log=log)
             self.cfg.vfs.makedirs(json_file.parent, exist_ok=True)
             cached = {'version': self.CACHE_VERSION, 'buildvars': self.buildvars}
             atomic_write(json_file, json.dumps(cached, indent=2), self.cfg.vfs)
@@ -1168,16 +1197,18 @@ class DirectoryConfig:
         else:
             self.linkflags = []
 
-    def handle_pkgconfig(self, buildvars):
+    def handle_pkgconfig(self, buildvars: dict[str, list[str]], log: Job | None = None) -> None:
+        """Append package flags to buildvars; route tool diagnostics to optional log."""
         if 'PKGCONFIG' not in buildvars:
             return
         
         linkflags = list(buildvars.get('LDFLAGS', []))
         cflags = list(buildvars.get('CFLAGS', []))
         
+        output_options = {"log": log} if log is not None else {}
         for pkg in buildvars['PKGCONFIG']:
-            libs_flags = shlex.split(shell("pkg-config", "--libs", pkg))
-            cflags_cur = self.filter_cflags(shlex.split(shell("pkg-config", "--cflags", pkg)))
+            libs_flags = shlex.split(shell("pkg-config", "--libs", pkg, **output_options))
+            cflags_cur = self.filter_cflags(shlex.split(shell("pkg-config", "--cflags", pkg, **output_options)))
             linkflags.extend(libs_flags)
             cflags.extend(cflags_cur)
 
@@ -1188,7 +1219,7 @@ class DirectoryConfig:
             buildvars['CFLAGS'] = cflags
             # buildvars['CXXFLAGS'] = list(cflags)
             
-    def filter_cflags(self, flags):
+    def filter_cflags(self, flags: list[str]) -> list[str]:
         out = []
         
         for flag in flags:
@@ -1201,20 +1232,19 @@ class DirectoryConfig:
 
 class HeaderDep:
     @classmethod
-    def get(cls, path: Path, cfg: BuildConfig):
+    def get(cls, path: Path, cfg: BuildConfig) -> HeaderDep:
         if path not in cfg.header_deps:
             cfg.header_deps[path] = cls(path)
         return cfg.header_deps[path]
 
-    def __init__(self, path):
+    def __init__(self, path: Path) -> None:
         #print("PATH", path, type(path))
         self.path = path
         self.built = False
         self._mtimes: dict[FileSystem, float] = {}
 
-    def build(self, target):
-        if self.built:
-            return
+    def build(self, target: Target, parent: Job | None = None) -> None:
+        """Discover this header's companion source, recording it under parent job."""
         self.built = True
         if self.path.is_absolute():
             # External headers participate in timestamp checks but do not
@@ -1223,24 +1253,27 @@ class HeaderDep:
         #debug_log("HeaderDep.build", self.path)
         
         dirname = self.path.parent
-        dircfg = DirectoryConfig.get(dirname, target.cfg)
+        dircfg = DirectoryConfig.get(dirname, target.cfg, log=parent)
 
-        target.add_config(dircfg)
+        target.add_config(dircfg, parent=parent)
         cppfile = self.find_cpp(self.path, target.cfg.vfs)
-        debug_log('find_cpp', self.path, '-->', cppfile)
+        debug_log('find_cpp', self.path, '-->', cppfile, log=parent)
         if cppfile:
             self.cpp_path = cppfile
-            target.compile(self.cpp_path)
+            if parent is None:
+                target.compile(self.cpp_path)
+            else:
+                target.schedule_compilation_job(self.cpp_path, parent=parent)
             return
 
-    def mtime(self, vfs: FileSystem):
+    def mtime(self, vfs: FileSystem) -> float:
         # Input headers are stable during a build. Keep their timestamps for
         # this dependency's lifetime, which ends when its BuildConfig resets.
         if vfs not in self._mtimes:
             self._mtimes[vfs] = self.path.mtime(vfs)
         return self._mtimes[vfs]
 
-    def find_cpp(self, hfile: Path, vfs: FileSystem):
+    def find_cpp(self, hfile: Path, vfs: FileSystem) -> Path | None:
         if hfile.suffix not in HFILE_SUFFIXES:
             return None
         
@@ -1298,18 +1331,18 @@ class HeaderDep:
 #         f.write(json_content)
 
 class CompilationDatabase:
-    def __init__(self, paths: list[Path]):
+    def __init__(self, paths: list[Path]) -> None:
         self.paths = paths
         self.processed_files = set()
         self.entries = []
 
-    def build(self, cfg: BuildConfig):
+    def build(self, cfg: BuildConfig) -> str:
         for path in find_files(self.paths, suffixes=[".cc", ".cpp", ".c"], vfs=cfg.vfs):
             self.process_file(path, cfg)
 
         return json.dumps(self.entries, indent=2)
 
-    def process_file(self, path, cfg: BuildConfig):
+    def process_file(self, path: Path, cfg: BuildConfig) -> None:
         # path = os.path.normpath(os.path.join(basepath, filepath))
         file = SourceFile.get(path, cfg)
         if file in self.processed_files:
@@ -1327,7 +1360,13 @@ class CompilationDatabase:
             "arguments": compilation_cmd,
         })
 
-def find_files(paths: list[Path], suffixes: tuple[str], prefixes: tuple[str] = None, *, vfs: FileSystem):
+def find_files(
+    paths: list[Path],
+    suffixes: Sequence[str],
+    prefixes: Sequence[str] | None = None,
+    *,
+    vfs: FileSystem,
+) -> Iterator[Path]:
     """
     Generator function to yield all files in the given directory
     that end with any of the specified suffixes.
@@ -1354,7 +1393,7 @@ def find_files(paths: list[Path], suffixes: tuple[str], prefixes: tuple[str] = N
             yield path
             continue
 
-        for entry in vfs.scandir(path):
+        for entry in sorted(vfs.scandir(path), key=lambda entry: entry.name):
             if entry.is_file and entry.name.endswith(suffixes):
                 if prefixes is not None and not entry.name.startswith(prefixes):
                     continue
@@ -1362,12 +1401,12 @@ def find_files(paths: list[Path], suffixes: tuple[str], prefixes: tuple[str] = N
             elif entry.is_dir and not entry.is_symlink and not entry.name.startswith("."):
                 yield from find_files([Path(entry.path)], suffixes=suffixes, prefixes=prefixes, vfs=vfs)
 
-def atomic_write(path: Path, data: str, vfs: FileSystem):
+def atomic_write(path: Path, data: str, vfs: FileSystem) -> None:
     tmpfile = path.with_extra_suffix(".tmp")
     vfs.write_text(tmpfile, data)
     vfs.replace(tmpfile, path)
 
-def atomic_symlink(path: Path, target: str, vfs: FileSystem):
+def atomic_symlink(path: Path, target: str, vfs: FileSystem) -> None:
     tmpfile = path.with_extra_suffix(f".{uuid4().hex}.tmp")
     vfs.symlink(target, tmpfile)
     try:
@@ -1378,13 +1417,20 @@ def atomic_symlink(path: Path, target: str, vfs: FileSystem):
         except FileNotFoundError:
             pass
 
-def try_read(path: Path, vfs: FileSystem):
+def try_read(path: Path, vfs: FileSystem) -> str | None:
     try:
         return path.read_text(vfs)
     except FileNotFoundError:
         return None
     
-def shell(*args):
+def shell(*args: str | os.PathLike[str], log: Job | None = None) -> str:
+    """Run args synchronously, returning stdout and sending diagnostics to log."""
+    if log is not None:
+        log.message(shlex.join(list(map(str, args))))
+        result = subprocess.run(args, capture_output=True, text=True)
+        log.write(result.stderr)
+        result.check_returncode()
+        return result.stdout
     cmd = " ".join(shlex.quote(str(arg)) for arg in args)
     print(cmd)
     result = subprocess.run(args, shell=False, text=True, stdin=0, stdout=subprocess.PIPE, stderr=2)
@@ -1392,8 +1438,7 @@ def shell(*args):
         exit(1)
     return result.stdout
 
-def mod2cm(modname, srcdir=SRCDIR):
-    debug_log(f"mod2cm {modname}")
+def mod2cm(modname: str, srcdir: str | os.PathLike[str] = SRCDIR) -> str:
     if modname.startswith('/'):
         path = modname
     elif modname.startswith('./'):
@@ -1407,8 +1452,7 @@ def mod2cm(modname, srcdir=SRCDIR):
     #path = path.replace('.', '/')
     return path + ".pcm"
 
-def mod2path(modname: str, type:SourceType):
-    debug_log("mod2path", modname, type)
+def mod2path(modname: str | None, type: SourceType) -> Path:
     if type == SourceType.USER_HEADER:
         return Path(modname)
     
@@ -1447,7 +1491,7 @@ def mod2path(modname: str, type:SourceType):
     # warn(f"FATAL: Unable to locate module {modname}: the following files do not exist: {srcfile1}, {srcfile2}")
     # exit(1)
 
-def parse_makefile_rules(text):
+def parse_makefile_rules(text: str) -> list[str]:
     # Compiler depfiles escape whitespace, #, backslash and colon with a
     # backslash, and escape dollar signs as $$. Only the first unescaped
     # colon separates the target from dependencies (we don't request -MP).
@@ -1477,35 +1521,39 @@ def parse_makefile_rules(text):
         words.append(''.join(word))
     return words
 
-def warn(*s: str):
+def warn(*s: object) -> None:
     print(*s, file=sys.stderr)
 
-def debug_log(*text):
+def debug_log(*text: object, log: Job | None = None) -> None:
+    """Emit text when debugging is enabled, using log if a build job owns it."""
     if DEBUG_LOG:
-        warn(*text)
+        if log is not None:
+            log.message(*text)
+        else:
+            warn(*text)
 
-def build(path: Path, cfg: BuildConfig):
+def build(path: Path, cfg: BuildConfig) -> Path:
     name = path.with_suffix('')
     target = Target(name, cfg)
     target.compile(path)
     
     return target.link()
 
-def make_compilation_database(paths: list[Path], cfg: BuildConfig):
+def make_compilation_database(paths: list[Path], cfg: BuildConfig) -> str:
     db = CompilationDatabase(paths)
     return db.build(cfg)
 
-def build_compilation_database(out: Path, paths: list[Path], cfg: BuildConfig):
+def build_compilation_database(out: Path, paths: list[Path], cfg: BuildConfig) -> None:
     data = make_compilation_database(paths, cfg)
     
     atomic_write(out, data, cfg.vfs)
     print("wrote %s" % out)
 
 
-def mkpath(path: str, *, vfs: FileSystem) -> Path:
+def mkpath(path: str | os.PathLike[str], *, vfs: FileSystem) -> Path:
     return Path(os.path.relpath(vfs.abspath(path), vfs.abspath(ROOT)))
 
-def run_tool(tool_path: str, dirs: list[str], cfg: BuildConfig):
+def run_tool(tool_path: str, dirs: list[str], cfg: BuildConfig) -> None:
     dirs = [Path(cfg.vfs.abspath(dir)) for dir in dirs]
 
     # change directory to root
@@ -1518,13 +1566,14 @@ def run_tool(tool_path: str, dirs: list[str], cfg: BuildConfig):
     main_path = mkpath(tool_path, vfs=cfg.vfs)
     main_name = main_path.with_suffix('')
     target = Target(main_name, cfg)
-    target.compile(main_path, SourceType.CPP)
+    sources = [main_path]
     
     for filename in find_files(dirs, suffixes = ('_test.cc', '_test.cpp'), vfs=cfg.vfs):
         #print("building %s..." % filename)
         path = mkpath(filename, vfs=cfg.vfs)
-        target.compile(path, SourceType.CPP)
+        sources.append(path)
 
+    target.compile_many(sources)
     bin = target.link()
     bin = cfg.vfs.abspath(bin)
     if oldwd:
@@ -1532,36 +1581,37 @@ def run_tool(tool_path: str, dirs: list[str], cfg: BuildConfig):
     os.execv(bin, [bin])
 
 
-def run_tests(dirs: list[str], cfg: BuildConfig):
+def run_tests(dirs: list[str], cfg: BuildConfig) -> None:
     run_tool(TESTMAIN, dirs, cfg)
 
-def run_benchmarks(dirs: list[str], cfg: BuildConfig):
+def run_benchmarks(dirs: list[str], cfg: BuildConfig) -> None:
     run_tool(BENCHMAIN, dirs, cfg)
         
-def sha256_file(path: Path, vfs: FileSystem):
+def sha256_file(path: Path, vfs: FileSystem) -> str:
     return vfs.sha256(path)
 
 
-def reset_build_state(cfg: BuildConfig):
+def reset_build_state(cfg: BuildConfig) -> None:
     """Start a fresh build invocation for the specified configuration."""
     cfg.reset_build_state()
 
 ## MAIN ##
-def main(
-        CC=CC,
-        CXX=CXX, 
-        CFLAGS=CFLAGS,
-        CXXFLAGS=CXXFLAGS,
-        LDFLAGS=LDFLAGS,
-        OBJDIR=OBJDIR,
-        DEPDIR=DEPDIR, 
-        SRCDIR=SRCDIR, 
-        BINDIR=BINDIR,
-        INCFLAGS=INCFLAGS,
-        USECLANG=USECLANG, 
-        SRC_ROOTS=SRC_ROOTS,
-        vfs: FileSystem = _DEFAULT_VFS,
-):
+def _main(
+    CC: str = CC,
+    CXX: str = CXX,
+    CFLAGS: list[str] = CFLAGS,
+    CXXFLAGS: list[str] = CXXFLAGS,
+    LDFLAGS: list[str] = LDFLAGS,
+    OBJDIR: str | os.PathLike[str] = OBJDIR,
+    DEPDIR: str | os.PathLike[str] = DEPDIR,
+    SRCDIR: str | os.PathLike[str] = SRCDIR,
+    BINDIR: str | os.PathLike[str] = BINDIR,
+    INCFLAGS: list[str] = INCFLAGS,
+    USECLANG: bool = USECLANG,
+    SRC_ROOTS: list[str] = SRC_ROOTS,
+    vfs: FileSystem = _DEFAULT_VFS,
+) -> None:
+    """Parse CLI arguments using the supplied compiler, path, flag and VFS defaults."""
 
     buildcfg = Release
     parser = argparse.ArgumentParser(
@@ -1601,7 +1651,13 @@ def main(
     bench_parser.add_argument('--debug', '-d', action='store_const', dest='buildtype', const='debug', help='build in debug mode')
     bench_parser.add_argument('--clang', action='store_true', help='build with clang')
 
+    for command_parser in (build_parser, run_parser, test_parser, bench_parser):
+        command_parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
+                                    help="maximum active compiler processes (also capped by memory)")
+
     args = parser.parse_args()
+    if getattr(args, "jobs", 1) < 1:
+        parser.error("--jobs must be at least 1")
 
     g = globals()
     buildtype = Release
@@ -1645,6 +1701,8 @@ def main(
         SUFFIX=SUFFIX,
         USECLANG=USECLANG,
         CLANG_WRAPPER=os.environ.get("BT_CLANG_WRAPPER") if USECLANG else None,
+        JOBS=getattr(args, "jobs", 1),
+        memory=MemoryBudget() if args.cmd in ('build', 'run', 'test', 'bench') else None,
         vfs=vfs,
     )
 
@@ -1707,6 +1765,18 @@ def main(
     else:
         parser.print_help()
         exit(1)
+
+def main(*args: Any, **kwargs: Any) -> None:
+    """Run the CLI with configuration args/kwargs; report build errors without traces."""
+    try:
+        return _main(*args, **kwargs)
+    except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+        if not getattr(error, 'buildtool_reported', False):
+            warn(error)
+        raise SystemExit(max(1, getattr(error, 'returncode', 1))) from None
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None
+
 
 if __name__ == '__main__':
     main()
