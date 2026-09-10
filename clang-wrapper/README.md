@@ -132,6 +132,16 @@ line. These are dedicated inherited descriptors, separate from stdout/stderr:
 {"pcm":"/absolute/path/math-detail.pcm"}
 ```
 
+Replies may also supply a transitive module mapping:
+
+```json
+{"pcm":"/cache/std.compat.pcm","modules":{"std":"/cache/std.pcm","std.compat":"/cache/std.compat.pcm"}}
+```
+
+The wrapper registers those paths before loading the requested PCM. Clang's
+AST reader can load transitive dependencies without calling the module-loader
+callback again, so returning only the outer module's path is insufficient.
+
 The alternative reply is `{"error":"reason"}`. A returned PCM must already be
 complete and compatible with the importing invocation. Requests are synchronous;
 buildtool starts a nested wrapper when that dependency itself imports modules.
@@ -143,6 +153,12 @@ The wrapper currently initializes the native target and accepts exactly one
 Clang frontend job. Linking, offloading, and multiple input files remain the
 responsibility of the caller. There is no FUSE or custom VFS requirement; the
 frontend initializes Clang's ordinary VFS, including requested overlays.
+
+Standard-module builds use one invocation to precompile the interface and a
+second invocation with `-x pcm` to produce its object. Both run through the same
+wrapper frontend. Build against the current patched Clang headers: its
+`loadModule` override includes the `SourceRange ModuleNameRange` argument used
+by the module-import diagnostic fix.
 
 ## Tests
 

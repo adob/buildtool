@@ -63,19 +63,27 @@ incremental invalidation. Run its optional real GCC 16 tests with:
 BT_TEST_GCC=g++ python3 -m unittest discover -s tests -p test_gcc_std_headers.py -v
 ```
 
-## GCC named standard-library modules
+## Named standard-library modules
 
 `import std;` and `import std.compat;` are discovered on demand using GCC's
 `-print-file-name=libstdc++.modules.json`. Buildtool reads the manifest and resolves
 each `source-path` relative to the manifest directory. This requires a GCC/libstdc++
-installation providing that metadata (tested with GCC 16). Clang's discovery is
-unchanged.
+installation providing that metadata (tested with GCC 16). Clang uses
+`--print-library-module-manifest-path`, which selects the manifest for its chosen
+libstdc++ or libc++. Manifest-local system include directories are preserved.
 
 The metadata location is persisted in
 `build/<configuration>/gcc-std-modules/<hash>.json`. The key includes the compiler
 path and file identity, flags, working directory, and driver search environment.
 Fresh builds reread the manifest, but reuse the stored location without launching
 GCC. Missing metadata or sources produce an explicit error.
+
+Clang emits the PCM and object in separate steps. With the patched wrapper, both
+steps use the wrapper's frontend so they agree on the PCM format. Mapper replies
+include transitive module paths: importing `std.compat` must also make `std`
+available to Clang's AST reader. The standalone scanner backend receives the
+same explicit dependency mappings. Rebuilding the wrapper invalidates its cached
+standard modules.
 
 Named modules use the same controlled flags as the standard header unit, with
 separate CMI, object, and incremental metadata artifacts. For example, the CMI
@@ -99,6 +107,31 @@ checks no-op and importer-only rebuilds, and tests both header-unit modes:
 ```sh
 BT_TEST_GCC=g++ python3 -m unittest discover -s tests -p test_gcc_std_modules.py -v
 ```
+
+For Clang, `bt.main(CLANG_CXXFLAGS=[...], CLANG_LDFLAGS=[...])` configures only
+Clang builds, leaving GCC flags unchanged. Select matching headers, libraries,
+startup objects and runtime loader. In particular, a standalone patched Clang
+on Nix can otherwise select host GCC headers or the host loader. The workspace
+launcher reads its Nix GCC wrapper's metadata to select a consistent toolchain
+without launching a compiler at startup.
+
+`bt ide` now includes installed `std` and `std.compat` source commands, allowing
+clangd to compile its own PCMs. `bt ide --clang` uses the Clang toolchain and its
+extra flags. Missing standard-module metadata does not prevent ordinary IDE
+database generation. Use clangd's `--experimental-modules-support` and
+`--compile-commands-dir=/absolute/project/path`: an external SDK source has no
+project database in its ancestor directories, even though that source has an
+entry in the project's database. GCC-based database entries use `-xc++` so
+clangd's GCC query-driver probe succeeds. Do not add application-built PCMs to
+clangd's search path.
+
+`test_clang_std_modules.py` covers Clang manifest queries, local include paths,
+IDE entries and optional real compilation/linking/reuse tests. Set
+`BT_TEST_CLANG_STD_COMPILER`, optionally `BT_TEST_CLANG_STD_WRAPPER`, and
+`BT_TEST_CLANG_STD_FLAGS`/`BT_TEST_CLANG_STD_LDFLAGS` for the selected SDK. Put a
+matching `clang-scan-deps` on PATH for the standalone backend. Setting
+`BT_TEST_CLANGD` additionally checks a `std.compat` consumer using the generated
+database and clangd's own module cache.
 
 ## Building a directory
 

@@ -9,6 +9,7 @@ import inspect
 import json
 import shutil
 
+MapperResult = str | os.PathLike[str] | dict[str, object]
 if __package__:
     from .compiler import mapper_pipe, run_compiler
     from .scheduler import BuildSession, Job
@@ -21,7 +22,7 @@ async def compile_with_mapper_async(
     job: Job,
     wrapper: str | os.PathLike[str],
     command: Sequence[str | os.PathLike[str]],
-    resolve: Callable[[object], Awaitable[str | os.PathLike[str]]],
+    resolve: Callable[[object], Awaitable[MapperResult]],
 ) -> None:
     """Run wrapper/command in job; await resolve(request) for each PCM path."""
     command = list(map(str, command))
@@ -37,7 +38,8 @@ async def compile_with_mapper_async(
             child_output.close()
             while line := await requests.readline():
                 try:
-                    reply = {"pcm": str(await resolve(json.loads(line)))}
+                    result = await resolve(json.loads(line))
+                    reply = result if isinstance(result, dict) else {"pcm": str(result)}
                 except Exception as error:
                     try:
                         replies.write(json.dumps({"error": str(error)}) + "\n")
@@ -55,14 +57,14 @@ async def compile_with_mapper_async(
 def compile_with_mapper(
     wrapper: str | os.PathLike[str],
     command: Sequence[str | os.PathLike[str]],
-    resolve: Callable[[object], str | os.PathLike[str] | Awaitable[str | os.PathLike[str]]],
+    resolve: Callable[[object], MapperResult | Awaitable[MapperResult]],
 ) -> None:
     """Synchronous entry point; resolve(request) may return a path or awaitable."""
     async def run() -> None:
         """Create a one-job session for this standalone mapper invocation."""
         session = BuildSession()
 
-        async def resolve_async(request: object) -> str | os.PathLike[str]:
+        async def resolve_async(request: object) -> MapperResult:
             """Adapt this caller's resolver for the asynchronous transport."""
             result = resolve(request)
             return await result if inspect.isawaitable(result) else result

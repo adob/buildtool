@@ -17,6 +17,21 @@ from clang_mapper import compile_with_mapper
 
 
 class ClangMapperTests(unittest.TestCase):
+    def test_mapper_reply_includes_transitive_named_modules(self) -> None:
+        """Importing std.compat must also tell ASTReader where to load std."""
+        fs = bt.MemoryFileSystem(cwd='/workspace')
+        fs.write_text('main.cc', '')
+        cfg = bt.BuildConfig(vfs=fs, USECLANG=True)
+        source = bt.SourceFile.get(bt.Path('main.cc'), cfg)
+        module = mock.Mock(cmpath=bt.Path('build/std.compat.pcm'),
+                           srcfile=mock.Mock(clang_module_files={'std': bt.Path('build/std.pcm')}))
+        module.build = mock.AsyncMock(return_value='hash')
+        with mock.patch.object(bt.CompiledModule, 'get', return_value=module):
+            reply = asyncio.run(source.resolve_clang_request(
+                {'kind': 'module', 'name': 'std.compat'}, bt.Target(bt.Path('main'), cfg), cfg))
+        self.assertEqual(reply, {'pcm': '/workspace/build/std.compat.pcm', 'modules': {
+            'std': '/workspace/build/std.pcm', 'std.compat': '/workspace/build/std.compat.pcm'}})
+
     def test_resolved_header_and_named_module_record_hash_dependencies(self):
         fs = bt.MemoryFileSystem(cwd="/workspace")
         fs.write_text("main.cc", "")
@@ -27,7 +42,7 @@ class ClangMapperTests(unittest.TestCase):
             ({"kind": "header", "path": '/sdk/a "quoted" header.h'}, '/sdk/a "quoted" header.h'),
             ({"kind": "module", "name": "math:detail"}, "math:detail"),
         ]:
-            module = mock.Mock(cmpath=bt.Path("build/test.pcm"))
+            module = mock.Mock(cmpath=bt.Path("build/test.pcm"), srcfile=None)
             module.build = mock.AsyncMock(return_value="hash")
             with mock.patch.object(bt.CompiledModule, "get", return_value=module) as get:
                 self.assertEqual(asyncio.run(source.resolve_clang_module(request, target, cfg)),
@@ -94,6 +109,32 @@ with os.fdopen(int(sys.argv[2])) as replies, os.fdopen(int(sys.argv[3]), "w") as
 @unittest.skipUnless(os.environ.get("BT_TEST_CLANG_WRAPPER") and os.environ.get("BT_TEST_CLANG"),
                      "set BT_TEST_CLANG_WRAPPER and BT_TEST_CLANG for real compiler tests")
 class ClangWrapperIntegrationTests(unittest.TestCase):
+    def test_pcm_codegen_honors_driver_warning_options(self) -> None:
+        """Driver warnings must honor suppression and promotion to errors."""
+        Path("example.cc").write_text("export module example;\nexport int value() { return 7; }\n")
+
+        def compile_args(args: list[str]) -> subprocess.CompletedProcess[str]:
+            """Run the wrapper with compiler args; this fixture makes no mapper requests."""
+            with open(os.devnull, "rb") as replies, open(os.devnull, "wb") as requests:
+                return subprocess.run([
+                    self.cfg.CLANG_WRAPPER, "--mapper-fds", str(replies.fileno()),
+                    str(requests.fileno()), "--", self.cfg.CXX, "-std=c++20", *args,
+                ], pass_fds=(replies.fileno(), requests.fileno()),
+                    capture_output=True, text=True, check=False)
+
+        result = compile_args(["-x", "c++-module", "--precompile", "example.cc", "-o", "example.pcm"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        codegen = ["-x", "pcm", "-c", "example.pcm", "-o", "example.o", "-I."]
+        result = compile_args(codegen)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("argument unused during compilation", result.stderr)
+        result = compile_args([*codegen, "-Wno-unused-command-line-argument"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("argument unused during compilation", result.stderr)
+        result = compile_args([*codegen, "-Werror=unused-command-line-argument"])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("argument unused during compilation", result.stderr)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="buildtool-clang-")
         self.addCleanup(self.tmp.cleanup)

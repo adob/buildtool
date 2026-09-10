@@ -122,23 +122,30 @@ class GccStdHeaders:
 
 class GccStdModules:
     def __init__(self, vfs: FileSystem) -> None:
-        """Cache GCC module metadata using vfs for persistent discovery records."""
+        """Cache GCC/Clang standard-module metadata using vfs for discovery records."""
         self.vfs = vfs
         self.sources: dict[str, dict[str, str]] = {}
         self.fingerprints: dict[tuple[str, tuple[str, ...]], str] = {}
+        self.local_flags: dict[str, dict[str, tuple[str, ...]]] = {}
 
     async def resolve(self, name: str, compiler: str, flags: Sequence[str],
-                      cache_dir: str, parent: Job) -> str:
+                      cache_dir: str, parent: Job, *, clang: bool = False,
+                      optional: bool = False) -> str:
         """Find name with compiler/flags; cache discovery in cache_dir via parent.
 
+        clang selects Clang's library-manifest query (libstdc++ or libc++).
+        optional lets IDE generation proceed when no module SDK is installed.
         Metadata is reread each build. The persistent probe result is keyed by
         compiler identity, flags, working directory, and driver search environment.
         """
-        command = (compiler, *toolchain_flags(flags), '-print-file-name=libstdc++.modules.json')
+        query = '--print-library-module-manifest-path' if clang else '-print-file-name=libstdc++.modules.json'
+        command = (compiler, *toolchain_flags(flags), query)
         candidates = ([compiler] if os.path.dirname(compiler) else
                       [os.path.join(path, compiler) for path in os.get_exec_path()])
         executable = next((path for path in candidates if self.vfs.is_file(path)), None)
         if executable is None:
+            if optional:
+                return ''
             raise RuntimeError(f'Cannot discover module {name}: compiler {compiler!r} not found')
         stat = self.vfs.stat(executable)
         identity = (command, self.vfs.realpath(executable), stat.st_mtime_ns, stat.st_size,
@@ -161,10 +168,19 @@ class GccStdModules:
                 if metadata is None:
                     result = await run_compiler(job, command, capture=True)
                     if result.returncode:
+                        if optional:
+                            self.sources[key] = {}
+                            return
                         job.write(result.stderr)
                         raise subprocess.CalledProcessError(result.returncode, command)
                     metadata = self.vfs.abspath(result.stdout.decode().strip())
                     if not self.vfs.is_file(metadata):
+                        if optional:
+                            self.sources[key] = {}
+                            return
+                        if clang:
+                            raise RuntimeError(f'{compiler} did not locate a standard-library module manifest; '
+                                               'select a module-capable C++ library/toolchain')
                         raise RuntimeError(f'{compiler} does not provide libstdc++.modules.json; '
                                            f'cannot build import {name}')
                 try:
@@ -172,6 +188,7 @@ class GccStdModules:
                     if document['version'] != 1:
                         raise ValueError('unsupported metadata version')
                     sources = {}
+                    local_flags = {}
                     for module in document['modules']:
                         logical_name = module['logical-name']
                         if logical_name in ('std', 'std.compat'):
@@ -180,6 +197,9 @@ class GccStdModules:
                             if not self.vfs.is_file(path):
                                 raise ValueError(f'module source does not exist: {path}')
                             sources[logical_name] = path
+                            local_flags[logical_name] = tuple(
+                                '-isystem' + os.path.normpath(os.path.join(os.path.dirname(metadata), directory))
+                                for directory in module.get('local-arguments', {}).get('system-include-directories', []))
                 except (KeyError, TypeError, ValueError) as error:
                     raise RuntimeError(f'Invalid GCC module metadata {metadata}: {error}') from error
                 self.vfs.makedirs(cache_dir, exist_ok=True)
@@ -187,9 +207,12 @@ class GccStdModules:
                 self.vfs.write_text(temporary, json.dumps({'metadata': metadata}) + '\n')
                 self.vfs.replace(temporary, cache)
                 self.sources[key] = sources
+                self.local_flags[key] = local_flags
 
             job = parent.session.schedule(('gcc-std-modules', key), discover, parent=parent)
             await parent.wait_for_dependency(job)
         if name not in self.sources[key]:
+            if optional:
+                return ''
             raise RuntimeError(f'GCC module metadata does not provide {name}')
         return self.sources[key][name]

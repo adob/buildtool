@@ -10,6 +10,18 @@ import buildtool as bt
 
 
 class CliArgumentTests(unittest.TestCase):
+    def test_clang_specific_configuration_is_not_used_by_gcc(self) -> None:
+        """Only --clang selects its extra compilation and linking flags."""
+        for flags in ([], ['--clang']):
+            with self.subTest(flags=flags), mock.patch.dict(vars(bt)), \
+                 mock.patch.object(sys, 'argv', ['bt', 'build', *flags, 'main.cc']), \
+                 mock.patch.object(bt, 'ROOT', '.'), mock.patch.object(bt, 'build') as build:
+                bt.main(vfs=bt.MemoryFileSystem(), CLANG_CXXFLAGS=['--gcc-install-dir=/sdk'],
+                        CLANG_LDFLAGS=['-L/sdk/lib'])
+                cfg = build.call_args.args[1]
+                self.assertEqual('--gcc-install-dir=/sdk' in cfg.CXXFLAGS, bool(flags))
+                self.assertEqual('-L/sdk/lib' in cfg.LDFLAGS, bool(flags))
+
     def test_run_preserves_options_after_target(self) -> None:
         """Only options before the target configure the build; the rest reach execv."""
         for flags in ([], ['--debug', '--verbose', '-j', '2', '--rebuild', '--no-std-header-unit']):

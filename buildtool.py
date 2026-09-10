@@ -206,6 +206,7 @@ class BuildConfig:
         self.gcc_std_headers.paths.clear()
         self.gcc_std_modules.sources.clear()
         self.gcc_std_modules.fingerprints.clear()
+        self.gcc_std_modules.local_flags.clear()
         self.std_header_sources.clear()
         self.std_module_sources.clear()
 
@@ -577,11 +578,12 @@ class Target:
     async def resolve_module_source(self, name: str, type: SourceType,
                                     directory: DirectoryConfig | None, parent: Job) -> Path:
         """Resolve name/type, discovering GCC SDK modules with directory flags via parent."""
-        if not self.cfg.USECLANG and type == SourceType.MODULE and name in ('std', 'std.compat'):
+        if type == SourceType.MODULE and name in ('std', 'std.compat'):
             flags = header_unit_flags([*self.cfg.CXXFLAGS, *self.cfg.INCFLAGS],
                                       directory.buildvars.get('CFLAGS', []) if directory else [])
             return Path(await self.cfg.gcc_std_modules.resolve(
-                name, self.cfg.CXX, flags, str(self.cfg.DEPDIR / 'gcc-std-modules'), parent))
+                name, self.cfg.CXX, flags, str(self.cfg.DEPDIR / 'gcc-std-modules'), parent,
+                clang=self.cfg.USECLANG))
         return self.mod2src(name, type)
 
     def mod2src(self, modname: str | None, type: SourceType) -> Path:
@@ -623,7 +625,7 @@ class SourceFile:
     ) -> SourceFile:
         std_header = type == SourceType.SYSTEM_HEADER and str(path).endswith('/bits/stdc++.h')
         std_module = type == SourceType.MODULE and modname in ('std', 'std.compat') and path.is_absolute()
-        if not cfg.USECLANG and (std_header or std_module):
+        if (not cfg.USECLANG and std_header) or std_module:
             # The aggregate is requested by many directories. Keep incompatible
             # command-line configurations in separate source and artifact caches.
             directory_flags = (inherited_dircfg.buildvars.get('CFLAGS', [])
@@ -632,7 +634,14 @@ class SourceFile:
             key = (path, (cfg.CXX, *flags))
             if std_module:
                 # A replaced compiler must not reuse an older module's CMI/object.
-                key = (path, (*key[1], cfg.gcc_std_modules.fingerprints[(cfg.CXX, flags)]))
+                fingerprint = cfg.gcc_std_modules.fingerprints[(cfg.CXX, flags)]
+                local_flags = cfg.gcc_std_modules.local_flags[fingerprint].get(modname, ())
+                flags = (*flags, *local_flags)
+                key = (path, (*key[1], fingerprint, *local_flags))
+                if cfg.USECLANG and cfg.CLANG_WRAPPER:
+                    backend = cfg.vfs.stat(cfg.CLANG_WRAPPER)
+                    key = (path, (*key[1], cfg.vfs.realpath(cfg.CLANG_WRAPPER),
+                                  str(backend.st_mtime_ns), str(backend.st_size)))
             cache = cfg.std_header_sources if std_header else cfg.std_module_sources
             if key not in cache:
                 source = SourceFile(path, type, modname, cfg, inherited_dircfg)
@@ -677,6 +686,7 @@ class SourceFile:
         self.std_header_variant = False
         self.std_module_variant = False
         self.std_header_flags: tuple[str, ...] = ()
+        self.clang_module_files: dict[str, Path] = {}
         self.cmhash = None
 
         if path.is_absolute():
@@ -828,6 +838,10 @@ class SourceFile:
         for dep, mod in modules:
             new_hash = await mod.build(target, inherited_dircfg=self.dircfg(),
                                        parent=self.job)
+            if cfg.USECLANG:
+                self.clang_module_files.update(mod.srcfile.clang_module_files)
+                if mod.type == SourceType.MODULE:
+                    self.clang_module_files[mod.name] = mod.cmpath
             if new_hash != dep.sha256:
                 self.need_recompile = True
 
@@ -923,6 +937,11 @@ class SourceFile:
         
 
     def compiler_cmd_clang(self, cfg: BuildConfig, extra_args: list[str] = []) -> list[str]:
+        if self.std_module_variant:
+            # Emit the PCM first; the wrapper executes one frontend job at a time.
+            return [cfg.CXX, *self.std_header_flags, *extra_args,
+                    '-Wno-reserved-module-identifier', '-xc++-module', '--precompile',
+                    '-MD', f'-MF{self.makefile}', '-o' + str(self.cmpath), str(self.path)]
         extra_args1 = self.compiler_extra_args()
         header_units = []
 
@@ -1113,18 +1132,39 @@ class SourceFile:
     async def compile_clang(self, target: Target, cfg: BuildConfig) -> dict[ModuleDep | HeaderDep, None]:
         """Compile using cfg's wrapper or legacy scanner, scheduling under target."""
         self.job.message(f"BUILDING {self.type} {self.path}...")
+        self.clang_module_files = {}
         if cfg.CLANG_WRAPPER:
             self.deps = {}
             self.vcpkgs = set()
             cfg.vfs.makedirs(self.cmpath.parent, exist_ok=True)
             await compile_with_mapper_async(
                 self.job, cfg.CLANG_WRAPPER, self.compiler_cmd_clang(cfg),
-                lambda request: self.resolve_clang_module(request, target, cfg))
+                lambda request: self.resolve_clang_request(request, target, cfg))
         else:
             await self.clang_get_deps(target, cfg)
-            await run_compiler(self.job, self.compiler_cmd(cfg), color_diagnostics=True)
+            module_args = [f'-fmodule-file={name}={path}' for name, path in self.clang_module_files.items()]
+            await run_compiler(self.job, self.compiler_cmd_clang(cfg, extra_args=module_args),
+                               color_diagnostics=True)
+        if self.std_module_variant:
+            object_command = [cfg.CXX, *self.std_header_flags,
+                *[f'-fmodule-file={name}={path}' for name, path in self.clang_module_files.items()],
+                '-Wno-unused-command-line-argument', '-x', 'pcm', '-c', str(self.cmpath),
+                '-o' + str(self.objpath)]
+            if cfg.CLANG_WRAPPER:
+                # The wrapper and standalone Clang may use different Clang library
+                # revisions. Read the PCM with the same frontend that produced it.
+                await compile_with_mapper_async(self.job, cfg.CLANG_WRAPPER, object_command,
+                    lambda request: self.resolve_clang_request(request, target, cfg))
+            else:
+                await run_compiler(self.job, object_command, color_diagnostics=True)
         self.process_makefile_deps()
         return self.deps
+
+    async def resolve_clang_request(self, request: object, target: Target, cfg: BuildConfig) -> dict[str, object]:
+        """Resolve request for target/cfg and include transitive named-module paths."""
+        path = await self.resolve_clang_module(request, target, cfg)
+        return {'pcm': path, 'modules': {name: cfg.vfs.abspath(pcm)
+                                        for name, pcm in self.clang_module_files.items()}}
 
     async def resolve_clang_module(self, request: object, target: Target, cfg: BuildConfig) -> str:
         """Resolve a wrapper request to a built PCM path using target/cfg."""
@@ -1148,6 +1188,10 @@ class SourceFile:
         module = CompiledModule.get(name, cfg, source_type)
         cmhash = await module.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
         self.deps[ModuleDep(name, cmhash, source_type)] = None
+        if module.srcfile is not None:
+            self.clang_module_files.update(getattr(module.srcfile, 'clang_module_files', {}))
+        if request.get('kind') == 'module':
+            self.clang_module_files[name] = module.cmpath
         return cfg.vfs.abspath(module.cmpath)
 
     async def clang_get_deps(
@@ -1164,7 +1208,7 @@ class SourceFile:
             extra_args = ["-xc++-header"]
         else:
             extra_args = ["-xc++"]
-        args = [CLANG_PATH + CLANG_SCAND_DEPS, "-format=p1689", "--", cfg.CXX, *extra_args, f"-fprebuilt-module-path={cfg.OBJDIR}", *CXXFLAGS, *INCFLAGS, "-o"+str(self.objpath), "-c", self.path]
+        args = [CLANG_PATH + CLANG_SCAND_DEPS, "-format=p1689", "--", *self.compiler_cmd_clang(cfg)]
 
         #print("running", *args)
         result = await run_compiler(self.job, args, capture=True)
@@ -1228,6 +1272,8 @@ class SourceFile:
                     mod = CompiledModule.get(modname, cfg)
                     cmhash = await mod.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
                     self.deps[ModuleDep(modname, cmhash)] = None
+                    self.clang_module_files.update(mod.srcfile.clang_module_files)
+                    self.clang_module_files[modname] = mod.cmpath
             return self.deps, header_units
 
     def process_makefile_deps(self) -> None:
@@ -1236,7 +1282,7 @@ class SourceFile:
         text = self.makefile.read_text(self.cfg.vfs)
         rules = parse_makefile_rules(text)
         for rule in rules:
-            if self.cfg.CLANG_WRAPPER:
+            if self.cfg.CLANG_WRAPPER or self.std_module_variant:
                 # PCMs are tracked by ModuleDep hashes, not as input headers.
                 if rule.endswith('.pcm'):
                     continue
@@ -1485,11 +1531,32 @@ class CompilationDatabase:
         for path in find_files(self.paths, suffixes=[".cc", ".cpp", ".c"], vfs=cfg.vfs):
             self.process_file(path, cfg)
 
+        asyncio.run(self.add_standard_modules(cfg))
         return json.dumps(self.entries, indent=2)
 
-    def process_file(self, path: Path, cfg: BuildConfig) -> None:
+    async def add_standard_modules(self, cfg: BuildConfig) -> None:
+        """Add installed SDK sources to cfg's IDE database so clangd builds its own PCMs."""
+        directory = DirectoryConfig.get(Path('.'), cfg)
+        flags = header_unit_flags([*cfg.CXXFLAGS, *cfg.INCFLAGS], directory.buildvars.get('CFLAGS', []))
+        session = BuildSession(cfg.JOBS, verbose=cfg.VERBOSE)
+
+        async def discover(job: Job) -> None:
+            """Discover optional SDK modules through job without compiling them."""
+            for name in ('std', 'std.compat'):
+                source = await cfg.gcc_std_modules.resolve(name, cfg.CXX, flags,
+                    str(cfg.DEPDIR / 'gcc-std-modules'), job, clang=cfg.USECLANG, optional=True)
+                if source:
+                    self.process_file(Path(source), cfg, modname=name)
+
+        session.schedule('ide-standard-modules', discover)
+        await session.finish()
+
+    def process_file(self, path: Path, cfg: BuildConfig, *, modname: str | None = None) -> None:
+        """Record path's IDE command; modname identifies an external SDK module."""
         # path = os.path.normpath(os.path.join(basepath, filepath))
-        file = SourceFile.get(path, cfg)
+        file = SourceFile.get(path, cfg, type=SourceType.MODULE if modname else None,
+                              modname=modname,
+                              inherited_dircfg=DirectoryConfig.get(Path('.'), cfg) if modname else None)
         if file in self.processed_files:
             return
         
@@ -1498,6 +1565,10 @@ class CompilationDatabase:
         # dirpath = os.path.dirname(filepath)
         # filename = os.path.basename(filepath)
         compilation_cmd = [str(cmd) for cmd in file.compiler_cmd_clang(cfg)]
+        if modname and not cfg.USECLANG:
+            # GCC's query-driver probe understands c++, but not c++-module.
+            # clangd's module builder selects the module-interface action itself.
+            compilation_cmd = ['-xc++' if arg == '-xc++-module' else arg for arg in compilation_cmd]
         # clangd builds its own BMIs. The normal build cache may contain GCC CMIs
         # or Clang BMIs made with a different compiler/configuration.
         compilation_cmd = [arg for arg in compilation_cmd
@@ -1846,8 +1917,10 @@ def _main(
     USECLANG: bool = USECLANG,
     SRC_ROOTS: list[str] = SRC_ROOTS,
     vfs: FileSystem = _DEFAULT_VFS,
+    CLANG_CXXFLAGS: list[str] = [],
+    CLANG_LDFLAGS: list[str] = [],
 ) -> None:
-    """Parse CLI arguments using the supplied compiler, path, flag and VFS defaults."""
+    """Parse CLI arguments with compiler/path/VFS defaults; CLANG_* flags apply only to Clang."""
 
     buildcfg = Release
     parser = argparse.ArgumentParser(
@@ -1875,6 +1948,7 @@ def _main(
 
     ide_parser = subparsers.add_parser('ide', help='generate a compile_commands.json compilation database')
     ide_parser.add_argument('paths', nargs='*')
+    ide_parser.add_argument('--clang', action='store_true', help='use the Clang toolchain for IDE commands')
 
     headers_parser = subparsers.add_parser('generate-module-headers',
         help='recursively generate headers for .cc module interfaces')
@@ -1928,6 +2002,13 @@ def _main(
             USECLANG = True
             CXX = CLANG_PATH + CLANGXX
             CC = CLANG_PATH + CLANG
+    if args.cmd == 'ide' and args.clang:
+        USECLANG = True
+        CXX = CLANG_PATH + CLANGXX
+        CC = CLANG_PATH + CLANG
+    if USECLANG:
+        CXXFLAGS = [*CXXFLAGS, *CLANG_CXXFLAGS]
+        LDFLAGS = [*LDFLAGS, *CLANG_LDFLAGS]
     if args.cmd == 'generate-module-headers':
         USECLANG = True
         CXX = os.environ.get('BT_MODULE_HEADER_CLANG', CLANG_PATH + CLANGXX)

@@ -14,6 +14,7 @@
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Lex/PreprocessorOptions.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
@@ -39,6 +40,7 @@ class Mapper {
   FILE *Output;
 
 public:
+  llvm::StringMap<std::string> ModuleFiles;
   Mapper(FILE *Input, FILE *Output) : Input(Input), Output(Output) {}
   std::optional<std::string> request(llvm::json::Object Request) {
     std::string Line;
@@ -67,8 +69,15 @@ public:
     if (auto *Object = Reply->getAsObject()) {
       if (auto Error = Object->getString("error"))
         llvm::errs() << "buildtool-clang: " << *Error << '\n';
-      else if (auto PCM = Object->getString("pcm"); PCM && !PCM->empty())
+      else if (auto PCM = Object->getString("pcm"); PCM && !PCM->empty()) {
+        // ASTReader loads transitive imports without calling loadModule again.
+        // Register the dependency closure before opening the requested PCM.
+        if (auto *Files = Object->getObject("modules"))
+          for (const auto &Entry : *Files)
+            if (auto Path = Entry.second.getAsString())
+              ModuleFiles[Entry.first.str()] = Path->str();
         return PCM->str();
+      }
     }
     llvm::errs() << "buildtool-clang: mapper did not supply a PCM\n";
     return std::nullopt;
@@ -98,6 +107,8 @@ public:
       return false;
     }
     serialization::ModuleFile *Loaded = nullptr;
+    for (const auto &File : Modules.ModuleFiles)
+      getHeaderSearchOpts().PrebuiltModuleFiles[File.first().str()] = File.second;
     bool Success =
         loadModuleFile(ModuleFileName::makeExplicit(*PCM), Loaded) && Loaded;
     if (!Success)
@@ -107,7 +118,8 @@ public:
 
   ModuleLoadResult loadModule(SourceLocation ImportLoc, ModuleIdPath Path,
                               Module::NameVisibilityKind Visibility,
-                              bool IsInclusionDirective) override {
+                              bool IsInclusionDirective,
+                              SourceRange ModuleNameRange = {}) override {
     // Header units reach the loader via loadHeaderUnit above. Named modules
     // can be requested here before the ordinary loader tries their PCM path.
     std::string Name = ModuleLoader::getFlatNameFromPath(Path);
@@ -123,9 +135,11 @@ public:
         return {};
       }
       getHeaderSearchOpts().PrebuiltModuleFiles[Name] = *PCM;
+      for (const auto &File : Modules.ModuleFiles)
+        getHeaderSearchOpts().PrebuiltModuleFiles[File.first().str()] = File.second;
     }
     return CompilerInstance::loadModule(ImportLoc, Path, Visibility,
-                                        IsInclusionDirective);
+                                        IsInclusionDirective, ModuleNameRange);
   }
 };
 } // namespace
@@ -161,8 +175,13 @@ int main(int Argc, char **Argv) {
   // The driver forwards color settings from its diagnostic options to cc1.
   // Parse argv as the regular Clang driver does instead of using defaults.
   auto DiagOpts = CreateAndPopulateDiagOpts(DriverArgs);
+  // Like Clang's driver, leave source-level suppression mappings to cc1.
+  DiagOpts->DiagnosticSuppressionMappingsFile.clear();
   DiagnosticsEngine Diags(DiagnosticIDs::create(), *DiagOpts,
                           new TextDiagnosticPrinter(llvm::errs(), *DiagOpts));
+  // Apply -W options before BuildCompilation emits driver diagnostics.
+  ProcessWarningOptions(Diags, *DiagOpts, *llvm::vfs::getRealFileSystem(),
+                        /*ReportDiags=*/false);
   // Use the real driver's path for builtin headers and toolchain discovery.
   driver::Driver Driver(Argv[5], llvm::sys::getDefaultTargetTriple(), Diags);
   std::unique_ptr<driver::Compilation> Jobs(Driver.BuildCompilation(DriverArgs));
