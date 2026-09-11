@@ -6,7 +6,41 @@ import unittest
 import buildtool as bt
 
 
-class GccMapperTests(unittest.TestCase):
+class GccMapperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_import_refines_directory_source_without_duplicate_job(self) -> None:
+        """A module import reuses a .cc root already scheduled by directory discovery."""
+        cfg = bt.BuildConfig(vfs=bt.MemoryFileSystem())
+        target = bt.Target(bt.Path('main'), cfg)
+        graph = bt.CompilationGraph(cfg)
+        self.addAsyncCleanup(graph.session.close)
+        target.schedule_sources([], graph)
+        path = bt.Path('lib/math/math.cc')
+        root = target.schedule_compilation_job(path)
+        source = cfg.source_files[path]
+        imported = target.schedule_compilation_job(
+            path, type=bt.SourceType.MODULE, modname='lib.math')
+        self.assertIs(root, imported)
+        self.assertIs(source, cfg.source_files[path])
+        self.assertEqual(source.type, bt.SourceType.MODULE)
+        self.assertEqual(source.cmpath, cfg.OBJDIR / 'lib.math.pcm')
+        self.assertIs(bt.SourceFile.get(path, cfg, type=bt.SourceType.CPP), source)
+
+    def test_export_records_module_identity_for_later_import(self) -> None:
+        """An export discovered by GCC supplies the module name and actual CMI path."""
+        cfg = bt.BuildConfig(vfs=bt.MemoryFileSystem())
+        path = bt.Path('lib/math/bits.cc')
+        source = bt.SourceFile.get(path, cfg)
+        target = bt.Target(bt.Path('main'), cfg)
+        reply = asyncio.run(source.gcc_mapper_request(
+            'MODULE-EXPORT', ['lib.math:bits'], target, cfg))
+        self.assertEqual(source.type, bt.SourceType.MODULE)
+        self.assertEqual(source.modname, 'lib.math:bits')
+        self.assertEqual(reply, 'PATHNAME ' + str(source.cmpath.relative_to(cfg.OBJDIR)))
+        self.assertIs(bt.SourceFile.get(path, cfg, type=bt.SourceType.MODULE,
+                                       modname='lib.math:bits'), source)
+        with self.assertRaisesRegex(Exception, 'modname mismatch'):
+            bt.SourceFile.get(path, cfg, type=bt.SourceType.MODULE, modname='other')
+
     def test_exports_are_relative_to_the_build_directory(self) -> None:
         """Check named modules, relative headers, and absolute system headers."""
         fs = bt.MemoryFileSystem()

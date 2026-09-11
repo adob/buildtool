@@ -95,6 +95,9 @@ class IncrementalModuleTests(unittest.TestCase):
         contents = json.loads(cfg.vfs.read_text(source.path))
         value = contents.get("value", 0)
         source.deps = {}
+        for header in contents.get("headers", []):
+            value += int(cfg.vfs.read_text(header))
+            source.deps[bt.HeaderDep.get(bt.Path(header), cfg)] = None
         for imported in contents.get("imports", []):
             module = bt.CompiledModule.get(imported, cfg)
             digest = await module.build(target, inherited_dircfg=source.dircfg(), parent=source.job)
@@ -116,6 +119,19 @@ class IncrementalModuleTests(unittest.TestCase):
         metadata = json.loads(self.fs.read_text(f"build/{importer}.info"))
         digest = bt.sha256_file(bt.Path(f"build/{module}.pcm"), self.fs)
         self.assertIn(f"module:{module}@{digest}", metadata["deps"])
+
+    def test_deleted_header_forces_compiler_to_check_includes(self) -> None:
+        """Deleting a cached header must trigger compilation and expose the missing input."""
+        self.fs.write_text("value.h", "7")
+        self.source("main", headers=["value.h"])
+        self.assertEqual(self.build(), 7)
+        self.assertEqual(self.build(), 7)
+        self.assertEqual(self.calls, [])
+        metadata = self.fs.read_text("build/main.info")
+        self.fs.unlink("value.h")
+        with self.assertRaises(FileNotFoundError):
+            self.build()
+        self.assertEqual(self.fs.read_text("build/main.info"), metadata)
 
     def test_build_does_not_access_host_files_or_start_a_compiler(self):
         self.source("value", value=1)

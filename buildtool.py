@@ -173,6 +173,8 @@ class BuildConfig:
     directory_configs: dict[Path, DirectoryConfig]
     header_deps: dict[Path, HeaderDep]
     compiler_commands: dict[SourceFile, list[str]]
+    nm_paths: dict[str, str]
+    nm_locks: dict[str, asyncio.Lock]
     gcc_std_headers: GccStdHeaders
     gcc_std_modules: GccStdModules
     std_header_sources: dict[tuple[Path, tuple[str, ...]], SourceFile]
@@ -236,10 +238,32 @@ class BuildConfig:
         self.directory_configs = {}
         self.header_deps = {}
         self.compiler_commands = {}
+        self.nm_paths = {}
+        self.nm_locks = {}
         self.gcc_std_headers = GccStdHeaders(vfs)
         self.gcc_std_modules = GccStdModules(vfs)
         self.std_header_sources = {}
         self.std_module_sources = {}
+
+    def get_nm(self) -> str:
+        """Return this configuration's cached nm path for the selected C++ compiler."""
+        compiler = self.CXX
+        if compiler not in self.nm_paths:
+            self.nm_paths[compiler] = shell(
+                compiler, '-print-prog-name=nm', verbose=self.VERBOSE).strip()
+        return self.nm_paths[compiler]
+
+    async def get_nm_async(self, job: Job) -> str:
+        """Share nm discovery across targets; job supplies the lookup's slot and log."""
+        compiler = self.CXX
+        if compiler not in self.nm_paths:
+            lock = self.nm_locks.setdefault(compiler, asyncio.Lock())
+            async with lock:
+                # Another target may have completed discovery while we waited.
+                if compiler not in self.nm_paths:
+                    self.nm_paths[compiler] = (await shell_async(
+                        job, compiler, '-print-prog-name=nm')).strip()
+        return self.nm_paths[compiler]
 
     def reset_build_state(self) -> None:
         """Clear this configuration's caches, retaining filesystem contents.
@@ -252,6 +276,8 @@ class BuildConfig:
         self.directory_configs.clear()
         self.header_deps.clear()
         self.compiler_commands.clear()
+        self.nm_paths.clear()
+        self.nm_locks.clear()
         self.gcc_std_headers.paths.clear()
         self.gcc_std_modules.sources.clear()
         self.gcc_std_modules.fingerprints.clear()
@@ -642,7 +668,7 @@ class Target:
         """Inspect this target's objects through job without blocking other compilations."""
         if not self.objs:
             return False
-        nm = (await shell_async(job, self.cfg.CXX, '-print-prog-name=nm')).strip()
+        nm = await self.cfg.get_nm_async(job)
         symbols = await shell_async(job, nm, '--defined-only', '--extern-only', '--format=posix',
                                     *self.objs)
         return self.symbols_define_main(symbols)
@@ -652,7 +678,7 @@ class Target:
         if not self.objs:
             return False
         # Let the compiler select its toolchain's nm, including cross-toolchains.
-        nm = shell(self.cfg.CXX, '-print-prog-name=nm', verbose=self.cfg.VERBOSE).strip()
+        nm = self.cfg.get_nm()
         symbols = shell(nm, '--defined-only', '--extern-only', '--format=posix',
                         *self.objs, verbose=self.cfg.VERBOSE)
         return self.symbols_define_main(symbols)
@@ -774,6 +800,15 @@ class SourceFile:
             return cache[key]
         file = cfg.source_files.get(path)
         if file:
+            if not cfg.USECLANG:
+                # GCC discovers module declarations while compiling ordinary .cc
+                # inputs. Refine the cached identity without replacing its job.
+                if file.type == SourceType.CPP and type == SourceType.MODULE and modname:
+                    file.type = SourceType.MODULE
+                    file.modname = modname
+                    file.cmpath = cfg.OBJDIR / mod2cm(modname, cfg.SRCDIR)
+                elif file.type == SourceType.MODULE and type == SourceType.CPP:
+                    type = SourceType.MODULE
             if type and file.type and type != file.type:
                 raise Exception(f"type mismatch: new type {type}; old type {file.type}")
             if modname and file.modname and modname != file.modname:
@@ -888,7 +923,8 @@ class SourceFile:
             if depname.startswith('file:'):
                 dep = Path(depname[5:])
 
-                if SourceFile.get(dep, cfg).mtime >= infofile_mtime:
+                dep_mtime = SourceFile.get(dep, cfg).mtime
+                if dep_mtime == 0 or dep_mtime >= infofile_mtime:
                     self.up_to_date     = False
                     self.need_recompile = True
 
@@ -903,7 +939,8 @@ class SourceFile:
                 dep = depname[8:]
                 hfile = HeaderDep.get(Path(dep), cfg)
                 self.up_to_date = False
-                if hfile.mtime(cfg.vfs) >= infofile_mtime:
+                header_mtime = hfile.mtime(cfg.vfs)
+                if header_mtime == 0 or header_mtime >= infofile_mtime:
                     self.need_recompile = True
                 self.deps[hfile] = None
 
@@ -1238,6 +1275,8 @@ class SourceFile:
         if verb == 'MODULE-EXPORT':
             if self.std_header_variant or self.std_module_variant:
                 return 'PATHNAME ' + shlex.quote(str(self.cmpath.relative_to(cfg.OBJDIR)))
+            if self.type in (SourceType.CPP, SourceType.MODULE):
+                SourceFile.get(self.path, cfg, type=SourceType.MODULE, modname=args[0])
             # Path joining maps absolute header names under SYSTEM/, matching
             # SourceFile.cmpath. GCC expects a path relative to MODULE-REPO.
             module_path = cfg.OBJDIR / mod2cm(args[0], cfg.SRCDIR)
