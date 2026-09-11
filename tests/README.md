@@ -154,7 +154,20 @@ Use `bt build cmd/...` to select source-bearing directories recursively, includi
 do not collide. Internal binaries use `build/<config>/packages/<identity>/<name>`;
 the identity includes the absolute directory path. Publishing retains buildtool's
 `bin/<name>` convention: if two packages share a name, that symlink points to the
-last built package. Their internal artifacts remain separate.
+last package in selection order, regardless of linker completion order. Their
+internal artifacts remain separate.
+
+All selected directories share one scheduler, job limit, and memory budget.
+Independent files compile concurrently across directory boundaries; shared
+modules and header companions compile once. Each target retains its own root
+sources and collects only its reachable objects and linker flags. Linking starts
+as soon as that target's transitive compilations finish, using the same job limit.
+
+Compilation logs retain breadth-first ordering across all selected roots. Link
+jobs execute concurrently but their logs are printed afterward, in target order.
+Verbose `launching ...` messages still print immediately. A build error stops
+reporting and cancels pending work when its place in the output queue is reached.
+Public symlinks are updated in target order after the batch succeeds.
 
 Recursive patterns skip symlinked subdirectories, names beginning with `.` or
 `_`, `testdata`, `vendor`, and configured build/output directories. They traverse
@@ -178,13 +191,22 @@ publishing to `bin`. The identity includes the directory and selected test files
 so an explicit subset cannot reuse a binary with extra tests. Tests execute in
 their source directory, in deterministic directory order. A failed package is
 reported and subsequent packages still run; any failure makes the overall command
-fail. An explicit directory without tests reports `[no test files]`.
+fail. Compilation and linking share one scheduler across all test packages;
+independent packages keep building after a compilation failure. Test binaries
+execute sequentially after the build phase. An explicit directory without tests
+reports `[no test files]`.
 
 `test_target_patterns.py` exercises pattern selection and test execution with a
 fake filesystem and mock processes. `test_directory_build.py` checks independent
 recursive build artifacts and includes an optional real GCC build/test fixture
 (`BT_TEST_GCC=g++`). The existing recursive behavior of `ide`, `bench`, and
 `generate-module-headers` is unchanged.
+
+`test_parallel_build.py` uses event barriers to verify cross-directory concurrency,
+the global slot limit, shared transitive dependencies, separate link inputs,
+link/compile overlap, incremental reuse, and per-package errors. The opt-in
+`test_parallel_compilers.py` fixtures build two executables sharing a named module
+and header unit with GCC or the patched Clang wrapper.
 
 ## Source build tags
 

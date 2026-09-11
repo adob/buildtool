@@ -117,6 +117,141 @@ class ParallelBuildTests(unittest.TestCase):
         self.assertEqual(self.maximum_active, 1)
         self.assertEqual(self.calls.count('leaf.cc'), 1)
 
+    def test_directories_share_jobs_but_keep_separate_link_inputs(self) -> None:
+        """Concurrent packages share transitive dependencies without mixing objects or flags."""
+        self.barrier = asyncio.Event()
+        self.write('value.cc', {'imports': ['leaf'], 'value': 42})
+        self.write('leaf.cc', {'headers': ['common/common.h'], 'value': 7})
+        self.write('common/common.h', {})
+        self.write('common/common.cc', {})
+        self.fs.write_text('common/BUILD.py', 'LDFLAGS = ["-lcommon"]')
+        plans = [bt.BuildPlan(bt.Target(bt.Path(name), self.cfg), [bt.Path(f'{name}/{name}.cc')],
+                              check_main=False, publish=False) for name in ('a', 'b')]
+        linked = []
+
+        async def link(target: bt.Target, job: bt.Job, artifact: bt.Path | None) -> bt.Path:
+            """Verify target's full graph is ready before recording its simulated link."""
+            self.assertTrue(self.cfg.source_files[bt.Path('common/common.cc')].processed)
+            linked.append(target)
+            job.message(f'LINKING {target.path}')
+            return target.binary_paths(artifact)[0]
+
+        with mock.patch.object(bt.Target, 'link_async', autospec=True, side_effect=link):
+            for repeat in range(2):
+                self.cfg.reset_build_state()
+                self.calls = []
+                for plan in plans:
+                    plan.target = bt.Target(plan.target.path, self.cfg)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    bt.build_plans(plans, self.cfg)
+                if repeat == 0:
+                    self.assertEqual(self.maximum_active, 2)
+                    self.assertEqual(self.calls.count('value.cc'), 1)
+                    self.assertEqual(self.calls.count('leaf.cc'), 1)
+                    self.assertEqual(self.calls.count('common/common.cc'), 1)
+                    self.assertLess(output.getvalue().index('common/common.cc: done'),
+                                    output.getvalue().index('LINKING'))
+                else:
+                    self.assertEqual(self.calls, [])
+                for name, plan in zip(('a', 'b'), plans):
+                    self.assertEqual(list(map(str, plan.target.objs)),
+                                     ['build/common/common.o', 'build/leaf.o', 'build/value.o',
+                                      f'build/{name}/{name}.o'])
+                    self.assertEqual(plan.target.get_linkflags(), [f'-l{name}', '-lcommon'])
+
+    def test_ready_target_links_while_another_directory_compiles(self) -> None:
+        """An unrelated slow compilation must not delay a ready target's linker."""
+        self.write('fast/fast.cc', {})
+        self.write('slow/slow.cc', {})
+        slow_started = asyncio.Event()
+        fast_linked = asyncio.Event()
+        original_compile = self.compile
+
+        async def compile(source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
+            """Keep slow's compiler active until fast's link has run in another slot."""
+            if str(source.path) == 'slow/slow.cc':
+                async with source.job.compiler_slot():
+                    slow_started.set()
+                    await asyncio.wait_for(fast_linked.wait(), 2)
+            await original_compile(source, target, cfg)
+
+        async def link(target: bt.Target, job: bt.Job, artifact: bt.Path | None) -> bt.Path:
+            """Acquire the shared limit and release the slow compiler after fast links."""
+            async with job.compiler_slot(compilation=False):
+                if str(target.path) == 'fast':
+                    await asyncio.wait_for(slow_started.wait(), 2)
+                    fast_linked.set()
+            return target.binary_paths(artifact)[0]
+
+        plans = [bt.BuildPlan(bt.Target(bt.Path(name), self.cfg), [bt.Path(f'{name}/{name}.cc')],
+                              check_main=False, publish=False) for name in ('fast', 'slow')]
+        with mock.patch.object(bt.SourceFile.compile_gcc, 'side_effect', compile), \
+             mock.patch.object(bt.Target, 'link_async', autospec=True, side_effect=link), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bt.build_plans(plans, self.cfg)
+        self.assertTrue(fast_linked.is_set())
+
+    def test_all_directories_obey_one_job_limit(self) -> None:
+        """Four packages must overlap while sharing two slots, including linker work."""
+        two_running = asyncio.Event()
+        plans = []
+        for index in range(4):
+            name = f'pkg{index}'
+            self.write(f'{name}/code.cc', {})
+            plans.append(bt.BuildPlan(bt.Target(bt.Path(name), self.cfg),
+                                       [bt.Path(f'{name}/code.cc')], check_main=False, publish=False))
+
+        async def work(job: bt.Job, *, compilation: bool) -> None:
+            """Measure activity inside job's shared slot and let other jobs contend."""
+            async with job.compiler_slot(compilation=compilation):
+                self.active += 1
+                self.maximum_active = max(self.maximum_active, self.active)
+                if self.active == 2:
+                    two_running.set()
+                await asyncio.wait_for(two_running.wait(), 2)
+                await asyncio.sleep(0)
+                self.active -= 1
+
+        async def compile(source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
+            """Simulate source compilation under the shared limit."""
+            await work(source.job, compilation=True)
+            self.fs.write_text(source.objpath, '')
+
+        async def link(target: bt.Target, job: bt.Job, artifact: bt.Path | None) -> bt.Path:
+            """Simulate linking with the same capacity counter as compiler jobs."""
+            await work(job, compilation=False)
+            return target.binary_paths(artifact)[0]
+
+        with mock.patch.object(bt.SourceFile.compile_gcc, 'side_effect', compile), \
+             mock.patch.object(bt.Target, 'link_async', autospec=True, side_effect=link), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bt.build_plans(plans, self.cfg)
+        self.assertEqual(self.maximum_active, 2)
+        self.assertEqual(self.active, 0)
+
+    def test_failed_test_package_does_not_link_or_block_other_packages(self) -> None:
+        """Keep-going batches retain per-package failure while sharing successful dependencies."""
+        self.fail_source = 'a/a.cc'
+        plans = [bt.BuildPlan(bt.Target(bt.Path(name), self.cfg), [bt.Path(f'{name}/{name}.cc')],
+                              check_main=False, publish=False) for name in ('a', 'b')]
+        linked = []
+
+        async def link(target: bt.Target, job: bt.Job, artifact: bt.Path | None) -> bt.Path:
+            """Record only successfully built targets reaching the linker."""
+            linked.append(str(target.path))
+            return target.binary_paths(artifact)[0]
+
+        with mock.patch.object(bt.Target, 'link_async', autospec=True, side_effect=link), \
+             contextlib.redirect_stdout(io.StringIO()):
+            bt.build_plans(plans, self.cfg, keep_going=True)
+        self.assertIsInstance(plans[0].error, RuntimeError)
+        self.assertIsNone(plans[0].binary)
+        self.assertIsNone(plans[1].error)
+        self.assertIsNotNone(plans[1].binary)
+        self.assertEqual(linked, ['b'])
+        self.assertEqual(self.calls.count('value.cc'), 1)
+
     def test_forced_rebuild_recompiles_shared_and_transitive_dependencies(self) -> None:
         """Force unchanged companions and nested modules once each, then return to no-op."""
         self.write('value.cc', {'imports': ['leaf'], 'value': 42})

@@ -31,6 +31,12 @@ class DirectoryBuildTests(unittest.TestCase):
         self.enterContext(mock.patch.object(bt.SourceFile, 'compile_gcc', autospec=True,
                                            side_effect=self.compile_source))
         self.enterContext(mock.patch.object(bt, 'shell', side_effect=self.shell))
+        self.enterContext(mock.patch.object(bt, 'run_compiler', side_effect=self.run_command))
+
+    async def run_command(self, job: bt.Job, command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+        """Run scheduled inspection/link commands against the same fake toolchain."""
+        async with job.compiler_slot(compilation=False):
+            return subprocess.CompletedProcess(command, 0, self.shell(*command).encode(), b'')
 
     def compile_source(self, source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
         """Write source's simulated object using cfg; target supplies the build graph."""
@@ -162,7 +168,7 @@ class DirectoryCompilerTests(unittest.TestCase):
             os.chdir(directory)
             self.addCleanup(os.chdir, previous)
             Path('runner.cc').write_text('int check(); int main() { return check(); }\n')
-            for package in ('one/same', 'two/same'):
+            for package in ('packages/one/same', 'packages/two/same'):
                 Path(package).mkdir(parents=True)
                 Path(package, 'main.cc').write_text('int main() { return 0; }\n')
                 Path(package, 'marker').write_text('fixture')
@@ -171,23 +177,22 @@ class DirectoryCompilerTests(unittest.TestCase):
                     'int check() { return access("marker", 0); }\n')
             cfg = bt.BuildConfig(CXX=os.environ['BT_TEST_GCC'], CXXFLAGS=['-std=c++20'],
                                  LDFLAGS=shlex.split(os.environ.get('BT_TEST_GCC_LDFLAGS', '')),
-                                 STD_HEADER_UNIT=False)
+                                 STD_HEADER_UNIT=False, JOBS=2)
             with mock.patch.object(bt, 'ROOT', directory), mock.patch.object(bt, 'TESTMAIN', 'runner.cc'), \
                  contextlib.redirect_stdout(io.StringIO()):
-                bt.build_targets(bt.Path('one/...'), cfg)
-                bt.build_targets(bt.Path('two/...'), cfg)
-                binaries = list(Path('build/release/packages').glob('*/same'))
+                bt.build_targets(bt.Path('packages/...'), cfg)
+                binaries = [path for path in Path('build/release/packages').glob('*/same') if path.is_file()]
                 self.assertEqual(len(binaries), 2)
                 for binary in binaries:
                     subprocess.run([str(binary.resolve())], check=True)
-                bt.run_tests(['one/...', 'two/...'], cfg)
+                bt.run_tests(['packages/...'], cfg)
                 self.assertEqual(len(list(Path('build/release/tests').glob('*/same'))), 2)
-                Path('one/same/case_test.cc').write_text('int check() { return 1; }\n')
+                Path('packages/one/same/case_test.cc').write_text('int check() { return 1; }\n')
                 cfg.reset_build_state()
                 # Preserve actual execution while counting the packages run after a failure.
                 with mock.patch.object(bt.subprocess, 'run', wraps=subprocess.run) as execute, \
                      self.assertRaises(SystemExit):
-                    bt.run_tests(['one/...', 'two/...'], cfg)
+                    bt.run_tests(['packages/...'], cfg)
                 tests = [call for call in execute.call_args_list if 'cwd' in call.kwargs]
                 self.assertEqual(len(tests), 2)
 

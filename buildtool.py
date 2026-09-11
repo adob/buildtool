@@ -445,6 +445,15 @@ class CompiledModule:
         self.cmhash = self.srcfile.cmhash
         return self.cmhash
 
+class CompilationGraph:
+    def __init__(self, cfg: BuildConfig) -> None:
+        """Own one scheduler and shared dependency records for targets using cfg."""
+        self.session = BuildSession(cfg.JOBS, memory=cfg.memory, verbose=cfg.VERBOSE,
+                                    concurrency_reporter=cfg.concurrency_reporter)
+        self.job_sources: dict[Job, SourceFile] = {}
+        self.link_events: dict[Job, list[Job | DirectoryConfig]] = {}
+
+
 class Target:
     def __init__(self, path: Path, cfg: BuildConfig) -> None:
         self.path = path
@@ -456,6 +465,7 @@ class Target:
         self.extra_linkflags = []
         self.cfg = cfg
         self.session = None
+        self.roots: list[Job] = []
 
     def compile(
         self,
@@ -475,26 +485,52 @@ class Target:
         """Build source paths or (path, type, module name, directory config) tuples."""
         async def run() -> None:
             """Schedule this target's roots and consume their ordered output."""
-            self.session = BuildSession(self.cfg.JOBS, memory=self.cfg.memory,
-                                        verbose=self.cfg.VERBOSE,
-                                        concurrency_reporter=self.cfg.concurrency_reporter)
-            self.job_sources = {}
-            self.link_events = {}
+            graph = CompilationGraph(self.cfg)
             try:
-                for source in sources:
-                    if isinstance(source, tuple):
-                        path, kind, name, directory = source
-                        self.schedule_compilation_job(path, kind, name, directory)
-                    else:
-                        self.schedule_compilation_job(source)
-                await self.session.finish()
+                self.schedule_sources(sources, graph)
+                await graph.session.finish()
                 self.collect_link_inputs()
             finally:
                 # Scheduling can fail before finish() takes ownership of cleanup.
-                await self.session.close()
+                await graph.session.close()
                 self.session = None
 
         asyncio.run(run())
+
+    def schedule_sources(
+        self,
+        sources: Iterable[Path | tuple[Path, SourceType | None, str | None, DirectoryConfig | None]],
+        graph: CompilationGraph,
+    ) -> None:
+        """Attach to graph and schedule this target's source paths or module tuples."""
+        self.session = graph.session
+        self.job_sources = graph.job_sources
+        self.link_events = graph.link_events
+        self.roots = []
+        for source in sources:
+            if isinstance(source, tuple):
+                path, kind, name, directory = source
+                self.schedule_compilation_job(path, kind, name, directory)
+            else:
+                self.schedule_compilation_job(source)
+
+    async def wait_for_compilations(self) -> None:
+        """Wait for this target's roots and all dynamically discovered dependencies."""
+        seen: set[Job] = set()
+
+        async def wait(job: Job) -> None:
+            """Await job before visiting its completed list of discovered children."""
+            if job in seen:
+                return
+            seen.add(job)
+            await asyncio.shield(job.task)
+            if job.error:
+                raise job.error
+            for child in job.children:
+                await wait(child)
+
+        for root in self.roots:
+            await wait(root)
 
     def schedule_compilation_job(
         self,
@@ -529,7 +565,9 @@ class Target:
         job = self.session.schedule(str(source.output_path), work, parent=parent)
         self.job_sources[job] = source
         self.link_events.setdefault(job, [])
-        if parent is not None and job not in self.link_events[parent]:
+        if parent is None and job not in self.roots:
+            self.roots.append(job)
+        elif parent is not None and job not in self.link_events[parent]:
             self.link_events[parent].append(job)
         return job
 
@@ -554,38 +592,60 @@ class Target:
             self.most_recent_output_mtime = max(
                 self.most_recent_output_mtime, source.output_mtime)
 
-        for root in self.session.roots:
+        for root in self.roots:
             visit(root)
 
-    def link(self, *, publish: bool = True, artifact: Path | None = None) -> Path:
-        """Link to optional artifact; publish exposes the executable through bin's symlink."""
-        dirname = self.path.parent
-        #buildvars = DirectoryConfig.get(dirname).buildvars
-
-        suffix = self.cfg.SUFFIX
-        extra_flags = []
-        
+    def binary_paths(self, artifact: Path | None = None) -> tuple[Path, Path]:
+        """Return internal and public binary paths, with an optional artifact override."""
         if self.cfg.OUTFILE is None:
-            name = self.path.name + suffix
+            name = self.path.name + self.cfg.SUFFIX
         else:
             name = self.cfg.OUTFILE
         ofile = artifact if artifact is not None else self.cfg.OBJDIR / "bin" / name
         public_file = self.cfg.BINDIR / name
+        return ofile, public_file
 
+    def needs_link(self, ofile: Path) -> bool:
+        """Check whether ofile predates this target's inputs or a rebuild was requested."""
         ofile_mtime = ofile.mtime(self.cfg.vfs)
-        if self.cfg.REBUILD or self.most_recent_output_mtime >= ofile_mtime or THIS_MTIME > ofile_mtime:
-            lflags = self.get_linkflags()
-            self.cfg.vfs.makedirs(ofile.parent, exist_ok=True)
-            print("LINKING", ofile)
-            shell(self.cfg.CXX, *extra_flags, *self.objs, *lflags, f"-o{ofile}",
-                  verbose=self.cfg.VERBOSE)
-        if not publish:
-            return ofile
+        return self.cfg.REBUILD or self.most_recent_output_mtime >= ofile_mtime or THIS_MTIME > ofile_mtime
+
+    def publish_binary(self, ofile: Path, public_file: Path) -> Path:
+        """Point public_file at the completed ofile artifact and return the public path."""
         self.cfg.vfs.makedirs(public_file.parent, exist_ok=True)
         link_target = os.path.relpath(self.cfg.vfs.abspath(ofile),
                                       self.cfg.vfs.abspath(public_file.parent))
         atomic_symlink(public_file, link_target, self.cfg.vfs)
         return public_file
+
+    def link(self, *, publish: bool = True, artifact: Path | None = None) -> Path:
+        """Link to optional artifact; publish exposes the executable through bin's symlink."""
+        ofile, public_file = self.binary_paths(artifact)
+        if self.needs_link(ofile):
+            self.cfg.vfs.makedirs(ofile.parent, exist_ok=True)
+            print("LINKING", ofile)
+            shell(self.cfg.CXX, *self.objs, *self.get_linkflags(), f"-o{ofile}",
+                  verbose=self.cfg.VERBOSE)
+        return self.publish_binary(ofile, public_file) if publish else ofile
+
+    async def link_async(self, job: Job, artifact: Path | None = None) -> Path:
+        """Link through job's slot and log into artifact; publication is handled in target order."""
+        ofile, _ = self.binary_paths(artifact)
+        if self.needs_link(ofile):
+            self.cfg.vfs.makedirs(ofile.parent, exist_ok=True)
+            job.message('LINKING', ofile)
+            await run_compiler(job, [self.cfg.CXX, *self.objs, *self.get_linkflags(), f'-o{ofile}'],
+                               color_diagnostics=True, compilation=False)
+        return ofile
+
+    async def defines_main_async(self, job: Job) -> bool:
+        """Inspect this target's objects through job without blocking other compilations."""
+        if not self.objs:
+            return False
+        nm = (await shell_async(job, self.cfg.CXX, '-print-prog-name=nm')).strip()
+        symbols = await shell_async(job, nm, '--defined-only', '--extern-only', '--format=posix',
+                                    *self.objs)
+        return self.symbols_define_main(symbols)
 
     def defines_main(self) -> bool:
         """Check this target's compiled objects for an externally defined main function."""
@@ -595,6 +655,11 @@ class Target:
         nm = shell(self.cfg.CXX, '-print-prog-name=nm', verbose=self.cfg.VERBOSE).strip()
         symbols = shell(nm, '--defined-only', '--extern-only', '--format=posix',
                         *self.objs, verbose=self.cfg.VERBOSE)
+        return self.symbols_define_main(symbols)
+
+    @staticmethod
+    def symbols_define_main(symbols: str) -> bool:
+        """Recognize an externally defined main in nm's POSIX-format symbols."""
         return any(len(fields := line.split()) >= 2 and
                    fields[0] == 'main' and fields[1] in ('T', 'W')
                    for line in symbols.splitlines())
@@ -1729,6 +1794,17 @@ def shell(*args: str | os.PathLike[str], log: Job | None = None, verbose: bool =
         exit(1)
     return result.stdout
 
+async def shell_async(job: Job, *args: str | os.PathLike[str]) -> str:
+    """Run inspection args within job's limit; return stdout and report stderr."""
+    result = await run_compiler(job, args, capture=True, compilation=False)
+    if result.stderr:
+        if not job.session.verbose:
+            job.message(shlex.join(list(map(str, args))))
+        job.write(result.stderr)
+    result.check_returncode()
+    return result.stdout.decode(errors='replace')
+
+
 def mod2cm(modname: str, srcdir: str | os.PathLike[str] = SRCDIR) -> str:
     if modname.startswith('/'):
         path = modname
@@ -1869,13 +1945,68 @@ def package_artifact(path: Path, cfg: BuildConfig, *, sources: Sequence[Path] = 
     return cfg.OBJDIR / ('tests' if sources else 'packages') / key / (name + cfg.SUFFIX)
 
 
+@dataclass
+class BuildPlan:
+    """A target's roots, output policy, and resulting internal binary, if it has main."""
+    target: Target
+    sources: list[Path]
+    artifact: Path | None = None
+    check_main: bool = True
+    publish: bool = True
+    binary: Path | None = None
+    error: Exception | None = None
+
+    async def finish(self, job: Job) -> None:
+        """Wait for this target's graph, then inspect/link using job's slot and log."""
+        await self.target.wait_for_compilations()
+        self.target.collect_link_inputs()
+        if self.check_main and not await self.target.defines_main_async(job):
+            return
+        self.binary = await self.target.link_async(job, self.artifact)
+
+
+def build_plans(plans: Sequence[BuildPlan], cfg: BuildConfig, *, keep_going: bool = False) -> None:
+    """Build plans with one limit; keep_going records per-plan errors for test packages."""
+    if not plans:
+        return
+
+    async def run() -> None:
+        """Schedule all roots before running finalizers alongside pending compilations."""
+        graph = CompilationGraph(cfg)
+        try:
+            for plan in plans:
+                plan.binary = None
+                plan.error = None
+                plan.target.schedule_sources(plan.sources, graph)
+            final_jobs = []
+            for index, plan in enumerate(plans):
+                # Finalizers execute immediately but their logs follow the compilation queue.
+                final_jobs.append(graph.session.schedule(('link', index), plan.finish, final=True))
+            await graph.session.finish(keep_going=keep_going)
+            for plan, job in zip(plans, final_jobs):
+                plan.error = job.error
+        finally:
+            await graph.session.close()
+            for plan in plans:
+                plan.target.session = None
+
+    asyncio.run(run())
+    for plan in plans:
+        if plan.binary is not None and plan.publish:
+            _, public_file = plan.target.binary_paths(plan.artifact)
+            plan.target.publish_binary(plan.binary, public_file)
+
+
 def build_targets(path: Path, cfg: BuildConfig) -> None:
-    """Build path or each directory selected by path/... independently using cfg."""
-    for selected in expand_target_pattern(path, cfg):
-        if path.name == '...':
-            build(selected, cfg, artifact=package_artifact(selected, cfg))
-        else:
-            build(selected, cfg)
+    """Build path or schedule every directory selected by path/... in one shared graph."""
+    if path.name != '...':
+        build(path, cfg)
+        return
+    plans = [BuildPlan(Target(Path(cfg.vfs.abspath(selected)), cfg),
+                       directory_sources(selected, cfg), artifact=package_artifact(selected, cfg),
+                       check_main=cfg.SUFFIX != '.so')
+             for selected in expand_target_pattern(path, cfg)]
+    build_plans(plans, cfg)
 
 
 def build(path: Path, cfg: BuildConfig, *, publish: bool = True,
@@ -1964,21 +2095,27 @@ def run_tests(dirs: list[str], cfg: BuildConfig) -> None:
                 else:
                     raise RuntimeError(f'Expected a directory or test source: {selected}')
         main_path = mkpath(TESTMAIN, vfs=cfg.vfs)
+        plans = []
         for directory, files in groups.items():
             label = mkpath(directory, vfs=cfg.vfs)
             if not files:
                 print(f'? {label} [no test files]', flush=True)
                 continue
             sources = [mkpath(file, vfs=cfg.vfs) for file in sorted(files, key=str)]
-            target = Target(directory, cfg)
+            plans.append(BuildPlan(Target(directory, cfg), [main_path, *sources],
+                                   artifact=package_artifact(directory, cfg, sources=sources),
+                                   check_main=False, publish=False))
+        build_plans(plans, cfg, keep_going=True)
+        for plan in plans:
+            directory = plan.target.path
+            label = mkpath(directory, vfs=cfg.vfs)
+            success = False
             try:
-                target.compile_many([main_path, *sources])
-                binary = target.link(publish=False,
-                    artifact=package_artifact(directory, cfg, sources=sources))
                 # A subprocess lets later packages run after a test failure; tests run in their own directory.
-                sys.stdout.flush()
-                result = subprocess.run([cfg.vfs.abspath(binary)], cwd=str(directory), check=False)
-                success = result.returncode == 0
+                if plan.error is None and plan.binary is not None:
+                    sys.stdout.flush()
+                    result = subprocess.run([cfg.vfs.abspath(plan.binary)], cwd=str(directory), check=False)
+                    success = result.returncode == 0
             except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
                 if not getattr(error, 'buildtool_reported', False):
                     warn(error)

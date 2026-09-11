@@ -75,18 +75,20 @@ async def run_compiler(
     env: Mapping[str, str] | None = None,
     capture: bool = False,
     color_diagnostics: bool = False,
+    compilation: bool = True,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run command in job; protocol handles mapper requests while output drains.
 
     pass_fds and env configure the child. capture returns stdout/stderr bytes
     without checking status, for tools whose output is machine-readable.
     color_diagnostics enables terminal-aware GCC/Clang diagnostic flags.
+    compilation=False shares the job limit without announcing a compilation.
     """
     command = list(map(str, command))
     if color_diagnostics:
         command += diagnostic_color_flags(job.session.output, command)
     stdout, stderr = bytearray(), bytearray()
-    async with job.compiler_slot():
+    async with job.compiler_slot(compilation=compilation):
         command_text = shlex.join(command)
         if job.session.verbose:
             job.session.report_launch(command_text)

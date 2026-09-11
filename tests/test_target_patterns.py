@@ -49,12 +49,13 @@ class TargetPatternTests(PatternFixture):
         self.assertIn('matched no source directories', output.getvalue())
 
     def test_cli_build_expands_before_building(self) -> None:
-        """The build command dispatches one directory at a time for a recursive pattern."""
+        """The build command schedules all selected directories in one batch."""
         with mock.patch.dict(vars(bt)), mock.patch.object(sys, 'argv', ['bt', 'build', 'pkg/...']), \
-             mock.patch.object(bt, 'build') as build:
+             mock.patch.object(bt, 'build_plans') as build:
             bt.main(vfs=self.fs)
-        self.assertEqual([str(call.args[0]) for call in build.call_args_list],
-                         ['pkg', 'pkg/empty/deep', 'pkg/sub'])
+        build.assert_called_once()
+        self.assertEqual([str(plan.target.path) for plan in build.call_args.args[0]],
+                         ['/workspace/pkg', '/workspace/pkg/empty/deep', '/workspace/pkg/sub'])
 
 
 class TestPackageTests(PatternFixture):
@@ -63,26 +64,38 @@ class TestPackageTests(PatternFixture):
         super().setUp()
         self.enterContext(contextlib.redirect_stdout(io.StringIO()))
         self.enterContext(contextlib.redirect_stderr(io.StringIO()))
-        self.target = self.enterContext(mock.patch.object(bt, 'Target'))
-        self.target.return_value.link.side_effect = lambda **kwargs: kwargs['artifact']
+        self.target = self.enterContext(mock.patch.object(bt, 'Target', wraps=bt.Target))
+        self.fail_package = None
+        self.build = self.enterContext(mock.patch.object(bt, 'build_plans', side_effect=self.build_packages))
         self.execute = self.enterContext(mock.patch.object(bt.subprocess, 'run',
             return_value=subprocess.CompletedProcess([], 0)))
+
+    def build_packages(self, plans: list[bt.BuildPlan], cfg: bt.BuildConfig, *, keep_going: bool) -> None:
+        """Simulate batch results; fail_package selects a target that must not execute."""
+        self.assertTrue(keep_going)
+        for plan in plans:
+            if str(plan.target.path) == self.fail_package:
+                plan.error = RuntimeError('compile failed')
+            else:
+                plan.binary = plan.artifact
 
     def test_directory_is_nonrecursive(self) -> None:
         """An ordinary directory runs its immediate tests in that directory."""
         bt.run_tests(['pkg'], self.cfg)
-        sources = self.target.return_value.compile_many.call_args.args[0]
+        plan = self.build.call_args.args[0][0]
+        sources = plan.sources
         self.assertEqual(list(map(str, sources)), [bt.TESTMAIN, 'pkg/code_test.cc'])
         self.assertEqual(self.execute.call_count, 1)
         self.assertEqual(self.execute.call_args.kwargs['cwd'], '/workspace/pkg')
-        self.assertFalse(self.target.return_value.link.call_args.kwargs['publish'])
+        self.assertFalse(plan.publish)
 
     def test_recursive_tests_run_separate_binaries(self) -> None:
         """Separate directories get separate selections, output paths, and working directories."""
         bt.run_tests(['pkg/...'], self.cfg)
-        compilations = self.target.return_value.compile_many.call_args_list
-        self.assertEqual(len(compilations), 3)
-        self.assertTrue(all(len(call.args[0]) == 2 for call in compilations))
+        self.build.assert_called_once()
+        plans = self.build.call_args.args[0]
+        self.assertEqual(len(plans), 3)
+        self.assertTrue(all(len(plan.sources) == 2 for plan in plans))
         self.assertEqual([call.kwargs['cwd'] for call in self.execute.call_args_list],
                          ['/workspace/pkg', '/workspace/pkg/empty/deep', '/workspace/pkg/sub'])
         binaries = [call.args[0][0] for call in self.execute.call_args_list]
@@ -115,7 +128,7 @@ class TestPackageTests(PatternFixture):
 
     def test_compile_failure_does_not_skip_later_packages(self) -> None:
         """A package that cannot build is reported without executing its stale binary."""
-        self.target.return_value.compile_many.side_effect = [RuntimeError('compile failed'), None, None]
+        self.fail_package = '/workspace/pkg'
         with self.assertRaises(SystemExit):
             bt.run_tests(['pkg/...'], self.cfg)
         self.assertEqual(self.execute.call_count, 2)

@@ -89,6 +89,27 @@ class ParallelCompilerTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     bt.build(bt.Path('main.cc'), cfg)
                 self.assertEqual(subprocess.run([os.path.abspath(binary)]).returncode, 1)
+                for name in ('one', 'two'):
+                    Path('apps', name).mkdir(parents=True)
+                    Path('apps', name, 'main.cc').write_text(
+                        '#include "../../a.h"\n#include "../../b.h"\n'
+                        'int main() { return a() + b() != 16; }\n')
+                cfg.REBUILD = True
+                cfg.reset_build_state()
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    bt.build_targets(bt.Path('apps/...'), cfg)
+                starts = [line for line in output.getvalue().splitlines()
+                          if line.startswith('BUILDING ')]
+                self.assertEqual(len(starts), 6)
+                self.assertEqual(sum('value.cc' in line for line in starts), 1)
+                self.assertEqual(sum('shared.h' in line for line in starts), 1)
+                for name in ('one', 'two'):
+                    subprocess.run([os.path.abspath('bin/' + name)], check=True)
+                cfg.REBUILD = False
+                cfg.reset_build_state()
+                with contextlib.redirect_stdout(io.StringIO()) as output:
+                    bt.build_targets(bt.Path('apps/...'), cfg)
+                self.assertEqual(output.getvalue(), '')
             finally:
                 os.chdir(previous)
 

@@ -162,12 +162,13 @@ class Job:
             destination.write(data)
 
     @asynccontextmanager
-    async def compiler_slot(self) -> AsyncIterator[None]:
-        """Hold an execution slot until the compiler exits or awaits a module."""
+    async def compiler_slot(self, *, compilation: bool = True) -> AsyncIterator[None]:
+        """Hold a slot; compilation marks compiler work rather than linking/inspection."""
         await self.session.slots.acquire(self)
         self.has_slot = True
         try:
-            self.session.compilation_started = True
+            if compilation:
+                self.session.compilation_started = True
             yield
         finally:
             if self.has_slot:
@@ -218,6 +219,7 @@ class BuildSession:
         self.slots = CompilerSlots(limit, memory)
         self.jobs = {}
         self.roots = []
+        self.final_jobs: list[Job] = []
 
     def report_concurrency(self) -> None:
         """Print the banner once before streamed output, after compilation starts."""
@@ -235,12 +237,16 @@ class BuildSession:
         key: Hashable,
         work: Callable[[Job], Awaitable[None]],
         parent: Job | None = None,
+        *,
+        final: bool = False,
     ) -> Job:
-        """Share work(job) by key; record every parent's encounter order."""
+        """Share work(job) by key; final jobs run now but report after compilation logs."""
+        if final and parent is not None:
+            raise ValueError('Final jobs cannot have a parent')
         if key not in self.jobs:
             self.jobs[key] = Job(self, key, work)
         job = self.jobs[key]
-        children = self.roots if parent is None else parent.children
+        children = self.final_jobs if final else (self.roots if parent is None else parent.children)
         if job not in children:
             children.append(job)
         return job
@@ -263,20 +269,22 @@ class BuildSession:
                 return
             await job.changed.wait()
 
-    async def finish(self) -> None:
-        """Report the breadth-first queue, stopping and cancelling on failure."""
+    async def finish(self, *, keep_going: bool = False) -> None:
+        """Report the queue; keep_going lets independent test packages finish after errors."""
         queue = deque(self.roots)
+        final_queue = deque(self.final_jobs)
         printed = set()
         try:
-            while queue:
-                job = queue.popleft()
+            while queue or final_queue:
+                job = queue.popleft() if queue else final_queue.popleft()
                 if job in printed:
                     continue
                 printed.add(job)
                 await self.stream(job)
                 if job.error:
                     job.error.buildtool_reported = True
-                    raise job.error
+                    if not keep_going:
+                        raise job.error
                 queue.extend(job.children)
         finally:
             await self.close()

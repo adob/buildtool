@@ -4,10 +4,42 @@ import asyncio
 import io
 import unittest
 
-from scheduler import BuildSession
+from scheduler import BuildSession, Job
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_final_jobs_run_early_but_report_after_dependencies(self) -> None:
+        """Final output follows compilation logs even when a linker finishes first."""
+        output = io.StringIO()
+        session = BuildSession(jobs=2, output=output)
+        linked = asyncio.Event()
+
+        async def fast(job: Job) -> None:
+            """Complete the first target's root."""
+            job.message('fast')
+
+        async def child(job: Job) -> None:
+            """Keep the second target's discovered dependency running until linking."""
+            await linked.wait()
+            job.message('child')
+
+        async def slow(job: Job) -> None:
+            """Discover a dependency whose output must precede link diagnostics."""
+            session.schedule('child', child, parent=job)
+            job.message('slow')
+
+        async def link(job: Job) -> None:
+            """Link the ready target without waiting for the second target's dependency."""
+            await first.task
+            job.message('link')
+            linked.set()
+
+        first = session.schedule('fast', fast)
+        session.schedule('slow', slow)
+        session.schedule('link', link, final=True)
+        await asyncio.wait_for(session.finish(), 2)
+        self.assertEqual(output.getvalue(), 'fast\nslow\nchild\nlink\n')
+
     async def test_output_is_identical_when_completion_order_reverses(self):
         """Change which sibling first creates a shared job without changing logs."""
         outputs = []
