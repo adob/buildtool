@@ -9,6 +9,27 @@ import buildtool as bt
 
 
 class BuildDecisionTests(unittest.TestCase):
+    def test_imported_header_schedules_companion_when_cached_or_rebuilt(self) -> None:
+        """A project header import must link its companion even with a cached CMI."""
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                fs = bt.MemoryFileSystem()
+                fs.write_text("value.h", "")
+                fs.write_text("value.cc", "")
+                cfg = bt.BuildConfig(vfs=fs)
+                source = bt.SourceFile(bt.Path("value.h"), bt.SourceType.USER_HEADER, None, cfg)
+                source.job = mock.Mock()
+                source.up_to_date = cached
+                source.need_recompile = not cached
+                source.header_deps = {}
+                target = mock.Mock(cfg=cfg)
+                with mock.patch.object(source, "check_up_to_date"), \
+                     mock.patch.object(source, "compile", new_callable=mock.AsyncMock), \
+                     mock.patch.object(source, "update"):
+                    asyncio.run(source.build(target, cfg))
+                target.schedule_compilation_job.assert_called_once_with(
+                    bt.Path("value.cc"), parent=source.job)
+
     def setUp(self):
         self.fs = bt.MemoryFileSystem()
         self.fs.write_text("main.cc", "")

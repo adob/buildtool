@@ -953,6 +953,9 @@ class SourceFile:
     async def build(self, target: Target, cfg: BuildConfig) -> None:
         """Build this source for target/cfg; publish metadata only after success."""
         target.add_config(self.dircfg(), parent=self.job)
+        if self.type == SourceType.USER_HEADER:
+            # Importing a project header needs its companion object just like including it.
+            HeaderDep.get(self.path, cfg).build(target, parent=self.job)
         if self.processed:
             await self.build_deps(target, cfg)
             return
