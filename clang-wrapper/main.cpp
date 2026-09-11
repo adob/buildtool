@@ -1,5 +1,9 @@
 // Copyright (c) 2026 buildtool contributors. See ../LICENSE.
 // A compile-only driver for the patched Clang header-unit loader.
+#include "clang/AST/ASTContext.h"
+#include "clang/CodeGen/CodeGenAction.h"
+#include "clang/Frontend/MultiplexConsumer.h"
+#include "clang/Serialization/ASTWriter.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/FileManager.h"
@@ -142,6 +146,47 @@ public:
                                         IsInclusionDirective, ModuleNameRange);
   }
 };
+// Observe the complete AST, emitting a PCM only for importable module units.
+class OptionalBMI : public ReducedBMIGenerator {
+  Mapper &Modules;
+public:
+  // CI supplies frontend services; Path is the stable source-scoped PCM output.
+  OptionalBMI(CompilerInstance &CI, StringRef Path, Mapper &Modules)
+      : ReducedBMIGenerator(CI.getPreprocessor(), CI.getModuleCache(), Path,
+                            CI.getCodeGenOpts()), Modules(Modules) {}
+  void HandleTranslationUnit(ASTContext &Ctx) override {
+    auto *M = Ctx.getCurrentNamedModule();
+    if (!M || !M->isInterfaceOrPartition() || getDiagnostics().hasErrorOccurred())
+      return;
+    auto Reply = Modules.request(llvm::json::Object{
+        {"kind", "export"}, {"name", M->getFullModuleName()},
+        {"path", getOutputFile()}});
+    if (!Reply) {
+      unsigned ID = getDiagnostics().getCustomDiagID(
+          DiagnosticsEngine::Error, "module export rejected by buildtool");
+      getDiagnostics().Report(ID);
+      return;
+    }
+    ReducedBMIGenerator::HandleTranslationUnit(Ctx);
+  }
+};
+
+// Generate ordinary objects and conditionally serialize their module interface.
+class OptionalModuleAction : public EmitObjAction {
+  Mapper &Modules;
+  std::string PCMPath;
+public:
+  // Modules reports discovered exports; PCMPath is fixed before compilation.
+  OptionalModuleAction(Mapper &Modules, std::string PCMPath)
+      : Modules(Modules), PCMPath(std::move(PCMPath)) {}
+  std::unique_ptr<ASTConsumer> CreateASTConsumer(CompilerInstance &CI,
+                                                StringRef File) override {
+    std::vector<std::unique_ptr<ASTConsumer>> Consumers;
+    Consumers.push_back(std::make_unique<OptionalBMI>(CI, PCMPath, Modules));
+    Consumers.push_back(EmitObjAction::CreateASTConsumer(CI, File));
+    return std::make_unique<MultiplexConsumer>(std::move(Consumers));
+  }
+};
 } // namespace
 
 int main(int Argc, char **Argv) {
@@ -202,10 +247,35 @@ int main(int Argc, char **Argv) {
   if (!CompilerInvocation::CreateFromArgs(*Invocation, Args, Diags, Argv[5]))
     return 1;
   Invocation->getPreprocessorOpts().ImplicitHeaderUnits = true;
+  // System header-unit lookup alone does not mark the main file as system.
+  // Preserve that classification for diagnostics, including -Wsystem-headers.
+  for (auto &Input : Invocation->getFrontendOpts().Inputs)
+    if (Input.getKind().getHeaderUnitKind() == InputKind::HeaderUnit_System)
+      Input = FrontendInputFile(Input.getFile(), Input.getKind(),
+                                /*IsSystem=*/true);
+  const auto &Frontend = Invocation->getFrontendOpts();
+  auto Kind = Frontend.Inputs.front().getKind();
+  bool OptionalOutput = Frontend.ProgramAction == frontend::EmitObj &&
+                        Kind.getLanguage() == Language::CXX &&
+                        Kind.getFormat() == InputKind::Source &&
+                        !Kind.isHeader() && !Kind.isHeaderUnit();
+  llvm::SmallString<256> PCMPath(Frontend.OutputFile);
+  llvm::sys::path::replace_extension(PCMPath, "pcm");
+  if (OptionalOutput) {
+    // Our consumer decides from the AST; do not install Clang's unconditional writer.
+    Invocation->getFrontendOpts().GenReducedBMI = false;
+    Invocation->getFrontendOpts().ModuleOutputPath.clear();
+  }
   MappedCompiler Compiler(std::move(Invocation), Modules);
   Compiler.createVirtualFileSystem(llvm::vfs::getRealFileSystem());
   Compiler.createDiagnostics();
-  bool Success = ExecuteCompilerInvocation(&Compiler);
+  bool Success;
+  if (OptionalOutput) {
+    OptionalModuleAction Action(Modules, PCMPath.str().str());
+    Success = Compiler.ExecuteAction(Action);
+  } else {
+    Success = ExecuteCompilerInvocation(&Compiler);
+  }
   fclose(Input);
   fclose(Output);
   return Success && !Compiler.hadModuleLoaderFatalFailure() ? 0 : 1;

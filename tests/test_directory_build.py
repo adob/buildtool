@@ -84,6 +84,13 @@ class DirectoryBuildTests(unittest.TestCase):
         self.assertEqual(self.links, [])
         self.assertFalse(self.fs.is_dir('bin'))
 
+    def test_explicit_sources_are_not_directory_roots(self) -> None:
+        """BUILD.py may reserve alternative runners for explicitly selected targets."""
+        self.fs.write_text('cmd/foo/BUILD.py', 'EXPLICIT_SOURCES = ["main.cc"]\n')
+        self.assertIsNone(self.build())
+        self.assertNotIn('cmd/foo/main.cc', self.compiled)
+        self.assertEqual(str(self.build('cmd/foo/main.cc')), 'bin/main')
+
     def test_internal_binary_name_and_explicit_override(self) -> None:
         """Directory runs use the internal artifact; suffixes and explicit names still apply."""
         self.cfg.SUFFIX = '+debug'

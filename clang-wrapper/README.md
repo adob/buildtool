@@ -7,6 +7,11 @@ requested through `ModuleLoader::loadModule`. No dependency scan or import
 rewriting is involved. Imported macros therefore affect subsequent `#if`s and
 imports normally.
 
+For `-fmodule-header=system`, the wrapper also marks the frontend input as a
+system header. Clang's lookup mode alone does not set this diagnostic property.
+Warnings in those inputs are suppressed as for ordinary system includes;
+user header units retain warnings, and `-Wsystem-headers` enables system warnings.
+
 This requires our patched Clang branch `feat/clangd-implicit-header-units`
 (commit `92b7ae1e9` or a compatible revision). In particular, it uses
 `ModuleLoader::loadHeaderUnit` and `PreprocessorOptions::ImplicitHeaderUnits`.
@@ -111,6 +116,26 @@ arguments. It does **not** execute a compiler shell script, so flags normally
 injected by an external wrapper (for example Nix) must be supplied explicitly
 through the build configuration.
 
+## Discovering module interfaces during ordinary compilation
+
+The wrapper compiles C++ source files in ordinary C++ mode. It attaches a
+conditional reduced-BMI writer alongside object generation, using the parsed
+AST to distinguish interfaces and partitions from ordinary translation units
+and primary implementation units. No source-text scan or additional Clang patch
+is required.
+
+Interfaces and partitions produce both an object and a source-scoped PCM (for
+example, `build/release+clang/pkg/math.o` and `pkg/math.pcm` beneath that same
+configuration directory). Ordinary sources and primary implementation units
+produce only objects. Header-unit, explicit precompile, and PCM-to-object actions
+retain their existing execution paths.
+
+Recursive target discovery and import requests share the same source job and
+output paths, even if the job has already started. Successful `.info` metadata
+records the exported module name. Imports verify that name before using a PCM,
+so a leftover PCM cannot satisfy an import after the source stops exporting the
+module. Metadata from older wrappers is rebuilt once to acquire this information.
+
 ## Protocol
 
 The executable accepts one compile job:
@@ -142,7 +167,19 @@ The wrapper registers those paths before loading the requested PCM. Clang's
 AST reader can load transitive dependencies without calling the module-loader
 callback again, so returning only the outer module's path is insufficient.
 
-The alternative reply is `{"error":"reason"}`. A returned PCM must already be
+For an interface or partition discovered while compiling a source, the wrapper
+announces the export before serializing it:
+
+```json
+{"kind":"export","name":"pkg.math","path":"build/release+clang/pkg/math.pcm"}
+```
+
+Buildtool validates the source identity and output path and acknowledges with
+`{"pcm":"/absolute/output/path.pcm"}`. Unlike an import reply, this acknowledges
+an output that is about to be written; consumers still wait for the producer job
+to finish successfully. A rejected export fails compilation.
+
+The alternative reply is `{"error":"reason"}`. For import requests, a returned PCM must already be
 complete and compatible with the importing invocation. Requests are synchronous;
 buildtool starts a nested wrapper when that dependency itself imports modules.
 Each child has separate pipes. Cycles fail explicitly; resolver exceptions,

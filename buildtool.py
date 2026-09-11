@@ -214,7 +214,9 @@ class BuildConfig:
         self.CC = CC
         self.CXX = CXX
         self.CFLAGS = COMPILE_FLAGS + CFLAGS
-        self.CXXFLAGS = COMPILE_FLAGS + CXXFLAGS
+        self.CXXFLAGS = (COMPILE_FLAGS
+                         + (["-Wno-experimental-header-units"] if USECLANG else [])
+                         + CXXFLAGS)
         self.LDFLAGS = LDFLAGS
         self.OBJDIR = Path(OBJDIR)
         self.DEPDIR = Path(DEPDIR)
@@ -465,6 +467,10 @@ class CompiledModule:
             inherited_dircfg=inherited_dircfg, parent=parent)
         await parent.wait_for_dependency(module_job)
         self.srcfile = target.job_sources[module_job]
+        if (target.cfg.USECLANG and target.cfg.CLANG_WRAPPER
+                and self.type == SourceType.MODULE and not self.srcfile.std_module_variant
+                and self.srcfile.clang_exported_module != self.name):
+            raise RuntimeError(f'{self.srcpath} does not export module {self.name}')
         self.cmpath = self.srcfile.cmpath
         if self.srcfile.cmhash is None:
             self.srcfile.cmhash = sha256_file(self.cmpath, target.cfg.vfs)
@@ -800,19 +806,24 @@ class SourceFile:
             return cache[key]
         file = cfg.source_files.get(path)
         if file:
-            if not cfg.USECLANG:
-                # GCC discovers module declarations while compiling ordinary .cc
-                # inputs. Refine the cached identity without replacing its job.
+            if not cfg.USECLANG or cfg.CLANG_WRAPPER:
+                # Both mappers discover modules while compiling ordinary .cc inputs.
+                # Preserve the existing job and Clang's source-scoped PCM path.
                 if file.type == SourceType.CPP and type == SourceType.MODULE and modname:
                     file.type = SourceType.MODULE
                     file.modname = modname
-                    file.cmpath = cfg.OBJDIR / mod2cm(modname, cfg.SRCDIR)
+                    if not cfg.USECLANG:
+                        file.cmpath = cfg.OBJDIR / mod2cm(modname, cfg.SRCDIR)
                 elif file.type == SourceType.MODULE and type == SourceType.CPP:
                     type = SourceType.MODULE
             if type and file.type and type != file.type:
                 raise Exception(f"type mismatch: new type {type}; old type {file.type}")
             if modname and file.modname and modname != file.modname:
-                raise Exception("modname mismatch")
+                # Header-unit names are paths: GCC can retain redundant './' components.
+                same_header = (file.type in (SourceType.USER_HEADER, SourceType.SYSTEM_HEADER)
+                               and pathlib.PurePath(modname) == pathlib.PurePath(file.modname))
+                if not same_header:
+                    raise Exception(f"modname mismatch for {path}: requested {modname!r}; cached {file.modname!r}")
             return file
         file = SourceFile(path, type=type, modname=modname, cfg=cfg, inherited_dircfg=inherited_dircfg)
         cfg.source_files[path] = file
@@ -839,6 +850,7 @@ class SourceFile:
         self.std_module_variant = False
         self.std_header_flags: tuple[str, ...] = ()
         self.clang_module_files: dict[str, Path] = {}
+        self.clang_exported_module: str | None = None
         self.cmhash = None
 
         if path.is_absolute():
@@ -853,7 +865,7 @@ class SourceFile:
         
         self.objpath     = cfg.OBJDIR / file.with_suffix('.o')
 
-        if modname:
+        if modname and not (cfg.USECLANG and cfg.CLANG_WRAPPER and type == SourceType.MODULE):
             self.cmpath  = cfg.OBJDIR / mod2cm(modname, cfg.SRCDIR)
         else:
             self.cmpath  = cfg.OBJDIR / file.with_suffix(".pcm")
@@ -904,6 +916,14 @@ class SourceFile:
             self.need_recompile = True
             return
 
+        if (cfg.USECLANG and cfg.CLANG_WRAPPER and not self.std_module_variant
+                and self.type in (SourceType.CPP, SourceType.MODULE)
+                and 'clang_exported_module' not in data):
+            # Older wrapper builds did not record whether this source exported a PCM.
+            self.up_to_date = False
+            self.need_recompile = True
+            return
+
         if data['command'] != self.compiler_cmd(cfg):
             self.up_to_date = False
             self.need_recompile = True
@@ -918,6 +938,7 @@ class SourceFile:
             self.need_recompile = True
             return
         
+        self.clang_exported_module = data.get('clang_exported_module')
         self.need_recompile = False
         for depname in data['deps']:
             if depname.startswith('file:'):
@@ -1025,6 +1046,8 @@ class SourceFile:
         }
         if not cfg.USECLANG and self.type not in (SourceType.C, SourceType.ASM):
             out['std_header_unit'] = cfg.STD_HEADER_UNIT
+        if cfg.USECLANG and cfg.CLANG_WRAPPER:
+            out['clang_exported_module'] = self.clang_exported_module
         module_types = {dep.name: dep.type.value for dep in self.deps
                         if isinstance(dep, ModuleDep) and dep.type is not None}
         if module_types:
@@ -1123,6 +1146,12 @@ class SourceFile:
         if self.type == SourceType.SYSTEM_HEADER:
             raise NotImplementedError
         
+        if cfg.CLANG_WRAPPER and self.type in (SourceType.CPP, SourceType.MODULE):
+            # The wrapper emits a source-scoped PCM only if it discovers an interface.
+            return [cfg.CXX, *extra_args, *extra_args1, *CLANG_CFLAGS,
+                    *cfg.CXXFLAGS, *cfg.INCFLAGS, "-MD", f"-MF{self.makefile}",
+                    "-o" + str(self.objpath), "-c", str(self.path)]
+
         if self.type == SourceType.MODULE:
             extra_args2 = [f"-fmodule-file={f}" for f in header_units] + [
                 "-xc++-module", 
@@ -1298,6 +1327,7 @@ class SourceFile:
         """Compile using cfg's wrapper or legacy scanner, scheduling under target."""
         self.job.message(f"BUILDING {self.type} {self.path}...")
         self.clang_module_files = {}
+        self.clang_exported_module = None
         if cfg.CLANG_WRAPPER:
             self.deps = {}
             self.vcpkgs = set()
@@ -1327,6 +1357,15 @@ class SourceFile:
 
     async def resolve_clang_request(self, request: object, target: Target, cfg: BuildConfig) -> dict[str, object]:
         """Resolve request for target/cfg and include transitive named-module paths."""
+        if isinstance(request, dict) and request.get("kind") == "export":
+            name, pcm = request.get("name"), request.get("path")
+            if not isinstance(name, str) or not re.fullmatch(r"[\w.]+(?::[\w.]+)?", name):
+                raise ValueError("Invalid Clang exported module name")
+            if not isinstance(pcm, str) or cfg.vfs.abspath(pcm) != cfg.vfs.abspath(self.cmpath):
+                raise ValueError("Clang exported an unexpected PCM path")
+            SourceFile.get(self.path, cfg, type=SourceType.MODULE, modname=name)
+            self.clang_exported_module = name
+            return {'pcm': cfg.vfs.abspath(self.cmpath)}
         path = await self.resolve_clang_module(request, target, cfg)
         return {'pcm': path, 'modules': {name: cfg.vfs.abspath(pcm)
                                         for name, pcm in self.clang_module_files.items()}}
@@ -1456,7 +1495,7 @@ class SourceFile:
                 path = Path(rule)
                 dep = HeaderDep.get(path, self.cfg)
                 self.deps[dep] = None
-                if not path.is_absolute():
+                if not dep.path.is_absolute():
                     self.header_deps[dep] = None
                 continue
             if not rule.startswith('/') and rule != self.path:
@@ -1476,7 +1515,7 @@ class ModuleDep:
         self.type = type
 
 class DirectoryConfig:
-    CACHE_VERSION = 1
+    CACHE_VERSION = 2
 
     @classmethod
     def get(cls, path: Path, cfg: BuildConfig, log: Job | None = None) -> DirectoryConfig:
@@ -1527,7 +1566,7 @@ class DirectoryConfig:
             exec(code, env)
 
             out = {}
-            ALLOWED = ('LDFLAGS', 'CFLAGS', 'PKGCONFIG')
+            ALLOWED = ('LDFLAGS', 'CFLAGS', 'PKGCONFIG', 'EXPLICIT_SOURCES')
             for key, val in env.items():
                 if key in ALLOWED:
                     out[key] = val
@@ -1589,6 +1628,12 @@ class DirectoryConfig:
 class HeaderDep:
     @classmethod
     def get(cls, path: Path, cfg: BuildConfig) -> HeaderDep:
+        """Cache path in cfg, normalizing workspace headers for companion discovery."""
+        if path.is_absolute():
+            try:
+                path = path.relative_to(cfg.vfs.getcwd())
+            except ValueError:
+                pass  # Headers outside the workspace remain external dependencies.
         if path not in cfg.header_deps:
             cfg.header_deps[path] = cls(path)
         return cfg.header_deps[path]
@@ -1944,8 +1989,12 @@ def debug_log(*text: object, log: Job | None = None) -> None:
 def directory_sources(path: Path, cfg: BuildConfig, *, tests: bool = False) -> list[Path]:
     """List immediate sources in path using cfg's VFS; tests selects only test sources."""
     suffixes = (*CCFILE_SUFFIXES, '.c', '.S', '.s')
+    # Explicit targets and header companions remain usable; only automatic
+    # directory discovery omits these alternative entry points/implementations.
+    explicit_only = DirectoryConfig.get(path, cfg).buildvars.get('EXPLICIT_SOURCES', [])
     return [Path(entry.path) for entry in sorted(cfg.vfs.scandir(path), key=lambda entry: entry.name)
             if entry.is_file and entry.name.endswith(suffixes)
+            and entry.name not in explicit_only
             and source_matches_target(Path(entry.path), cfg)
             and is_test_source(Path(entry.path)) == tests]
 

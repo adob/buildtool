@@ -109,6 +109,26 @@ with os.fdopen(int(sys.argv[2])) as replies, os.fdopen(int(sys.argv[3]), "w") as
 @unittest.skipUnless(os.environ.get("BT_TEST_CLANG_WRAPPER") and os.environ.get("BT_TEST_CLANG"),
                      "set BT_TEST_CLANG_WRAPPER and BT_TEST_CLANG for real compiler tests")
 class ClangWrapperIntegrationTests(unittest.TestCase):
+    def test_system_header_unit_warning_classification(self) -> None:
+        """Suppress system input warnings while retaining user and opt-in warnings."""
+        header = Path("narrow.h").resolve()
+        header.write_text("inline short narrow(long value) { return value; }\n")
+        for flavor, extra, warned in (("system", [], False),
+                                       ("user", [], True),
+                                       ("system", ["-Wsystem-headers"], True)):
+            with self.subTest(flavor=flavor, extra=extra), \
+                 open(os.devnull, "rb") as replies, open(os.devnull, "wb") as requests:
+                result = subprocess.run([
+                    self.cfg.CLANG_WRAPPER, "--mapper-fds", str(replies.fileno()),
+                    str(requests.fileno()), "--", self.cfg.CXX, "-std=c++20",
+                    "-Wconversion", *extra, "-xc++-header",
+                    f"-fmodule-header={flavor}", str(header), "-o", "narrow.pcm",
+                ], pass_fds=(replies.fileno(), requests.fileno()),
+                    capture_output=True, text=True, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("-Wimplicit-int-conversion" in result.stderr, warned,
+                                 result.stderr)
+
     def test_pcm_codegen_honors_driver_warning_options(self) -> None:
         """Driver warnings must honor suppression and promotion to errors."""
         Path("example.cc").write_text("export module example;\nexport int value() { return 7; }\n")
@@ -155,6 +175,54 @@ class ClangWrapperIntegrationTests(unittest.TestCase):
 
     def run_binary(self, binary):
         return subprocess.run([os.path.abspath(binary)], check=False).returncode
+
+    def test_recursive_module_discovery_and_rebuild(self) -> None:
+        """Recursive roots and imports share one job regardless of discovery order."""
+        Path("pkg").mkdir()
+        Path("pkg/math.cc").write_text(
+            'export module pkg.math;\nexport template<class T> T twice(T x) { return x+x; }\n')
+        Path("pkg/use.cc").write_text(
+            'import pkg.math;\nint use() { return twice(3); }\n')
+        Path("pkg/plain.cc").write_text('int plain() { return 1; }\n')
+        Path("main.cc").write_text('import pkg.math;\nint main() { return twice(3); }\n')
+        for rebuild in (True, False, True):
+            self.cfg.REBUILD = rebuild
+            self.cfg.reset_build_state()
+            with contextlib.redirect_stdout(io.StringIO()):
+                bt.build_targets(bt.Path("pkg/..."), self.cfg)
+            module = self.cfg.source_files[bt.Path("pkg/math.cc")]
+            self.assertTrue(Path(module.objpath).is_file())
+            self.assertTrue(Path(module.cmpath).is_file())
+            plain = self.cfg.source_files[bt.Path("pkg/plain.cc")]
+            self.assertTrue(Path(plain.objpath).is_file())
+            self.assertFalse(Path(plain.cmpath).exists())
+            self.assertEqual(self.run_binary(self.build()), 6)
+
+    def test_removed_module_declaration_does_not_reuse_old_pcm(self) -> None:
+        """A remaining PCM must not satisfy an import after its export is removed."""
+        Path("math.cc").write_text('export module math;\nexport int value() { return 5; }\n')
+        Path("main.cc").write_text('import math;\nint main() { return value(); }\n')
+        self.assertEqual(self.run_binary(self.build()), 5)
+        Path("math.cc").write_text('int value() { return 6; }\n')
+        self.cfg.REBUILD = True
+        with self.assertRaisesRegex(RuntimeError, 'does not export module math'):
+            self.build()
+
+    def test_partition_and_primary_implementation_outputs(self) -> None:
+        """Partitions emit PCMs, whereas a primary implementation emits only an object."""
+        Path("pkg/math").mkdir(parents=True)
+        Path("pkg/math/bits.cc").write_text(
+            'export module pkg.math:bits;\nexport int value() { return 5; }\n')
+        Path("pkg/math.cc").write_text(
+            'export module pkg.math;\nexport import :bits;\n')
+        Path("pkg/impl.cc").write_text('module pkg.math;\nint internal() { return value(); }\n')
+        with contextlib.redirect_stdout(io.StringIO()):
+            bt.build_targets(bt.Path("pkg/..."), self.cfg)
+        partition = self.cfg.source_files[bt.Path("pkg/math/bits.cc")]
+        implementation = self.cfg.source_files[bt.Path("pkg/impl.cc")]
+        self.assertTrue(Path(partition.cmpath).is_file())
+        self.assertTrue(Path(implementation.objpath).is_file())
+        self.assertFalse(Path(implementation.cmpath).exists())
 
     def test_nested_macro_import_named_module_and_incremental_rebuild(self):
         Path("leaf.h").write_text("#pragma once\ninline int leaf() { return 7; }\n")

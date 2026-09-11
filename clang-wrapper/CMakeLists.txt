@@ -15,6 +15,6 @@ if(NOT LLVM_ENABLE_RTTI)
 endif()
 llvm_map_components_to_libnames(WRAPPER_LLVM_LIBS native)
 target_link_libraries(buildtool-clang PRIVATE
-  clangFrontendTool clangDriver clangFrontend clangSerialization
+  clangFrontendTool clangDriver clangFrontend clangSerialization clangCodeGen
   ${WRAPPER_LLVM_LIBS})
 install(TARGETS buildtool-clang RUNTIME DESTINATION bin)

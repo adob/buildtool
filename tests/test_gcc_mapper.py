@@ -7,6 +7,21 @@ import buildtool as bt
 
 
 class GccMapperTests(unittest.IsolatedAsyncioTestCase):
+    def test_header_path_aliases_reuse_source_and_artifact(self) -> None:
+        """Redundant dot components in header names must not create another source."""
+        for kind, name in ((bt.SourceType.USER_HEADER, './lib/errors/errors.h'),
+                           (bt.SourceType.SYSTEM_HEADER, '/sdk/errors/errors.h')):
+            with self.subTest(kind=kind):
+                cfg = bt.BuildConfig(vfs=bt.MemoryFileSystem())
+                path = bt.Path(name)
+                source = bt.SourceFile.get(path, cfg, type=kind, modname=name)
+                alias = name.replace('/errors/errors.h', '/errors/./errors.h')
+                reused = bt.SourceFile.get(bt.Path(alias), cfg, type=kind, modname=alias)
+                self.assertIs(reused, source)
+                self.assertEqual(reused.cmpath, source.cmpath)
+                with self.assertRaisesRegex(Exception, 'modname mismatch'):
+                    bt.SourceFile.get(path, cfg, type=kind, modname=name + '.other')
+
     async def test_import_refines_directory_source_without_duplicate_job(self) -> None:
         """A module import reuses a .cc root already scheduled by directory discovery."""
         cfg = bt.BuildConfig(vfs=bt.MemoryFileSystem())
