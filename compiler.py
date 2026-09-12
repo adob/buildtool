@@ -108,7 +108,7 @@ async def run_compiler(
             code = await process.wait()
             await asyncio.gather(*readers)
             if not capture and code:
-                raise subprocess.CalledProcessError(code, command)
+                raise subprocess.CalledProcessError(code, command[0])
             return subprocess.CompletedProcess(command, code, bytes(stdout), bytes(stderr))
         finally:
             if process.returncode is None or any(not task.done() for task in readers):

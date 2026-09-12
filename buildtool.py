@@ -247,6 +247,20 @@ class BuildConfig:
         self.gcc_std_modules = GccStdModules(vfs)
         self.std_header_sources = {}
         self.std_module_sources = {}
+        self.compilation_database_mtime: float | None = None
+        self.compilation_database_dirty = False
+
+    def check_database_timestamp(self, path: Path, *, build_config: bool = False) -> None:
+        """Flag a database refresh for path's ctime, or mtime for a BUILD.py file."""
+        if self.compilation_database_mtime is None or self.compilation_database_dirty:
+            return
+        try:
+            status = self.vfs.stat(path)
+        except FileNotFoundError:
+            return
+        timestamp = status.st_mtime if build_config else status.st_ctime
+        if timestamp > self.compilation_database_mtime:
+            self.compilation_database_dirty = True
 
     def compiler_identity(self, compiler: str) -> list[str | int]:
         """Return compiler's canonical path and mtime, cached for this build."""
@@ -870,6 +884,7 @@ class SourceFile:
         inherited_dircfg: DirectoryConfig | None = None,
     ) -> None:
         self.cfg = cfg
+        cfg.check_database_timestamp(path)
         self.path         = path
         self.dirname      = path.parent
         self.type         = type
@@ -1582,6 +1597,7 @@ class DirectoryConfig:
             return
         
         buildpy_file = self.dir / 'BUILD.py'
+        self.cfg.check_database_timestamp(buildpy_file, build_config=True)
         if not buildpy_file.exists(self.cfg.vfs):
             self.buildvars = {}
             self.linkflags = []
@@ -2173,6 +2189,28 @@ def build_compilation_database(out: Path, paths: list[Path], cfg: BuildConfig) -
     print("wrote %s" % out)
 
 
+def track_compilation_database(cfg: BuildConfig) -> Path:
+    """Enable timestamp tracking in cfg and return the absolute database path."""
+    database = Path(cfg.vfs.abspath(ROOT)) / 'compile_commands.json'
+    cfg.compilation_database_mtime = database.mtime(cfg.vfs)
+    cfg.compilation_database_dirty = not database.exists(cfg.vfs)
+    return database
+
+
+def refresh_compilation_database(cfg: BuildConfig, database: Path) -> None:
+    """Stop tracking in cfg and regenerate database if processed files flagged it."""
+    cfg.compilation_database_mtime = None
+    if not cfg.compilation_database_dirty:
+        return
+    previous = cfg.vfs.getcwd()
+    try:
+        cfg.vfs.chdir(database.parent)
+        build_compilation_database(database, [Path(p) for p in SRC_ROOTS], cfg)
+        cfg.compilation_database_dirty = False
+    finally:
+        cfg.vfs.chdir(previous)
+
+
 def mkpath(path: str | os.PathLike[str], *, vfs: FileSystem) -> Path:
     return Path(os.path.relpath(vfs.abspath(path), vfs.abspath(ROOT)))
 
@@ -2507,7 +2545,11 @@ def _main(
             cfg.SUFFIX = '.so'
             cfg.LDFLAGS += ["-shared"]
         
-        build_targets(target, cfg)
+        database = track_compilation_database(cfg)
+        try:
+            build_targets(target, cfg)
+        finally:
+            refresh_compilation_database(cfg, database)
     
     elif args.cmd == 'run':
         file = args.path
@@ -2516,7 +2558,11 @@ def _main(
         if ROOT != ".":
             oldwd = cfg.vfs.getcwd()
             cfg.vfs.chdir(ROOT)
-        executable = build(target, cfg, publish=False)
+        database = track_compilation_database(cfg)
+        try:
+            executable = build(target, cfg, publish=False)
+        finally:
+            refresh_compilation_database(cfg, database)
         if executable is None:
             raise RuntimeError(f'No main function defined in {target}')
         bin = cfg.vfs.abspath(executable)
@@ -2548,7 +2594,11 @@ def _main(
 
     elif args.cmd == "test":
         dirs = args.dirs
-        run_tests(dirs, cfg)
+        database = track_compilation_database(cfg)
+        try:
+            run_tests(dirs, cfg)
+        finally:
+            refresh_compilation_database(cfg, database)
 
     elif args.cmd == "bench":
         dirs = args.dirs
