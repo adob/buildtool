@@ -18,6 +18,9 @@ import buildtool as bt
 class SourceTagTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create platform variants and tagged tests in a virtual directory."""
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
         self.fs = bt.MemoryFileSystem(cwd='/workspace')
         self.fs.makedirs('serial')
         for name in ('common.cc', 'serial+linux.cc', 'usbio+zephyr+posix.cc',

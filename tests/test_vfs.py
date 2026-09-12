@@ -12,6 +12,16 @@ import buildtool as bt
 class FileSystemContract:
     """The same operations must behave alike on disk and in memory."""
 
+    def test_stat_has_nanosecond_timestamps(self):
+        """Both filesystems supply numeric timestamps without caller fallbacks."""
+        self.fs.write_text('timestamps.txt', '')
+        status = self.fs.stat('timestamps.txt')
+        for name in ('st_atime', 'st_mtime', 'st_ctime'):
+            nanoseconds = getattr(status, name + '_ns')
+            self.assertIsInstance(nanoseconds, int)
+            self.assertAlmostEqual(nanoseconds / 1_000_000_000,
+                                   getattr(status, name), places=6)
+
     def test_relative_symlinks_and_atomic_replacement(self):
         self.fs.makedirs("bin")
         self.fs.makedirs("build")

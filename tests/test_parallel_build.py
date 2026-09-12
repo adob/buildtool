@@ -13,6 +13,9 @@ import buildtool as bt
 class ParallelBuildTests(unittest.TestCase):
     def setUp(self):
         """Create companion sources that import one common module."""
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
         self.fs = bt.MemoryFileSystem()
         self.cfg = bt.BuildConfig(vfs=self.fs, JOBS=2, OBJDIR='build',
                                  LDFLAGS=[], CXXFLAGS=[])

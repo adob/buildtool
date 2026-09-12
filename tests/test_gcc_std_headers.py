@@ -120,6 +120,9 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
 class StandardHeaderBuildTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create two importers and an SDK, replacing only compiler execution."""
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
         self.fs = bt.MemoryFileSystem()
         self.cfg = bt.BuildConfig(vfs=self.fs, CXXFLAGS=['-std=c++23'],
                                   CFLAGS=[], INCFLAGS=[], LDFLAGS=[], JOBS=2)

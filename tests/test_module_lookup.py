@@ -14,6 +14,27 @@ import buildtool as bt
 
 
 class ModuleLookupTests(unittest.TestCase):
+    def test_tagged_interface_requires_active_tags(self) -> None:
+        """Find a qualified interface only when every filename tag is active."""
+        self.fs.write_text('deps/base/lib/math/math+zephyr+posix.cc', '')
+        self.cfg.TAGS = {'zephyr'}
+        with self.assertRaisesRegex(RuntimeError, 'Unable to locate module'):
+            self.target.mod2src('lib.math', bt.SourceType.MODULE)
+        self.cfg.TAGS.add('posix')
+        self.assertEqual(self.target.mod2src('lib.math', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math/math+zephyr+posix.cc'))
+
+    def test_ambiguous_tagged_interfaces_and_unqualified_priority(self) -> None:
+        """Reject two active variants unless an unqualified interface takes priority."""
+        self.fs.write_text('deps/base/lib/math/math+linux.cc', '')
+        self.fs.write_text('deps/base/lib/math/math+posix.cc', '')
+        self.cfg.TAGS = {'linux', 'posix'}
+        with self.assertRaisesRegex(RuntimeError, 'Ambiguous module lib.math'):
+            self.target.mod2src('lib.math', bt.SourceType.MODULE)
+        self.fs.write_text('deps/base/lib/math/math.cc', '')
+        self.assertEqual(self.target.mod2src('lib.math', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math/math.cc'))
+
     def setUp(self) -> None:
         """Create independent virtual search roots and a target using them."""
         self.fs = bt.MemoryFileSystem()

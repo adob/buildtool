@@ -92,6 +92,9 @@ class IncrementalModuleTests(unittest.TestCase):
     """
 
     def setUp(self):
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
         self.fs = bt.MemoryFileSystem()
         self.cfg = bt.BuildConfig(
             CXX="fake-c++", OBJDIR="build", INCFLAGS=[], SRCDIR=".", vfs=self.fs

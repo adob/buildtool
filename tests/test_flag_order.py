@@ -13,6 +13,12 @@ import buildtool as bt
 
 
 class FlagOrderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        """Provide a stable identity for the simulated compiler."""
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
+
     def test_hash_seed_changes_do_not_trigger_recompilation(self):
         probe = '''
 import json, sys
@@ -24,10 +30,12 @@ flags = ["-DA=1", "-DB=2", "-DC=3", "-DD=4", "-UA", "-DA=1"]
 fs.write_text("BUILD.py", "CFLAGS = " + repr(flags))
 clang = sys.argv[1] == "clang"
 cfg = bt.BuildConfig(vfs=fs, CXX="clang++" if clang else "g++", CXXFLAGS=[], USECLANG=clang)
+cfg.compiler_identity = lambda compiler: ["/fake/compiler", 1]
 source = bt.SourceFile.get(bt.Path("main.cc"), cfg)
 command = source.compiler_cmd(cfg)
 fs.makedirs(source.infofile.parent, exist_ok=True)
 fs.write_text(source.infofile, json.dumps({"command": command if saved is None else saved,
+                                         "compiler_identity": cfg.compiler_identity(cfg.CXX),
                                          "tags": sorted(cfg.TAGS), "deps": []}))
 source.check_up_to_date(cfg)
 print(json.dumps({"command": command, "need_recompile": source.need_recompile}))

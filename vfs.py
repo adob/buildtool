@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import errno
 import hashlib
 import os
+import shutil
 from pathlib import Path
 import stat
 
@@ -23,6 +24,7 @@ class DirectoryEntry:
 class FileSystem(ABC):
     @abstractmethod
     def stat(self, path: str | os.PathLike[str]) -> os.stat_result:
+        """Return path's metadata, including integer nanosecond timestamps."""
         pass
 
     @abstractmethod
@@ -75,6 +77,11 @@ class FileSystem(ABC):
         """Return path's absolute spelling with symbolic links resolved."""
         pass
 
+    @abstractmethod
+    def which(self, command: str) -> str | None:
+        """Locate command by explicit path or PATH; return None if unavailable."""
+        pass
+
     def read_text(self, path: str | os.PathLike[str]) -> str:
         return self.read_bytes(path).decode("utf-8")
 
@@ -98,6 +105,10 @@ class FileSystem(ABC):
 
 
 class RealFileSystem(FileSystem):
+    def which(self, command: str) -> str | None:
+        """Find executable command using the standard library's PATH lookup."""
+        return shutil.which(command)
+
     def realpath(self, path: str | os.PathLike[str]) -> str:
         """Resolve path against the real filesystem."""
         return os.path.realpath(path)
@@ -212,12 +223,25 @@ class MemoryFileSystem(FileSystem):
         if self._entry(path).data is not None:
             raise NotADirectoryError(os.fspath(path))
 
+    def which(self, command: str) -> str | None:
+        """Find command in virtual PATH; fake files have no executable-bit model."""
+        directories = [''] if os.path.dirname(command) else os.get_exec_path()
+        for directory in directories:
+            path = os.path.join(directory, command)
+            if self.is_file(path):
+                return path
+        return None
+
     def stat(self, path: str | os.PathLike[str]) -> os.stat_result:
         entry = self._entry(path)
         mode = stat.S_IFDIR | 0o755 if entry.data is None else stat.S_IFREG | 0o644
         size = 0 if entry.data is None else len(entry.data)
+        timestamp_ns = int(entry.mtime * 1_000_000_000)
         return os.stat_result((mode, 0, 0, 1, 0, 0, size,
-                               entry.mtime, entry.mtime, entry.mtime))
+                               entry.mtime, entry.mtime, entry.mtime),
+                              {'st_atime_ns': timestamp_ns,
+                               'st_mtime_ns': timestamp_ns,
+                               'st_ctime_ns': timestamp_ns})
 
     def read_bytes(self, path: str | os.PathLike[str]) -> bytes:
         entry = self._entry(path)

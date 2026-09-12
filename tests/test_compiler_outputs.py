@@ -8,6 +8,12 @@ import buildtool as bt
 
 
 class CompilerOutputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        """Provide a stable identity for the simulated compiler."""
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
+
     def test_run_uses_build_artifact_without_publishing(self) -> None:
         """Run reuses artifacts and preserves public links across compiler/debug choices."""
         for debug in (False, True):

@@ -17,6 +17,9 @@ import buildtool as bt
 class DirectoryBuildTests(unittest.TestCase):
     def setUp(self) -> None:
         """Create a fake compiler whose source text represents its output symbol table."""
+        # These scheduling tests use simulated compilers without executable files.
+        self.enterContext(mock.patch.object(bt.BuildConfig, "compiler_identity",
+                                            return_value=["/fake/compiler", 1]))
         self.fs = bt.MemoryFileSystem()
         self.fs.makedirs('cmd/foo/nested')
         self.fs.write_text('cmd/foo/main.cc', 'main T 0 10\n')

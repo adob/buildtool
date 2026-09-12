@@ -240,12 +240,28 @@ class BuildConfig:
         self.directory_configs = {}
         self.header_deps = {}
         self.compiler_commands = {}
+        self.compiler_identities: dict[str, list[str | int]] = {}
         self.nm_paths = {}
         self.nm_locks = {}
         self.gcc_std_headers = GccStdHeaders(vfs)
         self.gcc_std_modules = GccStdModules(vfs)
         self.std_header_sources = {}
         self.std_module_sources = {}
+
+    def compiler_identity(self, compiler: str) -> list[str | int]:
+        """Return compiler's canonical path and mtime, cached for this build."""
+        if compiler in self.compiler_identities:
+            return self.compiler_identities[compiler]
+
+        executable = self.vfs.which(compiler)
+        if executable is None:
+            raise FileNotFoundError(f'Compiler {compiler!r} not found')
+
+        path = self.vfs.realpath(executable)
+        status = self.vfs.stat(path)
+        identity = [path, status.st_mtime_ns]
+        self.compiler_identities[compiler] = identity
+        return identity
 
     def get_nm(self) -> str:
         """Return this configuration's cached nm path for the selected C++ compiler."""
@@ -278,6 +294,7 @@ class BuildConfig:
         self.directory_configs.clear()
         self.header_deps.clear()
         self.compiler_commands.clear()
+        self.compiler_identities.clear()
         self.nm_paths.clear()
         self.nm_locks.clear()
         self.gcc_std_headers.paths.clear()
@@ -758,6 +775,21 @@ class Target:
                     if candidate.is_file(self.cfg.vfs) and source_matches_target(candidate, self.cfg):
                         return candidate
                     failed.append(str(candidate))
+                for candidate in candidates:
+                    if type == SourceType.MODULE and candidate.parent.is_dir(self.cfg.vfs):
+                        # Tagged interfaces retain the logical module name. Only
+                        # scan after all unqualified layouts in this root fail.
+                        variants = sorted(
+                            (Path(entry.path) for entry in self.cfg.vfs.scandir(candidate.parent)
+                             if entry.is_file and entry.name.startswith(candidate.stem + '+')
+                             and entry.name.endswith(candidate.suffix)
+                             and source_matches_target(Path(entry.path), self.cfg)),
+                            key=str)
+                        if len(variants) > 1:
+                            raise RuntimeError(f"Ambiguous module {modname}: "
+                                               + ", ".join(map(str, variants)))
+                        if variants:
+                            return variants[0]
 
         raise RuntimeError(f"Unable to locate module {modname}: " + ", ".join(failed))
 
@@ -924,6 +956,12 @@ class SourceFile:
             self.need_recompile = True
             return
 
+        if data.get('compiler_identity') != cfg.compiler_identity(self.compiler_cmd(cfg)[0]):
+            self.up_to_date = False
+            self.need_recompile = True
+            debug_log(f"#{self.path} NEED RECOMPILE BECAUSE COMPILER IDENTITY CHANGED", log=self.job)
+            return
+
         if data['command'] != self.compiler_cmd(cfg):
             self.up_to_date = False
             self.need_recompile = True
@@ -1041,6 +1079,7 @@ class SourceFile:
 
         out = {
             'command': self.compiler_cmd(cfg),
+            'compiler_identity': cfg.compiler_identity(self.compiler_cmd(cfg)[0]),
             'tags': sorted(cfg.TAGS),
             'deps': deps
         }
