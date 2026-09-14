@@ -42,8 +42,24 @@ class DatabaseRefreshTests(unittest.TestCase):
                             if trigger == 'failure':
                                 raise RuntimeError('build failed')
                         finally:
-                            bt.refresh_compilation_database(cfg, database)
+                            bt.refresh_compilation_database(cfg, database, ['src'])
                     except RuntimeError as error:
                         self.assertEqual(str(error), 'build failed')
                     self.assertEqual(write.call_count, int(trigger != 'none'))
                     self.assertIsNone(cfg.compilation_database_mtime)
+
+    def test_cli_refresh_uses_configured_roots(self) -> None:
+        roots = ['project/lib', 'project/cmd']
+        for command in ('build', 'run', 'test'):
+            with self.subTest(command=command):
+                fs = bt.MemoryFileSystem()
+                with patch.object(bt, 'ROOT', '.'), \
+                     patch.object(bt.sys, 'argv', ['bt', command, 'project/cmd/main.cc']), \
+                     patch.object(bt, 'build_targets'), \
+                     patch.object(bt, 'build', return_value='build/bin/main'), \
+                     patch.object(bt, 'run_tests'), \
+                     patch.object(bt.os, 'execv'), \
+                     patch.object(bt, 'build_compilation_database') as write:
+                    bt._main(SRC_ROOTS=roots, vfs=fs)
+                    write.assert_called_once()
+                    self.assertEqual(write.call_args.args[1], [bt.Path(p) for p in roots])

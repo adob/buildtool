@@ -12,17 +12,21 @@ import sys
 import tempfile
 
 if __package__:
+    from .jobserver import JobServer
     from .memory import GIB, MemoryBudget
 else:
+    from jobserver import JobServer
     from memory import GIB, MemoryBudget
 
 
 class CompilerSlots:
-    def __init__(self, count: int, memory: MemoryBudget | None = None) -> None:
-        """Provide count slots; optional memory gates launches and resumptions."""
+    def __init__(self, count: int, memory: MemoryBudget | None = None,
+                 jobserver: JobServer | None = None) -> None:
+        """Provide count slots, additionally gated by memory and shared jobserver tokens."""
         self.limit = count
         self.available = count
         self.memory = memory
+        self.jobserver = jobserver
         self.retry: asyncio.TimerHandle | None = None
         self.closed = False
         self.waiters = []
@@ -46,6 +50,8 @@ class CompilerSlots:
 
     def release(self) -> None:
         """Return an execution slot and wake queued compilers."""
+        if self.jobserver is not None:
+            self.jobserver.release()
         self.available += 1
         if not self.closed:
             asyncio.get_running_loop().call_soon(self.dispatch)
@@ -65,9 +71,19 @@ class CompilerSlots:
                 break
             index = min(range(len(self.waiters)), key=lambda i:
                         (not (self.waiters[i][0].required or self.waiters[i][1]), i))
-            _, _, future = self.waiters.pop(index)
+            job, resuming, future = self.waiters.pop(index)
             if future.done():
                 continue
+            if self.jobserver is not None:
+                try:
+                    acquired = self.jobserver.try_acquire()
+                except OSError as error:
+                    future.set_exception(error)
+                    continue
+                if not acquired:
+                    self.waiters.insert(index, (job, resuming, future))
+                    self.retry = asyncio.get_running_loop().call_later(0.05, self.dispatch)
+                    break
             self.available -= 1
             future.set_result(None)
 
@@ -196,8 +212,9 @@ class BuildSession:
         memory: MemoryBudget | None = None,
         verbose: bool = False,
         concurrency_reporter: ConcurrencyReporter | None = None,
+        jobserver: JobServer | None = None,
     ) -> None:
-        """Limit jobs by memory; output logs and share an optional invocation reporter."""
+        """Limit jobs by memory/jobserver; output logs through an optional shared reporter."""
         if jobs < 1:
             raise ValueError('jobs must be at least 1')
         self.output = output if output is not None else sys.stdout
@@ -205,18 +222,27 @@ class BuildSession:
         self.concurrency_reporter = (concurrency_reporter if concurrency_reporter is not None
                                      else ConcurrencyReporter())
         limit = jobs
+        if jobserver is not None and jobserver.jobs is not None:
+            limit = min(limit, jobserver.jobs)
         self.concurrency_message = ''
         self.compilation_started = False
         if memory is not None:
             available = memory.available()
-            limit = memory.job_limit(jobs, available)
+            limit = memory.job_limit(limit, available)
             memory_text = ('available memory unknown' if available is None else
                            f'{available / GIB:.0f} GB available')
+            limit_text = f'up to {limit}' if jobserver is not None else str(limit)
+            request_text = f'requested: {jobs}'
+            if jobserver is not None:
+                request_text = (f'requested: {jobserver.jobs}' if jobserver.jobs is not None
+                                else f'local limit: {jobs}')
             self.concurrency_message = (
-                f'Concurrency: {limit} compiler jobs '
-                f'(requested: {jobs}, {memory_text}, '
+                f'Concurrency: {limit_text} compiler jobs '
+                f'({request_text}, {memory_text}, '
                 f'{memory.bytes_per_job / GIB:.0f} GB/job estimate)\n')
-        self.slots = CompilerSlots(limit, memory)
+        if jobserver is not None and self.concurrency_message:
+            self.concurrency_message = self.concurrency_message.rstrip() + ' [shared jobserver]\n'
+        self.slots = CompilerSlots(limit, memory, jobserver)
         self.jobs = {}
         self.roots = []
         self.final_jobs: list[Job] = []

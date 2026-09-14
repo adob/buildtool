@@ -26,6 +26,7 @@ if __package__:
     from .compiler import mapper_pipe, run_compiler
     from .scheduler import BuildSession, ConcurrencyReporter, Job
     from .memory import MemoryBudget
+    from .jobserver import JobServer
     from .gcc_std import GccStdHeaders, GccStdModules, header_unit_flags
 else:
     from vfs import FileSystem, RealFileSystem, MemoryFileSystem
@@ -33,6 +34,7 @@ else:
     from compiler import mapper_pipe, run_compiler
     from scheduler import BuildSession, ConcurrencyReporter, Job
     from memory import MemoryBudget
+    from jobserver import JobServer
     from gcc_std import GccStdHeaders, GccStdModules, header_unit_flags
 
 _DEFAULT_VFS = RealFileSystem()
@@ -145,6 +147,9 @@ THIS_MTIME = 0
 # Generate the representation while retaining custom initialization and identity.
 @dataclass(init=False, eq=False)
 class BuildConfig:
+    USE_DIRECTORY_CONFIG: bool
+    ABSOLUTE_MODULE_PATHS: bool
+    jobserver: JobServer | None
     vfs: FileSystem
     CC: str
     CXX: str
@@ -205,8 +210,14 @@ class BuildConfig:
         vfs: FileSystem = _DEFAULT_VFS,
         TAGS: Iterable[str] | None = None,
         KNOWN_TAGS: Iterable[str] | None = None,
+        USE_DIRECTORY_CONFIG: bool = True,
+        ABSOLUTE_MODULE_PATHS: bool = False,
+        jobserver: JobServer | None = None,
     ) -> None:
         self.vfs = vfs
+        self.jobserver = jobserver
+        self.USE_DIRECTORY_CONFIG = USE_DIRECTORY_CONFIG
+        self.ABSOLUTE_MODULE_PATHS = ABSOLUTE_MODULE_PATHS
         self.TAGS = validate_tags(TAGS) if TAGS is not None else native_tags()
         self.KNOWN_TAGS = validate_tags(KNOWN_TAGS) if KNOWN_TAGS is not None else None
         if self.KNOWN_TAGS is not None and (unknown := self.TAGS - self.KNOWN_TAGS):
@@ -512,7 +523,8 @@ class CompilationGraph:
     def __init__(self, cfg: BuildConfig) -> None:
         """Own one scheduler and shared dependency records for targets using cfg."""
         self.session = BuildSession(cfg.JOBS, memory=cfg.memory, verbose=cfg.VERBOSE,
-                                    concurrency_reporter=cfg.concurrency_reporter)
+                                    concurrency_reporter=cfg.concurrency_reporter,
+                                    jobserver=cfg.jobserver)
         self.job_sources: dict[Job, SourceFile] = {}
         self.link_events: dict[Job, list[Job | DirectoryConfig]] = {}
 
@@ -764,8 +776,9 @@ class Target:
                 clang=self.cfg.USECLANG))
         return self.mod2src(name, type)
 
-    def mod2src(self, modname: str | None, type: SourceType) -> Path:
-        """Find modname's interface or header of type in the configured search roots."""
+    def mod2src(self, modname: str | None, type: SourceType,
+                *, search_roots: Iterable[Path | str] | None = None) -> Path:
+        """Find modname/type in search_roots, defaulting to source/include directories."""
         path = mod2path(modname, type)
         failed = []
 
@@ -774,7 +787,8 @@ class Target:
                 return path
             failed.append(str(path))
         else:
-            for base_path in [self.cfg.SRCDIR, *self.cfg.INCFLAGS]:
+            roots = search_roots if search_roots is not None else [self.cfg.SRCDIR, *self.cfg.INCFLAGS]
+            for base_path in roots:
                 if isinstance(base_path, str):
                     base_path = base_path.removeprefix("-I").removeprefix("-iquote")
                     base_path = Path(base_path)
@@ -971,6 +985,11 @@ class SourceFile:
             self.need_recompile = True
             return
 
+        if data.get('absolute_module_paths', False) != cfg.ABSOLUTE_MODULE_PATHS:
+            self.up_to_date = False
+            self.need_recompile = True
+            return
+
         if data.get('compiler_identity') != cfg.compiler_identity(self.compiler_cmd(cfg)[0]):
             self.up_to_date = False
             self.need_recompile = True
@@ -1095,6 +1114,7 @@ class SourceFile:
         out = {
             'command': self.compiler_cmd(cfg),
             'compiler_identity': cfg.compiler_identity(self.compiler_cmd(cfg)[0]),
+            'absolute_module_paths': cfg.ABSOLUTE_MODULE_PATHS,
             'tags': sorted(cfg.TAGS),
             'deps': deps
         }
@@ -1110,6 +1130,8 @@ class SourceFile:
         atomic_write(self.infofile, json.dumps(out, indent=2) + '\n', cfg.vfs)
 
     def dircfg(self) -> DirectoryConfig | None:
+        if not self.cfg.USE_DIRECTORY_CONFIG:
+            return DirectoryConfig.get(Path('/'), self.cfg)
         if self.dirname.is_absolute():
             return self.inherited_dircfg
         
@@ -1133,6 +1155,8 @@ class SourceFile:
     IFLAG_RE = re.compile('^-I')
     def compiler_extra_args(self) -> list[str]:
         """Return this source's directory flags and include paths."""
+        if not self.cfg.USE_DIRECTORY_CONFIG:
+            return []
         flags = []
 
         buildvars = self.dircfg().buildvars
@@ -1345,31 +1369,40 @@ class SourceFile:
                 # FALSE means unknown, allowing GCC to ask about bits/stdc++.h.
                 # TRUE would mark the original header as explicitly textual.
                 reply = 'BOOL FALSE'
-            if not args[0].startswith('/') or self.std_header_variant or self.std_module_variant:
+            # CMake supplies absolute include directories. Without directory
+            # config, those headers must still invalidate the managed sources.
+            if (not args[0].startswith('/') or self.std_header_variant or self.std_module_variant
+                    or not cfg.USE_DIRECTORY_CONFIG):
                 header = HeaderDep.get(Path(args[0]), cfg)
                 self.deps[header] = None
                 self.header_deps[header] = None
             return reply
         if verb == 'MODULE-REPO':
-            return f'PATHNAME {cfg.OBJDIR}'
+            return 'PATHNAME ' + shlex.quote(str(cfg.OBJDIR))
         if verb == 'MODULE-IMPORT':
             name = args[0]
             module = CompiledModule.get(name, cfg)
             digest = await module.build(target, inherited_dircfg=self.dircfg(), parent=self.job)
             self.deps[ModuleDep(name, digest)] = None
-            return f'PATHNAME {module.cmpath.relative_to(cfg.OBJDIR)}'
+            return self.module_mapper_path(module.cmpath)
         if verb == 'MODULE-EXPORT':
             if self.std_header_variant or self.std_module_variant:
-                return 'PATHNAME ' + shlex.quote(str(self.cmpath.relative_to(cfg.OBJDIR)))
+                return self.module_mapper_path(self.cmpath)
             if self.type in (SourceType.CPP, SourceType.MODULE):
                 SourceFile.get(self.path, cfg, type=SourceType.MODULE, modname=args[0])
             # Path joining maps absolute header names under SYSTEM/, matching
             # SourceFile.cmpath. GCC expects a path relative to MODULE-REPO.
             module_path = cfg.OBJDIR / mod2cm(args[0], cfg.SRCDIR)
-            return f'PATHNAME {module_path.relative_to(cfg.OBJDIR)}'
+            return self.module_mapper_path(module_path)
         if verb == 'MODULE-COMPILED':
             return 'OK'
         raise RuntimeError(f'Unknown GCC mapper request: {verb}')
+
+    def module_mapper_path(self, path: Path) -> str:
+        """Format path for GCC; absolute paths allow reuse under another mapper root."""
+        cfg = self.cfg
+        filename = cfg.vfs.abspath(path) if cfg.ABSOLUTE_MODULE_PATHS else str(path.relative_to(cfg.OBJDIR))
+        return 'PATHNAME ' + shlex.quote(filename)
 
     async def compile_gcc_c(self, cfg: BuildConfig) -> None:
         """Compile a C/assembly input with cfg and load its header depfile."""
@@ -1709,7 +1742,8 @@ class HeaderDep:
         #debug_log("HeaderDep.build", self.path)
         
         dirname = self.path.parent
-        dircfg = DirectoryConfig.get(dirname, target.cfg, log=parent)
+        dircfg = DirectoryConfig.get(dirname if target.cfg.USE_DIRECTORY_CONFIG else Path('/'),
+                                     target.cfg, log=parent)
 
         target.add_config(dircfg, parent=parent)
         cppfile = self.find_cpp(self.path, target.cfg)
@@ -1806,7 +1840,7 @@ class CompilationDatabase:
         """Add installed SDK sources to cfg's IDE database so clangd builds its own PCMs."""
         directory = DirectoryConfig.get(Path('.'), cfg)
         flags = header_unit_flags([*cfg.CXXFLAGS, *cfg.INCFLAGS], directory.buildvars.get('CFLAGS', []))
-        session = BuildSession(cfg.JOBS, verbose=cfg.VERBOSE)
+        session = BuildSession(cfg.JOBS, verbose=cfg.VERBOSE, jobserver=cfg.jobserver)
 
         async def discover(job: Job) -> None:
             """Discover optional SDK modules through job without compiling them."""
@@ -2197,15 +2231,15 @@ def track_compilation_database(cfg: BuildConfig) -> Path:
     return database
 
 
-def refresh_compilation_database(cfg: BuildConfig, database: Path) -> None:
-    """Stop tracking in cfg and regenerate database if processed files flagged it."""
+def refresh_compilation_database(cfg: BuildConfig, database: Path, source_roots: list[str]) -> None:
+    """Stop tracking in cfg and refresh database from source_roots if flagged."""
     cfg.compilation_database_mtime = None
     if not cfg.compilation_database_dirty:
         return
     previous = cfg.vfs.getcwd()
     try:
         cfg.vfs.chdir(database.parent)
-        build_compilation_database(database, [Path(p) for p in SRC_ROOTS], cfg)
+        build_compilation_database(database, [Path(p) for p in source_roots], cfg)
         cfg.compilation_database_dirty = False
     finally:
         cfg.vfs.chdir(previous)
@@ -2549,7 +2583,7 @@ def _main(
         try:
             build_targets(target, cfg)
         finally:
-            refresh_compilation_database(cfg, database)
+            refresh_compilation_database(cfg, database, SRC_ROOTS)
     
     elif args.cmd == 'run':
         file = args.path
@@ -2562,7 +2596,7 @@ def _main(
         try:
             executable = build(target, cfg, publish=False)
         finally:
-            refresh_compilation_database(cfg, database)
+            refresh_compilation_database(cfg, database, SRC_ROOTS)
         if executable is None:
             raise RuntimeError(f'No main function defined in {target}')
         bin = cfg.vfs.abspath(executable)
@@ -2598,7 +2632,7 @@ def _main(
         try:
             run_tests(dirs, cfg)
         finally:
-            refresh_compilation_database(cfg, database)
+            refresh_compilation_database(cfg, database, SRC_ROOTS)
 
     elif args.cmd == "bench":
         dirs = args.dirs
