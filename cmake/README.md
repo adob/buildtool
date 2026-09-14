@@ -28,13 +28,127 @@ to other registered projects with ordinary `target_link_libraries(... PUBLIC|PRI
 to add their roots and conventional CMake dependencies. No unused module is built.
 Register projects under new target names if a conventional library already exists.
 
+## Building source files with buildtool
+
+For an application, use:
+
+```cmake
+buildtool_add_executable(app
+  LIBRARY baselib::baselib
+  SOURCES main.cc helpers.cpp
+  PRIVATE_LIBRARIES protobuf::libprotobuf
+  DEPENDS generate_protocol)
+```
+
+Buildtool compiles the application sources, discovers imports and header units,
+and builds their dependencies. CMake links the resulting archive into the executable.
+`PRIVATE_LIBRARIES` supplies additional application compile and link requirements;
+`DEPENDS` orders targets that generate inputs before compilation. Both are optional.
+Source paths are relative to the calling directory. The helper registers that
+directory for application compilation settings, inheriting `LIBRARY`'s public
+requirements and build-wide flags without changing the library's own settings.
+It hides the intermediate archive and empty CMake linking source. No module list
+or consumer mapper is needed. It has the same native GCC/POSIX restrictions as
+`buildtool_add_library` below. Compile settings added later to the executable
+target affect only CMake's linking source; configure source requirements through
+`LIBRARY` or the dependencies in `PRIVATE_LIBRARIES`.
+
+Use `buildtool_add_library` when buildtool should compile the entry sources too:
+
+```cmake
+buildtool_add_library(baselib_test_main
+  LIBRARY baselib::baselib
+  SOURCES lib/testing/testmain.cc)
+add_library(baselib::test_main ALIAS baselib_test_main)
+
+add_executable(tests tests.cc)
+target_link_libraries(tests PRIVATE baselib::test_main)
+```
+
+`SOURCES` accepts one or more `.cc`/`.cpp` paths relative to the calling source
+directory, or absolute paths. Sources must belong to the registered library or
+one of its registered dependencies. Buildtool compiles them, discovers named
+module imports, builds explicit header units, and includes discovered companion
+implementations in the archive. There is no manually maintained `MODULES` list.
+Companion sources already listed as compilations in CMake's file API are left
+to their native CMake targets, even inside a registered project's source tree
+(for example, FetchContent dependencies under `build/_deps`). Their headers
+still participate in dependency tracking. Link the corresponding CMake target
+to supply its compiled code; this detection does not add link dependencies.
+
+The result is an imported static-library target, built only when requested or
+linked by another target. Configure compilation on the registered `LIBRARY`;
+the new archive uses its settings, locks, shared artifact cache and jobserver.
+Use `target_link_libraries(archive INTERFACE ...)` for additional final-link
+dependencies. Make, Ninja and Ninja Multi-Config are supported, with the same
+native GCC requirement as the module bridge. Generated entry sources require
+an explicit dependency on their generator via `add_dependencies(archive_build ...)`.
+Discovered `.c` companions use their registered owner's C compiler settings.
+Enable C with `project(... LANGUAGES C CXX)` before registering that library.
+Assembly companions still require a conventional CMake dependency.
+
+By default, the archive propagates the registered library's public usage requirements, but
+does not propagate a compiler response file or module map. An ordinary CMake
+consumer that itself imports modules still needs `buildtool_target_modules`.
+Alternatively, compile those consumer sources through this helper as well and
+let CMake link the archive into an executable with a conventional entry point.
+This helper creates archives, not executables, and does not expose a new native
+CMake module provider target.
+
+If the library's public headers contain imports, add `PUBLIC_MODULES` to
+`buildtool_add_library`. This publishes a standalone mapper and state header
+from the discovered module closure, with no manual module list. Ordinary CMake
+consumers inherit `@consumer.rsp` and must keep native module scanning disabled.
+Direct header-unit imports in these consumers still require building the
+consumer sources with buildtool; the public mapper contains named modules only.
+
+When another archive publishes its own complete closure, use
+`target_link_libraries(child INTERFACE "$<LINK_ONLY:parent>")` to link the parent
+archive without inheriting a second mapper. Each public map covers only the
+imports discovered in that archive's sources and dependencies; it is not an
+inventory of every module in the registered project.
+
 ## Library-owned compilation settings
 
-A registered project is an object-library target with one empty settings source.
+Header units are shared across registered libraries in one CMake build configuration.
+Their cache is under `buildtool/libraries/buildtool_header_units/<config>/artifacts`.
+Named modules and ordinary object files remain in their owning libraries' caches.
+All header imports resolve to the same CMI for a canonical header path, including
+requests through symlinks.
+
+The `buildtool_header_units` settings target uses build-wide compiler/toolchain
+flags, the registered libraries' language requirements, and their include paths.
+It defaults to strict C++ (`CXX_EXTENSIONS OFF`), matching baselib's dialect.
+Library-specific definitions and options do not customize header units. Set any
+required common header macros explicitly with
+`target_compile_definitions(buildtool_header_units PRIVATE ...)`. A header that
+needs conflicting macro configurations should remain textual; this cache does
+not create consumer-specific variants. Changing the common configuration
+invalidates units through the normal compiler-command and dependency checks.
+
+Each header has its own lock file. A process retains its acquired leases until
+its compilation session ends, preventing replacement while a consumer reads a CMI.
+Unrelated headers can build concurrently. If a required lease is held elsewhere,
+the bridge cancels the entire attempt, stops its compiler processes, releases all
+header and library locks, waits for the contended lease, and retries with fresh
+metadata. This conservative retry avoids nested-lock deadlocks at the cost of
+possibly repeating unfinished compilations. The jobserver and memory budget still
+limit compiler jobs; lock waits do not reserve compiler tokens. Completed CMIs
+are published by atomic rename, and failed attempts discard their temporary files.
+
+A registered project is an object-library target with an empty C++ settings source
+and, when C is enabled, an empty C settings source.
 This lets CMake evaluate its compiler settings through the file API, including
 toolchain flags, build-wide optimization/debug flags, transitive dependencies,
 and target properties such as PIC. Buildtool compiles the real module sources;
 do not list them with `target_sources` on the settings target.
+
+C sources use `CMAKE_C_COMPILER` and their owner's evaluated C flags, including
+`CMAKE_C_FLAGS_<CONFIG>`, `C_STANDARD`, PIC, include paths, and language-specific
+definitions/options. C++ module flags are not passed to C compilations. Use
+`$<COMPILE_LANGUAGE:C>` / `$<COMPILE_LANGUAGE:CXX>` to restrict language-specific
+requirements as with an ordinary mixed-language CMake target. C depfiles track
+both relative and absolute headers for incremental rebuilding.
 
 Use normal CMake scopes on this target. `PRIVATE` settings affect the library's
 own compilation, `PUBLIC` settings also reach consumers, and `INTERFACE` settings
@@ -287,7 +401,7 @@ and [CMake's JOB_SERVER_AWARE option](https://cmake.org/cmake/help/latest/comman
 Requires native GCC on POSIX, CMake 3.30+, and Python 3.10+. Tested with Make,
 Ninja, and Ninja Multi-Config. Clang, cross-compilation, installation/export of
 module bundles, compiler launchers for module jobs, and arbitrary per-source
-flags on module sources are not implemented. PCH on registered libraries, C/assembly
+flags on module sources are not implemented. PCH on registered libraries, assembly
 companions, and library IPO/LTO are rejected. Common file options such as `-include` are
 resolved against CMake's compiler working directory before building modules;
 compiler response files on registered libraries are rejected. Each source root

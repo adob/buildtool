@@ -532,6 +532,14 @@ class CompilationGraph:
 
 
 class Target:
+    async def compile_source(self, source: SourceFile, cfg: BuildConfig) -> None:
+        """Compile source using cfg; adapters may wrap compilation for publication."""
+        await source.compile(self, cfg)
+
+    def should_build_companion(self, path: Path) -> bool:
+        """Return whether this target should compile the discovered companion path."""
+        return True
+
     def __init__(self, path: Path, cfg: BuildConfig) -> None:
         self.path = path
         self.srcfiles = set()
@@ -1062,7 +1070,7 @@ class SourceFile:
                 await self.build_deps(target, cfg)
             if self.need_recompile:
                 cfg.vfs.makedirs(self.objpath.parent, exist_ok=True)
-                await self.compile(target, cfg)
+                await target.compile_source(self, cfg)
                 self.update(cfg)
                 self.output_mtime = self.output_path.mtime(cfg.vfs)
                 for header_dep in self.header_deps:
@@ -1262,10 +1270,8 @@ class SourceFile:
             # independent of which importing directory requested it first.
             return [cfg.CXX, '-fmodules-ts', '-fmodule-header=system',
                     '-xc++-system-header', *self.std_header_flags, '-c', str(self.path)]
-        cmd = cfg.CXX
-        args = [cmd]
+        args = [cfg.CC if self.type in (SourceType.C, SourceType.ASM) else cfg.CXX]
         if self.type in (SourceType.C, SourceType.ASM):
-            cmd = cfg.CC
             args += [*cfg.CFLAGS]
             
         if self.type == SourceType.SYSTEM_HEADER:
@@ -1389,7 +1395,8 @@ class SourceFile:
             self.deps[ModuleDep(name, digest)] = None
             return self.module_mapper_path(module.cmpath)
         if verb == 'MODULE-EXPORT':
-            if self.std_header_variant or self.std_module_variant:
+            if (self.std_header_variant or self.std_module_variant
+                    or self.type in (SourceType.USER_HEADER, SourceType.SYSTEM_HEADER)):
                 return self.module_mapper_path(self.cmpath)
             if self.type in (SourceType.CPP, SourceType.MODULE):
                 SourceFile.get(self.path, cfg, type=SourceType.MODULE, modname=args[0])
@@ -1574,7 +1581,7 @@ class SourceFile:
         text = self.makefile.read_text(self.cfg.vfs)
         rules = parse_makefile_rules(text)
         for rule in rules:
-            if self.cfg.CLANG_WRAPPER or self.std_module_variant:
+            if self.cfg.CLANG_WRAPPER or self.std_module_variant or not self.cfg.USE_DIRECTORY_CONFIG:
                 # PCMs are tracked by ModuleDep hashes, not as input headers.
                 if rule.endswith('.pcm'):
                     continue
@@ -1749,7 +1756,7 @@ class HeaderDep:
         target.add_config(dircfg, parent=parent)
         cppfile = self.find_cpp(self.path, target.cfg)
         debug_log('find_cpp', self.path, '-->', cppfile, log=parent)
-        if cppfile:
+        if cppfile and target.should_build_companion(cppfile):
             self.cpp_path = cppfile
             if parent is None:
                 target.compile(self.cpp_path)
@@ -1868,7 +1875,7 @@ class CompilationDatabase:
         # dirpath = os.path.dirname(filepath)
         # filename = os.path.basename(filepath)
         compilation_cmd = [str(cmd) for cmd in file.compiler_cmd_clang(cfg)]
-        if modname and not cfg.USECLANG:
+        if not cfg.USECLANG:
             # GCC's query-driver probe understands c++, but not c++-module.
             # clangd's module builder selects the module-interface action itself.
             compilation_cmd = ['-xc++' if arg == '-xc++-module' else arg for arg in compilation_cmd]

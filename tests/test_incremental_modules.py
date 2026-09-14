@@ -24,6 +24,7 @@ class BuildDecisionTests(unittest.TestCase):
                 source.need_recompile = not cached
                 source.header_deps = {}
                 target = mock.Mock(cfg=cfg)
+                target.compile_source = bt.Target.compile_source.__get__(target)
                 with mock.patch.object(source, "check_up_to_date"), \
                      mock.patch.object(source, "compile", new_callable=mock.AsyncMock), \
                      mock.patch.object(source, "update"):
@@ -44,6 +45,7 @@ class BuildDecisionTests(unittest.TestCase):
         self.source.deps = {bt.ModuleDep("value", "old-hash"): None}
         self.source.header_deps = {}
         self.target = mock.Mock(cfg=self.cfg)
+        self.target.compile_source = bt.Target.compile_source.__get__(self.target)
         self.target.resolve_module_source = mock.AsyncMock(return_value=bt.Path("value.cc"))
         self.events = []
         self.enterContext(mock.patch.object(self.source, "check_up_to_date"))

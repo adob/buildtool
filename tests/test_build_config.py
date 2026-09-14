@@ -9,6 +9,19 @@ import buildtool as bt
 
 
 class BuildConfigCacheTests(unittest.TestCase):
+    def test_gcc_c_command_uses_c_compiler_and_flags(self) -> None:
+        """C inputs use CC/CFLAGS, not CXX or its module and language options."""
+        self.fs.write_text('helper.c', '')
+        cfg = bt.BuildConfig(vfs=self.fs, CC='selected-cc', CXX='selected-cxx',
+                             CFLAGS=['-std=c11'], CXXFLAGS=['-std=c++23'],
+                             USE_DIRECTORY_CONFIG=False)
+        source = bt.SourceFile.get(bt.Path('helper.c'), cfg)
+        command = source.compiler_cmd(cfg)
+        self.assertEqual(command[0], 'selected-cc')
+        self.assertIn('-std=c11', command)
+        self.assertNotIn('-std=c++23', command)
+        self.assertNotIn('-fmodules-ts', command)
+
     def setUp(self):
         self.fs = bt.MemoryFileSystem()
         self.fs.write_text("main.cc", "")

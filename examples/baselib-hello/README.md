@@ -43,6 +43,7 @@ For another layout, add `-DBASELIB_SOURCE_ROOT=/path/to/baselib` to configuratio
 
 Consumers using CPM can replace the `add_subdirectory` and source-root setting
 with their normal `CPMAddPackage(NAME baselib GITHUB_REPOSITORY adob/baselib
-GIT_TAG <revision>)`, using a revision that contains this integration. Include
-buildtool's `cmake/Buildtool.cmake` first. No `BASELIB_USE_MODULES` option or
-explicit `BaselibModules.cmake` include is needed.
+GIT_TAG <revision>)`, using a revision that contains this integration. Baselib
+loads its pinned buildtool dependency automatically. Set
+`-DCPM_buildtool_SOURCE=/path/to/buildtool` to use a local checkout instead.
+No `BASELIB_USE_MODULES` option or explicit bridge include is needed.

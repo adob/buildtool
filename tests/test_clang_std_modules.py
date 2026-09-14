@@ -16,6 +16,22 @@ import gcc_std
 
 
 class StandardModuleIdeTests(unittest.TestCase):
+    def test_project_module_uses_query_driver_language(self) -> None:
+        """Use GCC's supported probe language for project modules as well as std."""
+        for clang in (False, True):
+            with self.subTest(clang=clang):
+                fs = bt.MemoryFileSystem()
+                fs.write_text('library.cc', 'export module library;\n')
+                cfg = bt.BuildConfig(vfs=fs, USECLANG=clang)
+                bt.SourceFile.get(bt.Path('library.cc'), cfg,
+                                  type=bt.SourceType.MODULE, modname='library')
+                database = bt.CompilationDatabase([])
+                database.process_file(bt.Path('library.cc'), cfg)
+                args = database.entries[0]['arguments']
+                self.assertIn('-xc++-module' if clang else '-xc++', args)
+                if not clang:
+                    self.assertNotIn('-xc++-module', args)
+
     def test_standalone_standard_module_tracks_sdk_headers(self) -> None:
         """SDK headers in standalone Clang depfiles participate in incremental checks."""
         fs = bt.MemoryFileSystem()

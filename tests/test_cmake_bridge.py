@@ -22,6 +22,369 @@ class CMakeBridgeTests(unittest.TestCase):
         if int(compiler_version.split('.')[0]) < 14:
             raise unittest.SkipTest('requires GCC 14+ for the C++26 fixture')
 
+    def test_shared_header_units(self) -> None:
+        """Concurrent library builds share one nested header unit despite private macros."""
+        adapter = pathlib.Path(__file__).resolve().parents[1] / 'cmake/Buildtool.cmake'
+        with tempfile.TemporaryDirectory(prefix='bt-shared-headers-') as temporary:
+            root = pathlib.Path(temporary)
+            (root / 'common').mkdir()
+            (root / 'common/inner.h').write_text('#pragma once\n#define NUMBER 41\n')
+            (root / 'common/value.h').write_text(
+                '#pragma once\nimport "inner.h";\n'
+                '#ifdef PRIVATE_VALUE\n#error Consumer macro leaked into shared unit\n#endif\n'
+                'inline int number() { return NUMBER; }\n')
+            cmake = f'''cmake_minimum_required(VERSION 3.30)
+project(shared_headers CXX)
+include("{adapter}")
+'''
+            for name, value in [('left', 1), ('right', 2)]:
+                (root / name).mkdir()
+                (root / name / 'entry.cc').write_text(
+                    f'import "value.h";\nint {name}() {{ return number() + PRIVATE_VALUE; }}\n')
+                cmake += f'''
+buildtool_register_project({name} SOURCE_ROOT {name})
+target_include_directories({name} PRIVATE "${{CMAKE_CURRENT_SOURCE_DIR}}/common")
+target_compile_features({name} PUBLIC cxx_std_23)
+target_compile_definitions({name} PRIVATE PRIVATE_VALUE={value})
+buildtool_add_library({name}_archive LIBRARY {name} SOURCES {name}/entry.cc)
+'''
+            (root / 'main.cc').write_text(
+                'int left(); int right(); int main() { return left() == 42 && right() == 43 ? 0 : 1; }\n')
+            cmake += '''
+add_executable(app main.cc)
+target_link_libraries(app PRIVATE left_archive right_archive)
+'''
+            (root / 'CMakeLists.txt').write_text(cmake)
+
+            def run(*args: str) -> str:
+                """Run args in root with bounded execution and captured diagnostics."""
+                result = subprocess.run(args, cwd=root, text=True, stdout=subprocess.PIPE,
+                                        stderr=subprocess.STDOUT, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                return result.stdout
+
+            run('cmake', '-S', '.', '-B', 'build', '-G', 'Unix Makefiles', '-DCMAKE_CXX_COMPILER=g++')
+            workers = [subprocess.Popen(['cmake', '--build', 'build', '--target', f'{name}_archive_build'],
+                       cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                       for name in ('left', 'right')]
+            try:
+                for worker in workers:
+                    output, _ = worker.communicate(timeout=120)
+                    self.assertEqual(worker.returncode, 0, output)
+            finally:
+                for worker in workers:
+                    if worker.poll() is None:
+                        worker.kill()
+                    worker.wait()
+            units = list((root / 'build/buildtool/libraries/buildtool_header_units').rglob('*.pcm'))
+            self.assertEqual(len(units), 2, units)
+            self.assertFalse(list((root / 'build/buildtool/libraries/left').rglob('*.pcm')))
+            self.assertFalse(list((root / 'build/buildtool/libraries/right').rglob('*.pcm')))
+            run('cmake', '--build', 'build', '--target', 'app', '-j2')
+            run(str(root / 'build/app'))
+            before = {p: p.stat().st_mtime_ns for p in units}
+            run('cmake', '--build', 'build', '--target', 'app', '-j2')
+            self.assertEqual(before, {p: p.stat().st_mtime_ns for p in units})
+
+    def test_source_executable(self) -> None:
+        """Build an application with discovered imports, generated input and a CMake library."""
+        adapter = pathlib.Path(__file__).resolve().parents[1] / 'cmake/Buildtool.cmake'
+        generators = ['Unix Makefiles']
+        if shutil.which('ninja'):
+            generators.extend(['Ninja', 'Ninja Multi-Config'])
+        for generator in generators:
+            with self.subTest(generator=generator), tempfile.TemporaryDirectory(prefix='bt-app-') as temporary:
+                root = pathlib.Path(temporary)
+                (root / 'library').mkdir()
+                (root / 'app').mkdir()
+                (root / 'library/number.cc').write_text(
+                    'export module number;\nexport int number() { return 30; }\n')
+                (root / 'external.h').write_text('int external();\n')
+                (root / 'external.cc').write_text(
+                    '#ifndef NATIVE_CMAKE\n#error Must be compiled by CMake\n#endif\n'
+                    'int external() { return 12; }\n')
+                (root / 'app/main.cc').write_text('''
+import number;
+import "value.h";
+#include "generated.h"
+static_assert(EXTERNAL_FLAG == 7);
+#ifndef __OPTIMIZE__
+#error Missing Release flags
+#endif
+#include "external.h"
+int extra();
+int main() { return number() + external() + extra() + VALUE + GENERATED_VALUE == 46 ? 0 : 1; }
+''')
+                (root / 'app/value.h').write_text('#define VALUE 1\n')
+                (root / 'app/extra.cpp').write_text('int extra() { return 2; }\n')
+                (root / 'app/extra_alias.cpp').symlink_to('extra.cpp')
+                (root / 'CMakeLists.txt').write_text(f'''
+cmake_minimum_required(VERSION 3.30)
+project(app_test CXX)
+include("{adapter}")
+buildtool_register_project(library SOURCE_ROOT library)
+target_compile_features(library PUBLIC cxx_std_23)
+add_library(external STATIC external.cc)
+target_compile_definitions(external PRIVATE NATIVE_CMAKE=1)
+target_include_directories(external INTERFACE "${{CMAKE_CURRENT_SOURCE_DIR}}")
+target_compile_definitions(external INTERFACE EXTERNAL_FLAG=7)
+add_subdirectory(app)
+''')
+                (root / 'app/CMakeLists.txt').write_text('''
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated.h"
+  COMMAND ${CMAKE_COMMAND} -E echo "#define GENERATED_VALUE 1" > "${CMAKE_CURRENT_BINARY_DIR}/generated.h"
+  VERBATIM)
+add_custom_target(generate_header DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/generated.h")
+target_include_directories(external INTERFACE "${CMAKE_CURRENT_BINARY_DIR}")
+buildtool_add_executable(app LIBRARY library SOURCES main.cc extra.cpp extra_alias.cpp
+  PRIVATE_LIBRARIES external DEPENDS generate_header)
+''')
+
+                def run(*command: str) -> str:
+                    """Run command in the fixture and report captured output on failure."""
+                    result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    return result.stdout
+
+                run('cmake', '-S', '.', '-B', 'build', '-G', generator,
+                    '-DCMAKE_CXX_COMPILER=g++', '-DCMAKE_BUILD_TYPE=Release')
+                build = ('cmake', '--build', 'build', '--config', 'Release', '--target', 'app', '-j2')
+                run(*build)
+                binary = root / 'build/app' / ('Release' if generator == 'Ninja Multi-Config' else '') / 'app'
+                run(str(binary))
+                before = binary.stat().st_mtime_ns
+                run(*build)
+                self.assertEqual(binary.stat().st_mtime_ns, before)
+                self.assertFalse(list((root / 'build').rglob('consumer.rsp')))
+                artifacts = root / 'build/buildtool/libraries/app_buildtool_settings/Release/artifacts'
+                self.assertEqual(len(list(artifacts.rglob('extra.o'))), 1)
+                self.assertFalse(list(artifacts.rglob('extra_alias.o')))
+
+    def test_source_archive(self) -> None:
+        """Discover imports from source roots, share archives, and track edits and cleaning."""
+        adapter = pathlib.Path(__file__).resolve().parents[1] / 'cmake/Buildtool.cmake'
+        generators = ['Unix Makefiles']
+        if shutil.which('ninja'):
+            generators.extend(['Ninja', 'Ninja Multi-Config'])
+        for generator in generators:
+            with self.subTest(generator=generator), tempfile.TemporaryDirectory(prefix='bt sources-') as temporary:
+                root = pathlib.Path(temporary)
+                (root / 'library/lib').mkdir(parents=True)
+                module = root / 'library/lib/number.cc'
+                module.write_text('export module lib.number;\nexport int number() { return 33; }\n')
+                header = root / 'library/value.h'
+                header.write_text('#pragma once\n#define HEADER_VALUE 10\n')
+                entry = root / 'library/entry.cc'
+                entry.write_text('import lib.number;\nimport "value.h";\n'
+                                 '#include "helper.h"\nstatic_assert(LIBRARY_PRIVATE == 7);\n'
+                                 '#ifndef __OPTIMIZE__\n#error Missing Release flags\n#endif\n'
+                                 'int answer() { return number() + HEADER_VALUE + helper(); }\n')
+                (root / 'library/helper.h').write_text('int helper();\n')
+                (root / 'library/helper.cc').write_text('int helper() { return 1; }\n')
+                (root / 'library/extra.cpp').write_text('int extra() { return 2; }\n')
+                (root / 'main.cc').write_text('#include <cstdio>\nint answer(); int extra();\n'
+                                            'int main() { std::printf("%d\\n", answer() + extra()); }\n')
+                (root / 'CMakeLists.txt').write_text(f'''
+cmake_minimum_required(VERSION 3.30)
+project(sources CXX)
+include("{adapter}")
+buildtool_register_project(library SOURCE_ROOT library)
+target_compile_features(library PUBLIC cxx_std_23)
+target_compile_definitions(library PRIVATE LIBRARY_PRIVATE=7)
+foreach(name first second)
+  buildtool_add_library(${{name}} LIBRARY library SOURCES library/entry.cc library/extra.cpp)
+  add_executable(${{name}}_app main.cc)
+  target_link_libraries(${{name}}_app PRIVATE ${{name}})
+endforeach()
+''')
+
+                def run(*command: str) -> str:
+                    """Run command in the fixture and include captured diagnostics on failure."""
+                    result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    return result.stdout
+
+                run('cmake', '-S', '.', '-B', 'build', '-G', generator,
+                    '-DCMAKE_CXX_COMPILER=g++', '-DCMAKE_BUILD_TYPE=Release')
+                build = ('cmake', '--build', 'build', '--config', 'Release', '-j2')
+                run(*build)
+                binary_dir = root / 'build' / ('Release' if generator == 'Ninja Multi-Config' else '')
+                self.assertEqual(run(str(binary_dir / 'first_app')), '46\n')
+                self.assertEqual(run(str(binary_dir / 'second_app')), '46\n')
+                first = root / 'build/buildtool/first_buildtool_sources/Release/libmodules.a'
+                second = root / 'build/buildtool/second_buildtool_sources/Release/libmodules.a'
+                self.assertEqual(first.resolve(), second.resolve())
+                artifacts = root / 'build/buildtool/libraries/library/Release/artifacts'
+                tracked = [*artifacts.rglob('*.o'), *artifacts.rglob('*.pcm'), first.resolve(),
+                           binary_dir / 'first_app']
+                self.assertTrue(list(artifacts.rglob('*.pcm')))
+                before = {path: path.stat().st_mtime_ns for path in tracked}
+                run(*build)
+                self.assertEqual(before, {path: path.stat().st_mtime_ns for path in tracked})
+                # Ordinary consumers receive neither a mapper nor the library's private flags.
+                self.assertFalse(list((root / 'build/buildtool').rglob('consumer.rsp')))
+                time.sleep(1.05)
+                header.write_text('#pragma once\n#define HEADER_VALUE 11\n')
+                run(*build)
+                self.assertEqual(run(str(binary_dir / 'first_app')), '47\n')
+                time.sleep(1.05)
+                module.write_text('export module lib.number;\nexport int number() { return 34; }\n')
+                run(*build)
+                self.assertEqual(run(str(binary_dir / 'second_app')), '48\n')
+                time.sleep(1.05)
+                entry.write_text(entry.read_text().replace('return number()', 'return 1 + number()'))
+                run(*build)
+                self.assertEqual(run(str(binary_dir / 'first_app')), '49\n')
+                run('cmake', '--build', 'build', '--config', 'Release', '--target', 'clean')
+                self.assertFalse(artifacts.exists())
+                run(*build)
+                self.assertEqual(run(str(binary_dir / 'second_app')), '49\n')
+
+    def test_c_companion(self) -> None:
+        """Compile discovered C with its owner's C flags and rebuild after C header edits."""
+        adapter = pathlib.Path(__file__).resolve().parents[1] / 'cmake/Buildtool.cmake'
+        generators = ['Unix Makefiles']
+        if shutil.which('ninja'):
+            generators.append('Ninja')
+        for generator in generators:
+            with self.subTest(generator=generator), tempfile.TemporaryDirectory(prefix='bt-c-') as temporary:
+                root = pathlib.Path(temporary)
+                (root / 'provider/private').mkdir(parents=True)
+                (root / 'library').mkdir()
+                (root / 'provider/helper.h').write_text('int helper(void);\n')
+                header = root / 'provider/private/value.h'
+                header.write_text('#define VALUE 42\n')
+                (root / 'provider/helper.c').write_text('''
+#include "helper.h"
+#include "value.h"
+#ifdef __cplusplus
+#error C compiled as C++
+#endif
+#ifdef CXX_ONLY
+#error C++ settings leaked into C
+#endif
+_Static_assert(__STDC_VERSION__ == 201112L, "C standard not applied");
+_Static_assert(OWNER == 9 && C_ONLY == 1 && BUILD_C == 1, "Wrong C settings");
+int helper(void) { return VALUE; }
+''')
+                (root / 'library/entry.cc').write_text('''
+extern "C" {
+#include "../provider/helper.h"
+}
+static_assert(OWNER == 7 && CXX_ONLY == 1);
+int answer() { return helper(); }
+''')
+                (root / 'main.cc').write_text('#include <cstdio>\nint answer();\n'
+                                            'int main() { std::printf("%d\\n", answer()); }\n')
+                cmake = root / 'CMakeLists.txt'
+                cmake.write_text(f'''
+cmake_minimum_required(VERSION 3.30)
+project(c_companion LANGUAGES CXX)
+include("{adapter}")
+buildtool_register_project(provider SOURCE_ROOT provider)
+buildtool_register_project(library SOURCE_ROOT library)
+target_link_libraries(library PRIVATE provider)
+target_compile_definitions(provider PRIVATE OWNER=9 "$<$<COMPILE_LANGUAGE:C>:C_ONLY=1>"
+  "$<$<COMPILE_LANGUAGE:CXX>:CXX_ONLY=1>")
+target_compile_definitions(library PRIVATE OWNER=7 "$<$<COMPILE_LANGUAGE:CXX>:CXX_ONLY=1>")
+target_include_directories(provider PRIVATE "$<$<COMPILE_LANGUAGE:C>:${{CMAKE_CURRENT_SOURCE_DIR}}/provider/private>")
+set_target_properties(provider PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
+buildtool_add_library(archive LIBRARY library SOURCES library/entry.cc)
+add_executable(app main.cc)
+target_link_libraries(app PRIVATE archive)
+''')
+
+                def run(*command: str, success: bool = True) -> str:
+                    """Run command in the fixture, asserting the requested exit status."""
+                    result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=120)
+                    self.assertEqual(result.returncode == 0, success, result.stdout)
+                    return result.stdout
+
+                configure = ('cmake', '-S', '.', '-B', 'build', '-G', generator,
+                             '-DCMAKE_CXX_COMPILER=g++')
+                run(*configure)
+                build = ('cmake', '--build', 'build', '-j2')
+                self.assertIn('Enable C in project', run(*build, success=False))
+                cmake.write_text(cmake.read_text().replace('LANGUAGES CXX', 'LANGUAGES C CXX'))
+                run(*configure, '-DCMAKE_C_COMPILER=gcc', '-DCMAKE_C_FLAGS=-DBUILD_C=1')
+                run(*build)
+                self.assertEqual(run(str(root / 'build/app')), '42\n')
+                artifacts = root / 'build/buildtool/libraries/provider/artifacts'
+                objects = list(artifacts.rglob('helper.o'))
+                self.assertEqual(len(objects), 1)
+                before = objects[0].stat().st_mtime_ns
+                run(*build)
+                self.assertEqual(before, objects[0].stat().st_mtime_ns)
+                time.sleep(1.05)
+                header.write_text('#define VALUE 43\n')
+                run(*build)
+                self.assertGreater(objects[0].stat().st_mtime_ns, before)
+                self.assertEqual(run(str(root / 'build/app')), '43\n')
+
+    def test_source_archive_public_modules(self) -> None:
+        """Publish discovered imports for headers without inheriting two GCC mappers."""
+        adapter = pathlib.Path(__file__).resolve().parents[1] / 'cmake/Buildtool.cmake'
+        for generator in ('Unix Makefiles', 'Ninja'):
+            if generator == 'Ninja' and not shutil.which('ninja'):
+                continue
+            with self.subTest(generator=generator), tempfile.TemporaryDirectory(prefix='bt-public-') as temporary:
+                root = pathlib.Path(temporary)
+                (root / 'library').mkdir()
+                module = root / 'library/value.cc'
+                module.write_text('export module value;\nexport int value() { return 42; }\n')
+                (root / 'library/left.h').write_text('#pragma once\nimport value;\nint left();\n')
+                (root / 'library/left.cc').write_text('#include "left.h"\nint left() { return value(); }\n')
+                (root / 'library/right.h').write_text('#include "left.h"\nint right();\n')
+                (root / 'library/right.cc').write_text('#include "right.h"\nint right() { return left(); }\n')
+                (root / 'generated.in').write_text('int generated() { return 0; }\n')
+                (root / 'main.cc').write_text('#include "right.h"\n#include <cstdio>\n'
+                                            'int main() { std::printf("%d\\n", right()); }\n')
+                (root / 'CMakeLists.txt').write_text(f'''
+cmake_minimum_required(VERSION 3.30)
+project(public_sources CXX)
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
+include("{adapter}")
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+buildtool_register_project(library SOURCE_ROOT library)
+buildtool_add_library(left LIBRARY library PUBLIC_MODULES
+  SOURCES library/left.cc library/generated.cc)
+add_custom_command(OUTPUT "${{CMAKE_CURRENT_SOURCE_DIR}}/library/generated.cc"
+  COMMAND "${{CMAKE_COMMAND}}" -E copy "${{CMAKE_CURRENT_SOURCE_DIR}}/generated.in"
+    "${{CMAKE_CURRENT_SOURCE_DIR}}/library/generated.cc"
+  DEPENDS generated.in VERBATIM)
+add_custom_target(generate DEPENDS "${{CMAKE_CURRENT_SOURCE_DIR}}/library/generated.cc")
+add_dependencies(left_build generate)
+buildtool_add_library(right LIBRARY library PUBLIC_MODULES SOURCES library/right.cc)
+target_link_libraries(right INTERFACE "$<LINK_ONLY:left>")
+add_executable(app main.cc)
+target_link_libraries(app PRIVATE right)
+''')
+
+                def run(*command: str) -> str:
+                    """Run command in the fixture, reporting captured output on failure."""
+                    result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE,
+                                            stderr=subprocess.STDOUT, timeout=120)
+                    self.assertEqual(result.returncode, 0, result.stdout)
+                    return result.stdout
+
+                run('cmake', '-S', '.', '-B', 'build', '-G', generator, '-DCMAKE_CXX_COMPILER=g++')
+                run('cmake', '--build', 'build', '-j2')
+                self.assertEqual(run(str(root / 'build/app')), '42\n')
+                database = json.loads((root / 'build/compile_commands.json').read_text())
+                command = next(entry['command'] for entry in database if entry['file'].endswith('/main.cc'))
+                self.assertEqual(command.count('consumer.rsp'), 1, command)
+                state = root / 'build/buildtool/right_buildtool_sources/state.h'
+                before = state.stat().st_mtime_ns
+                run('cmake', '--build', 'build', '-j2')
+                self.assertEqual(before, state.stat().st_mtime_ns)
+                time.sleep(1.05)
+                module.write_text(module.read_text().replace('return 42', 'return 43'))
+                run('cmake', '--build', 'build', '-j2')
+                self.assertEqual(run(str(root / 'build/app')), '43\n')
+
     def test_conflicting_bundles_are_rejected(self) -> None:
         """Reject a native consumer that would otherwise silently use the last mapper."""
         adapter = pathlib.Path(__file__).resolve().parents[1] / 'cmake/Buildtool.cmake'
@@ -131,11 +494,15 @@ file(WRITE "${{CMAKE_BINARY_DIR}}/scan" "${{scan}}")
                 'export int detail() { return VALUE; }\n')
             header = root / 'library/lib/number.h'
             header.write_text('#pragma once\n#define VALUE 42\n')
+            # A dependency loads the bridge; sibling consumers must still find Python.
+            (root / 'library/CMakeLists.txt').write_text(f'''
+include("{adapter}")
+buildtool_register_project(library SOURCE_ROOT .)
+''')
             (root / 'CMakeLists.txt').write_text(f'''
 cmake_minimum_required(VERSION 3.30)
 project(shared CXX)
-include("{adapter}")
-buildtool_register_project(library SOURCE_ROOT library)
+add_subdirectory(library)
 target_compile_definitions(library PRIVATE LIBRARY_PRIVATE=7)
 add_subdirectory(a)
 add_subdirectory(b)

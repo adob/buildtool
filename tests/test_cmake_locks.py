@@ -61,9 +61,12 @@ if len(sys.argv) > 2 and sys.argv[2] == 'metadata':
     sys.exit(0)
 
 class Target:
-    def __init__(self, cfg: SimpleNamespace, roots: list[str], projects: dict[Path, 'Target']) -> None:
+    def __init__(self, cfg: SimpleNamespace, roots: list[str], projects: dict[Path, 'Target'],
+                 cmake_sources: frozenset[Path] = frozenset(), leases: Any = None,
+                 header_roots: tuple[Path, ...] = ()) -> None:
         """Retain cfg and participating projects for the simulated compilation."""
         self.cfg, self.projects, self.objs = cfg, projects, []
+        self.source_roots = roots
 
     def mod2src(self, name: str, kind: bridge.bt.SourceType) -> str:
         """Return name as a placeholder for the requested module kind."""
@@ -83,6 +86,7 @@ with patch.object(bridge, 'cmake_targets', return_value=(registry.parent, [
      patch.object(bridge, 'lock_files', side_effect=lock_files), \
      patch.object(bridge, 'configuration', side_effect=configuration), \
      patch.object(bridge, 'ModuleTarget', Target), \
+     patch.object(bridge, 'HeaderUnitTarget', Target), \
      patch.object(bridge, 'archive_objects'), \
      patch.object(bridge, 'artifact_manifest', return_value={}), \
      patch.object(bridge, 'publish_consumer_files'):

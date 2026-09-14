@@ -13,6 +13,9 @@ function(buildtool_register_project name)
   # A compilation target lets CMake evaluate toolchain/configuration flags and
   # transitive requirements for this library, independently of its consumers.
   add_library(${name} OBJECT EXCLUDE_FROM_ALL "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Settings.cc")
+  if(CMAKE_C_COMPILER_LOADED)
+    target_sources(${name} PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Settings.c")
+  endif()
   target_compile_features(${name} PUBLIC cxx_std_20)
   set_target_properties(${name} PROPERTIES
     CXX_SCAN_FOR_MODULES OFF
@@ -29,16 +32,71 @@ function(buildtool_register_project name)
     "${directory}/artifacts" "${directory}/archives")
   set(compiler "${CMAKE_CXX_COMPILER}")
   set(compiler_arg1 "${CMAKE_CXX_COMPILER_ARG1}")
+  set(c_compiler "")
+  set(c_compiler_arg1 "")
+  if(CMAKE_C_COMPILER_LOADED)
+    set(c_compiler "${CMAKE_C_COMPILER}")
+    set(c_compiler_arg1 "${CMAKE_C_COMPILER_ARG1}")
+  endif()
   set(archiver "${CMAKE_AR}")
   set(ranlib "${CMAKE_RANLIB}")
   set(reply_directory "${CMAKE_BINARY_DIR}/.cmake/api/v1/reply")
   set(configuration "$<CONFIG>")
   set(roots "$<TARGET_PROPERTY:${name},BUILDTOOL_SOURCE_ROOTS>")
-  foreach(field name root roots compiler compiler_arg1 archiver ranlib reply_directory configuration)
+  foreach(field name root roots compiler compiler_arg1 c_compiler c_compiler_arg1 archiver ranlib reply_directory configuration)
     file(GENERATE OUTPUT "${directory}/${field}"
       CONTENT "$<JOIN:${${field}},\n>\n" TARGET ${name})
   endforeach()
   cmake_file_api(QUERY API_VERSION 1 CODEMODEL 2)
+  if(NOT name STREQUAL "buildtool_header_units")
+    if(NOT TARGET buildtool_header_units)
+      set(header_root "${CMAKE_BINARY_DIR}/buildtool/header-unit-root")
+      file(MAKE_DIRECTORY "${header_root}")
+      buildtool_register_project(buildtool_header_units SOURCE_ROOT "${header_root}")
+      # Use a stable dialect even when a dependency sets CXX_EXTENSIONS later.
+      # GNU mode changes libstdc++ __int128 traits across module boundaries.
+      set_property(TARGET buildtool_header_units PROPERTY CXX_EXTENSIONS OFF)
+    endif()
+    # One agreed header configuration: build-wide flags, language requirements,
+    # and the registered projects' include paths, without their private macros.
+    target_compile_features(buildtool_header_units PUBLIC
+      "$<TARGET_PROPERTY:${name},COMPILE_FEATURES>")
+    target_include_directories(buildtool_header_units PRIVATE
+      "$<TARGET_PROPERTY:${name},INCLUDE_DIRECTORIES>")
+  endif()
+endfunction()
+
+# Create target as an imported archive in directory, using library's public settings.
+function(_buildtool_import_archive target library directory)
+  add_library(${target} STATIC IMPORTED GLOBAL)
+  set_property(TARGET ${target} PROPERTY INTERFACE_LINK_LIBRARIES "${library}")
+  # Imported locations are configuration properties, not generator expressions.
+  if(CMAKE_CONFIGURATION_TYPES)
+    foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
+      string(TOUPPER "${config}" upper)
+      string(REPLACE "$<CONFIG>" "${config}" location "${directory}/libmodules.a")
+      set_property(TARGET ${target} APPEND PROPERTY IMPORTED_CONFIGURATIONS "${config}")
+      set_property(TARGET ${target} PROPERTY IMPORTED_LOCATION_${upper} "${location}")
+    endforeach()
+  else()
+    string(REPLACE "$<CONFIG>" "${CMAKE_BUILD_TYPE}" location "${directory}/libmodules.a")
+    set_property(TARGET ${target} PROPERTY IMPORTED_LOCATION "${location}")
+  endif()
+endfunction()
+
+# Build target from library and directory's manifest; description labels progress,
+# and ARGN lists additional metadata outputs.
+function(_buildtool_add_build_job target library directory description)
+  find_package(Python3 3.10 REQUIRED COMPONENTS Interpreter)
+  add_custom_target(${target}_build
+    COMMENT "${description}"
+    COMMAND "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../cmake_modules.py" "${directory}"
+    BYPRODUCTS "${directory}/libmodules.a" ${ARGN}
+    JOB_SERVER_AWARE TRUE
+    VERBATIM)
+  add_dependencies(${target}_build ${library})
+  add_dependencies(${target} ${target}_build)
 endfunction()
 
 # Build MODULES from LIBRARY for an existing native CMake target named consumer.
@@ -91,25 +149,11 @@ function(buildtool_target_modules consumer)
   set_property(TARGET ${consumer} PROPERTY CXX_SCAN_FOR_MODULES ${BT_NATIVE_MODULES})
 
   set(directory "${CMAKE_CURRENT_BINARY_DIR}/buildtool/${bundle}/$<CONFIG>")
-  set(archive "${directory}/libmodules.a")
-  add_library(${bundle} STATIC IMPORTED GLOBAL)
+  _buildtool_import_archive(${bundle} ${BT_LIBRARY} "${directory}")
   set_target_properties(${bundle} PROPERTIES
     INTERFACE_COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:@${directory}/consumer.rsp>"
-    INTERFACE_LINK_LIBRARIES "${BT_LIBRARY}"
     INTERFACE_BUILDTOOL_BUNDLE "${bundle}"
     COMPATIBLE_INTERFACE_STRING BUILDTOOL_BUNDLE)
-  # Imported locations are configuration properties, not generator expressions.
-  if(CMAKE_CONFIGURATION_TYPES)
-    foreach(config IN LISTS CMAKE_CONFIGURATION_TYPES)
-      string(TOUPPER "${config}" upper)
-      set_property(TARGET ${bundle} APPEND PROPERTY IMPORTED_CONFIGURATIONS "${config}")
-      set_property(TARGET ${bundle} PROPERTY IMPORTED_LOCATION_${upper}
-        "${CMAKE_CURRENT_BINARY_DIR}/buildtool/${bundle}/${config}/libmodules.a")
-    endforeach()
-  else()
-    set_property(TARGET ${bundle} PROPERTY IMPORTED_LOCATION
-      "${CMAKE_CURRENT_BINARY_DIR}/buildtool/${bundle}/${CMAKE_BUILD_TYPE}/libmodules.a")
-  endif()
   if(BT_PUBLIC)
     target_link_libraries(${consumer} PUBLIC ${bundle})
   else()
@@ -131,17 +175,9 @@ function(buildtool_target_modules consumer)
   else()
     list(APPEND metadata_outputs "${directory}/consumer.modmap")
   endif()
-  add_custom_target(${bundle}_build
-    COMMENT "Building ${BT_LIBRARY} modules"
-    COMMAND "${Python3_EXECUTABLE}"
-      "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../cmake_modules.py" "${directory}"
-    BYPRODUCTS "${archive}" "${directory}/consumer.rsp" "${directory}/state.h"
-      "${directory}/providers.json"
-      ${metadata_outputs}
-    JOB_SERVER_AWARE TRUE
-    VERBATIM)
-  add_dependencies(${bundle}_build ${BT_LIBRARY})
-  add_dependencies(${bundle} ${bundle}_build)
+  _buildtool_add_build_job(${bundle} ${BT_LIBRARY} "${directory}" "Building ${BT_LIBRARY} modules"
+    "${directory}/consumer.rsp" "${directory}/state.h"
+    "${directory}/providers.json" ${metadata_outputs})
   # Also order direct consumer compilation explicitly, including Ninja generators.
   add_dependencies(${consumer} ${bundle}_build)
 endfunction()

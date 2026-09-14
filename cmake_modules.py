@@ -13,10 +13,12 @@ from pathlib import Path
 import shlex
 import signal
 import subprocess
+import uuid
 from typing import Any
 
 import buildtool as bt
 from jobserver import JobServer, make_suppresses_execution
+from header_unit_cache import HeaderUnitBusy, HeaderUnitLocks
 
 
 def lock_files(stack: ExitStack, paths: Iterable[Path]) -> None:
@@ -56,18 +58,21 @@ def cmake_targets(directory: Path) -> tuple[Path, list[dict[str, Any]]]:
     model = json.loads((reply / model_file).read_text())
     config_name = (directory / 'configuration').read_text().strip()
     config = next(item for item in model['configurations'] if item['name'] == config_name)
-    return Path(model['paths']['build']), [json.loads((reply / entry['jsonFile']).read_text())
-                                         for entry in config['targets']]
+    targets = [json.loads((reply / entry['jsonFile']).read_text()) for entry in config['targets']]
+    for target in targets:
+        for source in target.get('sources', []):
+            source['path'] = str((Path(model['paths']['source']) / source['path']).resolve())
+    return Path(model['paths']['build']), targets
 
 
-def compilation_group(directory: Path) -> tuple[dict[str, Any], Path]:
-    """Load the registered library's C++ settings and CMake working directory."""
+def compilation_group(directory: Path, language: str = 'CXX') -> tuple[dict[str, Any], Path]:
+    """Load directory's library settings for language (C/CXX) and compiler working directory."""
     build_directory, targets = cmake_targets(directory)
     library = lines(directory, 'name')[0]
     target = next(item for item in targets if item['name'] == library)
-    groups = [group for group in target.get('compileGroups', []) if group['language'] == 'CXX']
+    groups = [group for group in target.get('compileGroups', []) if group['language'] == language]
     if len(groups) != 1:
-        raise RuntimeError(f'{library} must have one C++ settings group; '
+        raise RuntimeError(f'{library} must have one {language} settings group; '
                            'do not add source files to a registered buildtool library')
     group = groups[0]
     if group.get('precompileHeaders'):
@@ -76,10 +81,11 @@ def compilation_group(directory: Path) -> tuple[dict[str, Any], Path]:
     return group, working_directory
 
 
-def compiler_flags(directory: Path) -> list[str]:
-    """Read effective C++ flags from CMake, rebasing file arguments to their native cwd."""
-    group, working_directory = compilation_group(directory)
-    flags = shlex.split((directory / 'compiler_arg1').read_text())
+def compiler_flags(directory: Path, language: str = 'CXX') -> list[str]:
+    """Read directory's C/CXX flags for language, rebasing paths to the compiler's cwd."""
+    group, working_directory = compilation_group(directory, language)
+    argument_field = 'c_compiler_arg1' if language == 'C' else 'compiler_arg1'
+    flags = shlex.split((directory / argument_field).read_text())
     flags.extend('-D' + item['define'] for item in group.get('defines', []))
     for include in group.get('includes', []):
         flags.extend(['-isystem' if include.get('isSystem') else '-I', include['path']])
@@ -121,11 +127,18 @@ class ModuleTarget(bt.Target):
     """Discover modules in registered source roots, retaining relative project paths."""
 
     def __init__(self, cfg: bt.BuildConfig, roots: list[str],
-                 projects: dict[Path, ModuleTarget]) -> None:
-        """Build with cfg and roots; projects routes dependencies to their owning library."""
+                 projects: dict[Path, ModuleTarget],
+                 cmake_sources: frozenset[Path] = frozenset()) -> None:
+        """Route sources through projects; cmake_sources are compiled by native CMake targets."""
         super().__init__(bt.Path('cmake-modules'), cfg)
         self.source_roots = roots
         self.projects = projects
+        self.cmake_sources = cmake_sources
+        self.header_target: ModuleTarget | None = None
+
+    def should_build_companion(self, path: bt.Path) -> bool:
+        """Leave companion path to CMake when its file API lists a native compilation."""
+        return Path(str(path)).resolve() not in self.cmake_sources
 
     def schedule_sources(
         self, sources: Iterable[bt.Path | tuple[bt.Path, bt.SourceType | None, str | None,
@@ -137,6 +150,10 @@ class ModuleTarget(bt.Target):
             project.session = graph.session
             project.job_sources = graph.job_sources
             project.link_events = graph.link_events
+        if self.header_target is not None:
+            self.header_target.session = graph.session
+            self.header_target.job_sources = graph.job_sources
+            self.header_target.link_events = graph.link_events
         super().schedule_sources(sources, graph)
 
     def mod2src(self, modname: str | None, type: bt.SourceType) -> bt.Path:
@@ -151,12 +168,20 @@ class ModuleTarget(bt.Target):
                                  modname: str | None = None,
                                  inherited_dircfg: bt.DirectoryConfig | None = None,
                                  parent: bt.Job | None = None) -> bt.Job:
-        """Schedule a C++ dependency; C/assembly dependencies must be native CMake targets."""
-        if path.suffix in ('.c', '.s', '.S'):
-            raise RuntimeError(f'Build {path} as a native CMake dependency; '
-                               'the module bridge compiles C++ only')
-        if type == bt.SourceType.MODULE or path.suffix in bt.CCFILE_SUFFIXES:
+        """Route C/C++ sources to their owner; assembly requires a native CMake target."""
+        if type in (bt.SourceType.USER_HEADER, bt.SourceType.SYSTEM_HEADER) and self.header_target is not None:
             absolute = Path(str(path)).resolve()
+            return self.header_target.schedule_compilation_job(
+                bt.Path(str(absolute)), type, str(absolute), parent=parent)
+        if path.suffix in ('.s', '.S'):
+            raise RuntimeError(f'Build {path} as a native CMake dependency; '
+                               'the module bridge does not compile assembly')
+        if (type == bt.SourceType.MODULE or
+                (type not in (bt.SourceType.USER_HEADER, bt.SourceType.SYSTEM_HEADER)
+                 and path.suffix in (*bt.CCFILE_SUFFIXES, '.c'))):
+            absolute = Path(str(path)).resolve()
+            # Include-prefix symlinks must not schedule a second object for the same source.
+            path = bt.Path(os.path.relpath(absolute))
             # The most specific registered root owns a named module or companion.
             # Header units retain their importing library's compilation settings.
             for root, project in self.projects.items():
@@ -167,17 +192,62 @@ class ModuleTarget(bt.Target):
                             self.roots.append(job)
                         return job
                     break
+        if path.suffix == '.c' and not self.cfg.CC:
+            raise RuntimeError(f'Enable C in project(... LANGUAGES C CXX) before registering '
+                               f'the library that owns {path}')
         return super().schedule_compilation_job(path, type, modname, inherited_dircfg, parent)
+
+
+class HeaderUnitTarget(ModuleTarget):
+    """Compile all header units with one shared configuration and per-file leases."""
+
+    def __init__(self, cfg: bt.BuildConfig, roots: list[str], projects: dict[Path, ModuleTarget],
+                 cmake_sources: frozenset[Path], leases: HeaderUnitLocks,
+                 header_roots: tuple[Path, ...]) -> None:
+        """Use cfg/leases for shared units, projects for companions, and all header_roots for classification."""
+        super().__init__(cfg, roots, projects, cmake_sources)
+        self.leases = leases
+        self.header_roots = header_roots
+
+    def schedule_compilation_job(self, path: bt.Path, type: bt.SourceType | None = None,
+                                 modname: str | None = None,
+                                 inherited_dircfg: bt.DirectoryConfig | None = None,
+                                 parent: bt.Job | None = None) -> bt.Job:
+        """Lease a header before inspecting metadata; other sources use normal routing."""
+        if type in (bt.SourceType.USER_HEADER, bt.SourceType.SYSTEM_HEADER):
+            absolute = Path(str(path)).resolve()
+            self.leases.acquire(absolute)
+            path, modname = bt.Path(str(absolute)), str(absolute)
+            type = (bt.SourceType.USER_HEADER if any(absolute.is_relative_to(root) for root in self.header_roots)
+                    else bt.SourceType.SYSTEM_HEADER)
+        return super().schedule_compilation_job(path, type, modname, inherited_dircfg, parent)
+
+    async def compile_source(self, source: bt.SourceFile, cfg: bt.BuildConfig) -> None:
+        """Publish a completed CMI atomically; retain the previous CMI on cancellation."""
+        if source.type not in (bt.SourceType.USER_HEADER, bt.SourceType.SYSTEM_HEADER):
+            await super().compile_source(source, cfg)
+            return
+        final = source.cmpath
+        temporary = Path(str(final) + '.' + uuid.uuid4().hex + '.tmp')
+        source.cmpath = bt.Path(str(temporary))
+        try:
+            await source.compile(self, cfg)
+            temporary.replace(str(final))
+        finally:
+            source.cmpath = final
+            temporary.unlink(missing_ok=True)
 
 
 def configuration(directory: Path) -> bt.BuildConfig:
     """Build this library with its own CMake settings and per-configuration artifacts."""
     compiler = lines(directory, 'compiler')[0]
+    c_compiler = (directory / 'c_compiler').read_text().strip()
     artifacts = directory / 'artifacts'
     # Absolute BMI dependencies work with both standalone and native CMake maps,
     # allowing both consumer modes to reuse the same library compilation.
     # CMake's evaluated flags already contain the library's include directories.
-    return bt.BuildConfig(CXX=compiler, CC=compiler, CXXFLAGS=compiler_flags(directory), CFLAGS=[],
+    return bt.BuildConfig(CXX=compiler, CC=c_compiler, CXXFLAGS=compiler_flags(directory),
+                          CFLAGS=compiler_flags(directory, 'C') if c_compiler else [],
                           LDFLAGS=[], INCFLAGS=[], SRCDIR='.',
                           OBJDIR=str(artifacts), DEPDIR=str(artifacts / 'deps'), JOBS=1,
                           memory=bt.MemoryBudget(), progress=True,
@@ -365,16 +435,31 @@ def publish_cmake_metadata(directory: Path, manifest: dict[str, Any], fingerprin
 
 
 def build_modules(directory: Path) -> None:
-    """Resolve requested names, build their closure, and publish CMake artifacts."""
+    """Retry directory's build after contention, releasing all leases before waiting."""
+    while True:
+        try:
+            build_modules_attempt(directory)
+            return
+        except HeaderUnitBusy as busy:
+            busy.wait()
+
+
+def build_modules_attempt(directory: Path) -> None:
+    """Build directory's requested modules or source files and publish CMake artifacts."""
     library = Path(lines(directory, 'library')[0])
     registry = Path(lines(directory, 'registry')[0])
     config = (directory / 'configuration').read_text().strip()
     _, cmake_projects = cmake_targets(directory)
     names = {target['name'] for target in cmake_projects}
+    cmake_sources = frozenset(Path(source['path']) for target in cmake_projects
+                             for source in target.get('sources', [])
+                             if 'compileGroupIndex' in source)
     # All registered roots give a stable working directory across consumer jobs,
     # including a dependency built both on its own and through another library.
     registrations: dict[Path, Path] = {}
     for entry in registry.iterdir():
+        if entry.name == 'buildtool_header_units':
+            continue
         if entry.name not in names or not (entry / config / 'root').exists():
             continue
         root = Path(lines(entry / config, 'root')[0])
@@ -404,18 +489,34 @@ def build_modules(directory: Path) -> None:
         for root in sorted(active, key=lambda path: (-len(path.parts), str(path))):
             manifest = registrations[root]
             roots = list(dict.fromkeys(lines(manifest, 'roots')))
-            projects[root] = ModuleTarget(configuration(manifest), roots, projects)
+            projects[root] = ModuleTarget(configuration(manifest), roots, projects, cmake_sources)
             if jobserver is not None:
                 cfg = projects[root].cfg
                 cfg.jobserver = jobserver
                 cfg.JOBS = os.cpu_count() or 1
+        header_manifest = registry / 'buildtool_header_units' / config
+        headers = HeaderUnitTarget(configuration(header_manifest),
+            list(dict.fromkeys(path for project in projects.values() for path in project.source_roots)),
+            projects, cmake_sources, HeaderUnitLocks(header_manifest / 'locks', locks), tuple(registrations))
+        for project in projects.values():
+            project.header_target = headers
         target = projects[Path(lines(library, 'root')[0])]
-        target.compile_many([(target.mod2src(name, bt.SourceType.MODULE),
-                              bt.SourceType.MODULE, name, None)
-                             for name in lines(directory, 'modules')])
+        source_build = (directory / 'sources').exists()
+        if source_build:
+            sources = [Path(path).resolve() for path in lines(directory, 'sources')]
+            for source in sources:
+                if not any(source.is_relative_to(root) for root in projects):
+                    raise RuntimeError(f'Source {source} is outside the registered library roots')
+            target.compile_many([bt.Path(os.path.relpath(source)) for source in sources])
+        else:
+            target.compile_many([(target.mod2src(name, bt.SourceType.MODULE),
+                                  bt.SourceType.MODULE, name, None)
+                                 for name in lines(directory, 'modules')])
         archive_objects(directory, target.objs, library)
-        configs = [target.cfg, *(project.cfg for project in projects.values() if project is not target)]
-        publish_consumer_files(directory, artifact_manifest(configs))
+        if not source_build or (directory / 'public_modules').read_text().strip() == 'TRUE':
+            configs = [target.cfg, *(project.cfg for project in projects.values() if project is not target),
+                       headers.cfg]
+            publish_consumer_files(directory, artifact_manifest(configs))
 
 
 def main() -> None:
@@ -434,6 +535,9 @@ def main() -> None:
     previous = signal.signal(signal.SIGTERM, interrupt)
     try:
         build_modules(directory)
+    except subprocess.CalledProcessError as error:
+        # Compiler diagnostics have already been streamed; preserve its exit status.
+        raise SystemExit(error.returncode if error.returncode > 0 else 128 - error.returncode) from None
     finally:
         signal.signal(signal.SIGTERM, previous)
 
