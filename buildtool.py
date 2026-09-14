@@ -213,9 +213,11 @@ class BuildConfig:
         USE_DIRECTORY_CONFIG: bool = True,
         ABSOLUTE_MODULE_PATHS: bool = False,
         jobserver: JobServer | None = None,
+        progress: bool = False,
     ) -> None:
         self.vfs = vfs
         self.jobserver = jobserver
+        self.progress = progress
         self.USE_DIRECTORY_CONFIG = USE_DIRECTORY_CONFIG
         self.ABSOLUTE_MODULE_PATHS = ABSOLUTE_MODULE_PATHS
         self.TAGS = validate_tags(TAGS) if TAGS is not None else native_tags()
@@ -524,7 +526,7 @@ class CompilationGraph:
         """Own one scheduler and shared dependency records for targets using cfg."""
         self.session = BuildSession(cfg.JOBS, memory=cfg.memory, verbose=cfg.VERBOSE,
                                     concurrency_reporter=cfg.concurrency_reporter,
-                                    jobserver=cfg.jobserver)
+                                    jobserver=cfg.jobserver, progress=cfg.progress)
         self.job_sources: dict[Job, SourceFile] = {}
         self.link_events: dict[Job, list[Job | DirectoryConfig]] = {}
 
@@ -1293,14 +1295,16 @@ class SourceFile:
 
     async def compile(self, target: Target, cfg: BuildConfig) -> None:
         """Compile for target/cfg using its selected asynchronous backend."""
-        # Let the reporter emit its banner before this backend's BUILDING line.
-        self.job.session.compilation_started = True
+        self.job.start_compilation(f'{self.type} {self.path}')
+        if not self.job.session.progress:
+            self.job.message(f"BUILDING {self.type} {self.path}...")
         self.header_deps = {}
 
         if cfg.USECLANG:
             await self.compile_clang(target, cfg)
         else:
             await self.compile_gcc(target, cfg)
+        self.job.complete_compilation()
 
     MODULE_MAPPER_LINE_RE = re.compile(r'^([A-Z-]+)\b(.*)')
     async def compile_gcc(self, target: Target, cfg: BuildConfig) -> None:
@@ -1308,7 +1312,6 @@ class SourceFile:
         if self.type in (SourceType.C, SourceType.ASM):
             await self.compile_gcc_c(cfg)
             return
-        self.job.message(f"BUILDING {self.type} {self.path}...")
         start = time.perf_counter()
         self.deps = {}
         self.vcpkgs = set()
@@ -1406,13 +1409,11 @@ class SourceFile:
 
     async def compile_gcc_c(self, cfg: BuildConfig) -> None:
         """Compile a C/assembly input with cfg and load its header depfile."""
-        self.job.message(f"BUILDING {self.type} {self.path}...")
         await run_compiler(self.job, self.compiler_cmd(cfg), color_diagnostics=True)
         self.process_makefile_deps()
 
     async def compile_clang(self, target: Target, cfg: BuildConfig) -> dict[ModuleDep | HeaderDep, None]:
         """Compile using cfg's wrapper or legacy scanner, scheduling under target."""
-        self.job.message(f"BUILDING {self.type} {self.path}...")
         self.clang_module_files = {}
         self.clang_exported_module = None
         if cfg.CLANG_WRAPPER:

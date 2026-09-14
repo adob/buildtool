@@ -132,6 +132,7 @@ function(buildtool_target_modules consumer)
     list(APPEND metadata_outputs "${directory}/consumer.modmap")
   endif()
   add_custom_target(${bundle}_build
+    COMMENT "Building ${BT_LIBRARY} modules"
     COMMAND "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/../cmake_modules.py" "${directory}"
     BYPRODUCTS "${archive}" "${directory}/consumer.rsp" "${directory}/state.h"

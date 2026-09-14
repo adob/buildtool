@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Hashable
 from typing import TextIO
 from contextlib import asynccontextmanager
 import sys
+import os
 import tempfile
 
 if __package__:
@@ -110,7 +111,19 @@ class Job:
         self.changed = asyncio.Event()
         self.log = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
         self.size = 0
+        self.compilation_description: str | None = None
         self.task = asyncio.create_task(self.run())
+
+    def start_compilation(self, description: str) -> None:
+        """Register actual compilation work described by description, excluding cache hits."""
+        self.session.compilation_started = True
+        self.session.compilations_total += 1
+        self.compilation_description = description
+        self.changed.set()
+
+    def complete_compilation(self) -> None:
+        """Count this compilation after its compiler has completed successfully."""
+        self.session.compilations_completed += 1
 
     def write(self, data: str | bytes) -> None:
         """Append bytes or text data to this job's stream and wake its reader."""
@@ -213,12 +226,16 @@ class BuildSession:
         verbose: bool = False,
         concurrency_reporter: ConcurrencyReporter | None = None,
         jobserver: JobServer | None = None,
+        progress: bool = False,
     ) -> None:
-        """Limit jobs by memory/jobserver; output logs through an optional shared reporter."""
+        """Limit jobs; progress enables indented concurrency and numbered descriptions."""
         if jobs < 1:
             raise ValueError('jobs must be at least 1')
         self.output = output if output is not None else sys.stdout
         self.verbose = verbose
+        self.progress = progress
+        self.compilations_total = 0
+        self.compilations_completed = 0
         self.concurrency_reporter = (concurrency_reporter if concurrency_reporter is not None
                                      else ConcurrencyReporter())
         limit = jobs
@@ -231,17 +248,25 @@ class BuildSession:
             limit = memory.job_limit(limit, available)
             memory_text = ('available memory unknown' if available is None else
                            f'{available / GIB:.0f} GB available')
-            limit_text = f'up to {limit}' if jobserver is not None else str(limit)
-            request_text = f'requested: {jobs}'
-            if jobserver is not None:
-                request_text = (f'requested: {jobserver.jobs}' if jobserver.jobs is not None
-                                else f'local limit: {jobs}')
-            self.concurrency_message = (
-                f'Concurrency: {limit_text} compiler jobs '
-                f'({request_text}, {memory_text}, '
-                f'{memory.bytes_per_job / GIB:.0f} GB/job estimate)\n')
-        if jobserver is not None and self.concurrency_message:
-            self.concurrency_message = self.concurrency_message.rstrip() + ' [shared jobserver]\n'
+            if progress:
+                requested = jobs if jobserver is None else jobserver.jobs
+                requested_text = str(requested) if requested is not None else 'unknown'
+                self.concurrency_message = (
+                    f'       buildtool concurrency: {limit}; requested {requested_text}; '
+                    f'{memory_text}; {memory.bytes_per_job / GIB:.0f} GB/job estimate\n')
+            else:
+                limit_text = f'up to {limit}' if jobserver is not None else str(limit)
+                request_text = f'requested: {jobs}'
+                if jobserver is not None:
+                    request_text = (f'requested: {jobserver.jobs}' if jobserver.jobs is not None
+                                    else f'local limit: {jobs}')
+                self.concurrency_message = (
+                    f'Concurrency: {limit_text} compiler jobs '
+                    f'({request_text}, {memory_text}, '
+                    f'{memory.bytes_per_job / GIB:.0f} GB/job estimate)')
+                if jobserver is not None:
+                    self.concurrency_message += ' [shared jobserver]'
+                self.concurrency_message += '\n'
         self.slots = CompilerSlots(limit, memory, jobserver)
         self.jobs = {}
         self.roots = []
@@ -281,8 +306,19 @@ class BuildSession:
         """Print job's buffered bytes, then new bytes until the job completes."""
         offset = 0
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        progress_printed = False
         while True:
             job.changed.clear()
+            if self.progress and job.compilation_description is not None and not progress_printed:
+                self.report_concurrency()
+                message = (f'       [{self.compilations_completed}/{self.compilations_total}] '
+                           f'Building {job.compilation_description}')
+                if (self.output.isatty() and os.environ.get('TERM') != 'dumb'
+                        and not os.environ.get('NO_COLOR')):
+                    message = f'\x1b[32m{message}\x1b[0m'
+                self.output.write(message + '\n')
+                self.output.flush()
+                progress_printed = True
             job.log.seek(offset)
             while data := job.log.read(65536):
                 offset += len(data)

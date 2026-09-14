@@ -210,9 +210,30 @@ check; request that consumer's required modules together.
 
 ## Shared compiler concurrency
 
-Each bridge invocation that compiles sources prints a `Concurrency:` line before
-its first `BUILDING` line, including single-worker Ninja builds. Up-to-date
-invocations omit the banner.
+The custom build step is described as `Building <library> modules` in CMake's
+normal progress output. When compilation is needed, buildtool prints its indented
+concurrency budget, followed by numbered compilation lines:
+
+```text
+[ 50%] Building baselib::baselib modules
+       buildtool concurrency: 8; requested 8; 79 GB available; 2 GB/job estimate
+       [0/1] Building module lib/fmt/fmt.cc
+       [3/8] Building c++ lib/fmt/fmt_impl.cc
+```
+
+These counters mean successful compilations completed / compilations known to
+need rebuilding in this invocation. Cache hits and link commands are excluded;
+newly discovered imports can increase the total. A compilation may already have
+finished when its buffered description is displayed. Descriptions and diagnostics
+retain their logical job order, while the counters reflect work completed at the
+time of display. They do not change CMake's outer percentage or Ninja's step count.
+Progress descriptions are green on a terminal, respecting `NO_COLOR` and
+`TERM=dumb`. Ninja retains its normal buffering of custom-command output.
+Standalone `bt` commands retain their existing `BUILDING` messages.
+
+The concurrency line appears once per bridge invocation that compiles sources,
+including single-worker Ninja builds. Up-to-date invocations omit it. The reported
+concurrency is a ceiling; shared tokens and memory pressure can reduce active work.
 
 The bridge automatically joins any jobserver advertised through `MAKEFLAGS`,
 regardless of the CMake generator. With Unix Makefiles,
@@ -225,11 +246,10 @@ The bridge uses its recipe's implicit slot for one worker and borrows one token
 for each additional active worker. Tokens are returned when compilers finish,
 fail, are cancelled, or wait for imported modules. Importers reacquire a slot
 before resuming. Local CPU and available-memory limits can further reduce the
-number of workers. The concurrency banner marks jobserver-controlled builds;
-its displayed limit is a local ceiling, not a count of currently available tokens.
-The `requested` count comes from Make's advertised `-j` setting and also caps
-the local worker limit. If Make does not advertise a numeric count, the banner
-labels the CPU-based ceiling `local limit` instead of presenting it as a request.
+number of workers. The displayed concurrency is a local ceiling, not a count
+of currently available tokens. The `requested` count comes from the jobserver's
+advertised `-j` setting and also caps the local worker limit. If the jobserver
+does not advertise a numeric count, the line shows `requested unknown`.
 Make dry-run, touch, and question modes do not execute module builds despite the
 jobserver-aware recipe's `+` prefix. Interrupt/termination cleanup stops active
 compiler processes before returning borrowed tokens.

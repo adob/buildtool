@@ -91,10 +91,10 @@ class ParallelBuildTests(unittest.TestCase):
         self.assertEqual(self.calls.count('value.cc'), 1)
         self.assertEqual(target.get_linkflags(), ['-la', '-lb'])
         self.assertEqual(output,
-                         'main.cc: start\nmain.cc: done\n'
-                         'a/a.cc: start\na/a.cc: done\n'
-                         'b/b.cc: start\nb/b.cc: done\n'
-                         'value.cc: start\nvalue.cc: done\n')
+                     'BUILDING c++ main.cc...\nmain.cc: start\nmain.cc: done\n'
+                     'BUILDING c++ a/a.cc...\na/a.cc: start\na/a.cc: done\n'
+                     'BUILDING c++ b/b.cc...\nb/b.cc: start\nb/b.cc: done\n'
+                     'BUILDING module value.cc...\nvalue.cc: start\nvalue.cc: done\n')
 
     def test_incremental_parallel_build_rechecks_shared_module_hash(self):
         """A module edit rebuilds its importers, while a no-op rebuild is silent."""

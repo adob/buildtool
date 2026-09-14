@@ -182,8 +182,8 @@ buildtool_target_modules({name} PRIVATE {'NATIVE_MODULES' if native else ''}
             build = ['cmake', '--build', 'build', '--config', 'Release', '-j4']
             output = run(*build, '--target', 'app')
             # Both consumers trigger bridge jobs, but each module is compiled once.
-            self.assertEqual(output.count('BUILDING module lib/foo.cc'), 1, output)
-            self.assertEqual(output.count('BUILDING module lib/detail.cc'), 1, output)
+            self.assertEqual(output.count('Building module lib/foo.cc'), 1, output)
+            self.assertEqual(output.count('Building module lib/detail.cc'), 1, output)
             providers = [json.loads((bundle(name) / 'providers.json').read_text()) for name in ('a', 'b')]
             self.assertEqual(providers[0]['repository'], providers[1]['repository'])
             self.assertEqual(providers[0]['modules'], providers[1]['modules'])
@@ -194,11 +194,11 @@ buildtool_target_modules({name} PRIVATE {'NATIVE_MODULES' if native else ''}
             run(str(binary_dir / 'app'))
             tracked = [archive, binary_dir / 'app', *pathlib.Path(providers[0]['repository']).rglob('*.o')]
             before = {path: path.stat().st_mtime_ns for path in tracked}
-            self.assertNotIn('BUILDING ', run(*build, '--target', 'app'))
+            self.assertNotIn('Building module ', run(*build, '--target', 'app'))
             self.assertEqual(before, {path: path.stat().st_mtime_ns for path in tracked})
 
             # Different consumer definitions do not change the library compilation.
-            self.assertNotIn('BUILDING ', run(*build, '--target', 'other'))
+            self.assertNotIn('Building module ', run(*build, '--target', 'other'))
             run(str(binary_dir / 'other'))
             different = json.loads((bundle('different') / 'providers.json').read_text())
             self.assertEqual(providers[0]['repository'], different['repository'])
@@ -211,18 +211,18 @@ buildtool_target_modules({name} PRIVATE {'NATIVE_MODULES' if native else ''}
             lock_inode = (library_directory / 'build.lock').stat().st_ino
             manifest = (library_directory / 'root').read_text()
             output = run(*build, '--clean-first', '--target', 'app')
-            self.assertEqual(output.count('BUILDING module lib/foo.cc'), 1, output)
-            self.assertEqual(output.count('BUILDING module lib/detail.cc'), 1, output)
+            self.assertEqual(output.count('Building module lib/foo.cc'), 1, output)
+            self.assertEqual(output.count('Building module lib/detail.cc'), 1, output)
             self.assertEqual((library_directory / 'build.lock').stat().st_ino, lock_inode)
             self.assertEqual((library_directory / 'root').read_text(), manifest)
             run(str(binary_dir / 'app'))
-            self.assertNotIn('BUILDING ', run(*build, '--target', 'app'))
+            self.assertNotIn('Building module ', run(*build, '--target', 'app'))
 
             time.sleep(0.02)
             header.write_text('#pragma once\n#define VALUE 43\n')
             output = run(*build, '--target', 'app')
-            self.assertEqual(output.count('BUILDING module lib/foo.cc'), 1, output)
-            self.assertEqual(output.count('BUILDING module lib/detail.cc'), 1, output)
+            self.assertEqual(output.count('Building module lib/foo.cc'), 1, output)
+            self.assertEqual(output.count('Building module lib/detail.cc'), 1, output)
             self.assertGreater(archive.stat().st_mtime_ns, before[archive])
             self.assertEqual(subprocess.run([str(binary_dir / 'app')]).returncode, 1)
 
@@ -348,16 +348,18 @@ buildtool_target_modules(dep_app PRIVATE LIBRARY dependency MODULES dep.value)
                 run(*build, '--target', 'facade_buildtool_modules_build', '--', '-n')
                 self.assertFalse(list((root / 'build/buildtool/libraries').rglob('artifacts')))
             output = run(*build, '--target', 'app')
-            self.assertEqual(output.count('Concurrency:'), 1, output)
-            self.assertLess(output.index('Concurrency:'), output.index('BUILDING '))
+            self.assertEqual(output.count('buildtool concurrency:'), 1, output)
+            self.assertIn('Building example::library modules', output)
+            self.assertIn('\n       buildtool concurrency:', output)
+            self.assertLess(output.index('buildtool concurrency:'), output.index('Building module '))
+            self.assertRegex(output, r'       \[\d+/\d+\] Building module ')
             if generator == 'Unix Makefiles' or pool_ninja:
-                self.assertIn('[shared jobserver]', output)
-                self.assertIn('requested: 4', output)
+                self.assertIn('buildtool concurrency: 4; requested 4;', output)
             else:
-                self.assertIn('Concurrency: 1 compiler jobs', output)
+                self.assertIn('buildtool concurrency: 1; requested 1;', output)
             run(str(executable))
             # A direct consumer reuses the dependency built through the parent library.
-            self.assertNotIn('BUILDING ', run(*build, '--target', 'dep_app'))
+            self.assertNotIn('Building module ', run(*build, '--target', 'dep_app'))
             run(str(executable.with_name('dep_app')))
             bundle = root / 'build/buildtool/facade_buildtool_modules' / configuration
             response = (bundle / 'consumer.rsp').read_text()
@@ -377,8 +379,8 @@ buildtool_target_modules(dep_app PRIVATE LIBRARY dependency MODULES dep.value)
             objects = list((root / 'build').rglob('*.o'))
             before = {path: path.stat().st_mtime_ns for path in objects}
             output = run(*build)
-            self.assertNotIn('BUILDING ', output)
-            self.assertNotIn('Concurrency:', output)
+            self.assertNotIn('Building module ', output)
+            self.assertNotIn('buildtool concurrency:', output)
             self.assertEqual(before, {path: path.stat().st_mtime_ns for path in objects})
             self.assertEqual(map_mtime, module_map.stat().st_mtime_ns)
             time.sleep(0.02)

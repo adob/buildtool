@@ -180,7 +180,7 @@ def configuration(directory: Path) -> bt.BuildConfig:
     return bt.BuildConfig(CXX=compiler, CC=compiler, CXXFLAGS=compiler_flags(directory), CFLAGS=[],
                           LDFLAGS=[], INCFLAGS=[], SRCDIR='.',
                           OBJDIR=str(artifacts), DEPDIR=str(artifacts / 'deps'), JOBS=1,
-                          memory=bt.MemoryBudget(),
+                          memory=bt.MemoryBudget(), progress=True,
                           STD_HEADER_UNIT=False, USE_DIRECTORY_CONFIG=False, ABSOLUTE_MODULE_PATHS=True)
 
 
