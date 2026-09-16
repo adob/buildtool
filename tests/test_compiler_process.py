@@ -41,6 +41,62 @@ class CompilerProcessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(output.getvalue().count(shlex.join(command)), 1)
                 self.assertIn('buildtool: error:', output.getvalue())
 
+    async def test_disable_announce_suppresses_command_echo(self) -> None:
+        """Module-style runs can keep diagnostics without repeating the command line."""
+        output = io.StringIO()
+        session = BuildSession(output=output)
+        command = [sys.executable, '-c', 'import sys; print("diagnostic", file=sys.stderr); sys.exit(7)']
+
+        async def work(job: Job) -> None:
+            """Run a compiler while suppressing command echoing."""
+            await run_compiler(job, command, announce_command=False)
+
+        session.schedule('compile', work)
+        with self.assertRaises(subprocess.CalledProcessError):
+            await session.finish()
+        self.assertIn('diagnostic\n', output.getvalue())
+        self.assertIn('buildtool: error:', output.getvalue())
+        self.assertNotIn(shlex.join(command), output.getvalue())
+
+    async def test_failure_only_announcement_prints_failed_command(self) -> None:
+        """Quiet module-style runs expose their full invocation only when they fail."""
+        for code, expected_count in (('print("warning")', 0),
+                                     ('import sys; print("error"); sys.exit(7)', 1)):
+            with self.subTest(code=code):
+                output = io.StringIO()
+                session = BuildSession(output=output)
+                command = [sys.executable, '-c', code]
+
+                async def work(job: Job) -> None:
+                    await run_compiler(job, command, announce_command=False,
+                                       announce_on_failure=True)
+
+                session.schedule('compile', work)
+                if expected_count:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        await session.finish()
+                else:
+                    await session.finish()
+                self.assertEqual(output.getvalue().count(shlex.join(command)), expected_count)
+
+    async def test_failure_only_announcement_ignores_dependency_failure(self) -> None:
+        """An importer command stays hidden when its mapper dependency fails."""
+        output = io.StringIO()
+        session = BuildSession(output=output)
+        command = [sys.executable, '-c', 'import time; time.sleep(10)']
+
+        async def protocol(process: asyncio.subprocess.Process) -> None:
+            raise subprocess.CalledProcessError(7, ['dependency-compiler'])
+
+        async def work(job: Job) -> None:
+            await run_compiler(job, command, protocol=protocol,
+                               announce_command=False, announce_on_failure=True)
+
+        session.schedule('compile', work)
+        with self.assertRaises(subprocess.CalledProcessError):
+            await session.finish()
+        self.assertNotIn(shlex.join(command), output.getvalue())
+
     async def test_verbose_echoes_silent_and_captured_commands_once(self) -> None:
         """Verbose mode echoes every launch, without duplicating commands on diagnostics."""
         for code, capture in (('pass', False), ('print("output")', False),

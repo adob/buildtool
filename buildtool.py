@@ -78,8 +78,9 @@ CLANG_SCAND_DEPS = "clang-scan-deps"
 CXX = "g++"
 CC = "gcc"
 
-TESTMAIN = "deps/baselib/lib/testing/testmain.cc"
-BENCHMAIN = "deps/baselib/lib/testing/benchmain.cc"
+# TODO: Fix the build system to avoid needing to hardcode this path.
+TESTMAIN = "third_party/baselib/lib/testing/testmain.cc"
+BENCHMAIN = "third_party/baselib/lib/testing/benchmain.cc"
 
 class Release:
     CFLAGS = CFLAGS + ["-O2", "-mtune=native", 
@@ -1353,7 +1354,9 @@ class SourceFile:
             await run_compiler(self.job, command, protocol=protocol,
                                pass_fds=(read_fd, write_fd),
                                env=dict(os.environ, SOURCE_DATE_EPOCH='0'),
-                               color_diagnostics=True)
+                               color_diagnostics=True,
+                               announce_command=self.type != SourceType.MODULE,
+                               announce_on_failure=self.type == SourceType.MODULE)
         if cfg.VERBOSE:
             self.job.message(f"{self.path} done in {time.perf_counter() - start:.2f} seconds")
 
@@ -1435,7 +1438,9 @@ class SourceFile:
             await self.clang_get_deps(target, cfg)
             module_args = [f'-fmodule-file={name}={path}' for name, path in self.clang_module_files.items()]
             await run_compiler(self.job, self.compiler_cmd_clang(cfg, extra_args=module_args),
-                               color_diagnostics=True)
+                               color_diagnostics=True,
+                               announce_command=self.type != SourceType.MODULE,
+                               announce_on_failure=self.type == SourceType.MODULE)
         if self.std_module_variant:
             object_command = [cfg.CXX, *self.std_header_flags,
                 *[f'-fmodule-file={name}={path}' for name, path in self.clang_module_files.items()],
@@ -1447,7 +1452,9 @@ class SourceFile:
                 await compile_with_mapper_async(self.job, cfg.CLANG_WRAPPER, object_command,
                     lambda request: self.resolve_clang_request(request, target, cfg))
             else:
-                await run_compiler(self.job, object_command, color_diagnostics=True)
+                await run_compiler(self.job, object_command, color_diagnostics=True,
+                                   announce_command=self.type != SourceType.MODULE,
+                                   announce_on_failure=self.type == SourceType.MODULE)
         self.process_makefile_deps()
         return self.deps
 
@@ -1913,7 +1920,6 @@ def find_files(
     # print("file", paths)
     suffixes = tuple(suffixes)  # Convert to tuple for faster checks
     for path in paths:
-        print("file", path)
         if path.is_file(vfs):
             if not path.name.endswith(suffixes):
                 continue

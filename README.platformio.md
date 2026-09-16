@@ -10,16 +10,28 @@ For the local Teensy example:
 lib_deps =
     baselib=symlink://../../deps/baselib
     buildtool=symlink://../../deps/buildtool
-custom_buildtool_modules =
+buildtool_modules =
     lib.types
 ```
 
 Baselib's `library.json` loads its `platformio/build.py` script, which calls
-`platformio_adapter.configure(env, projenv, root)`. Other libraries can use that
-same registration hook, but only one library root is currently supported per
-environment. Library manifests cannot yet request their own module dependencies.
-Baselib disables ordinary PlatformIO source compilation in its manifest; without
-explicit module requests, none of its implementation sources are built.
+`platformio_adapter.configure(env, projenv, root)`. Other libraries use the same
+registration hook; every call in one PlatformIO environment joins a single
+buildtool action, archive, and module map. A library whose sources are ordinary
+C++ files that import modules passes those files as `sources=[...]` and its
+module-providing dependencies as `search_roots=[...]`;
+buildtool compiles the sources, discovers and builds the imported modules and
+header units, and archives everything together. Named modules requested by the
+project are searched in all registered roots. Library manifests cannot yet
+request their own named modules directly.
+Libraries whose module namespace does not mirror their checkout directory can
+map a logical prefix to a source directory with `module_roots`. For example,
+`module_roots={'serialrpc': root}` resolves `serialrpc.server` as `root/server.cc`,
+allowing an application to build the server module without also building client
+sources.
+Registered libraries disable ordinary PlatformIO source compilation; without
+explicit module requests or registered sources, none of their implementation
+sources are built.
 
 Buildtool is a PlatformIO library package containing Python tooling, with C/C++
 source compilation disabled. Baselib declares it as a dependency, so ordinary

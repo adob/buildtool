@@ -75,6 +75,8 @@ async def run_compiler(
     capture: bool = False,
     color_diagnostics: bool = False,
     compilation: bool = True,
+    announce_command: bool = True,
+    announce_on_failure: bool = False,
 ) -> subprocess.CompletedProcess[bytes]:
     """Run command in job; protocol handles mapper requests while output drains.
 
@@ -82,6 +84,8 @@ async def run_compiler(
     without checking status, for tools whose output is machine-readable.
     color_diagnostics enables terminal-aware GCC/Clang diagnostic flags.
     compilation=False shares the job limit without announcing a compilation.
+    announce_on_failure prints a suppressed command only for a compiler exit failure,
+    not when its mapper propagates a dependency failure.
     """
     command = list(map(str, command))
     if color_diagnostics:
@@ -89,16 +93,16 @@ async def run_compiler(
     stdout, stderr = bytearray(), bytearray()
     async with job.compiler_slot(compilation=compilation):
         command_text = shlex.join(command)
-        announced = job.session.verbose
+        announced = job.session.verbose if announce_command else False
 
         def announce() -> None:
-            """Print this invocation once, on output or failure (including mapper failures)."""
+            """Print this invocation once, on visible output or compiler failure."""
             nonlocal announced
             if not announced:
                 job.message(command_text)
                 announced = True
 
-        if job.session.verbose:
+        if job.session.verbose and announce_command:
             job.session.report_launch(command_text)
         process = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.DEVNULL,
@@ -107,19 +111,22 @@ async def run_compiler(
             pass_fds=pass_fds, env=env, start_new_session=True)
         readers = [asyncio.create_task(read_output(
             process.stdout, job, stdout if capture else None,
-            announce))]
+            announce if announce_command else None))]
         if capture:
             readers.append(asyncio.create_task(read_output(process.stderr, job, stderr)))
+        compiler_failed = False
         try:
             if protocol:
                 await protocol(process)
             code = await process.wait()
             await asyncio.gather(*readers)
             if not capture and code:
+                compiler_failed = True
                 raise subprocess.CalledProcessError(code, command)
             return subprocess.CompletedProcess(command, code, bytes(stdout), bytes(stderr))
         except Exception:
-            announce()
+            if announce_command or (announce_on_failure and compiler_failed):
+                announce()
             raise
         finally:
             if process.returncode is None or any(not task.done() for task in readers):
