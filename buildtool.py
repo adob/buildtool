@@ -645,6 +645,7 @@ class Target:
         async def work(job: Job) -> None:
             """Associate source with job before building through the shared caches."""
             source.job = job
+            job.diagnostic_source = str(source.path)
             await source.build(self, self.cfg)
 
         job = self.session.schedule(str(source.output_path), work, parent=parent)
@@ -2564,6 +2565,7 @@ def _main(
         JOBS=getattr(args, "jobs", 1),
         REBUILD=getattr(args, 'rebuild', False),
         VERBOSE=args.verbose,
+        progress=True,
         STD_HEADER_UNIT=not getattr(args, 'no_std_header_unit', False),
         memory=MemoryBudget() if args.cmd in ('build', 'run', 'test', 'bench') else None,
         vfs=vfs,
@@ -2658,7 +2660,7 @@ def main(*args: Any, **kwargs: Any) -> None:
         return _main(*args, **kwargs)
     except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
         if not getattr(error, 'buildtool_reported', False):
-            warn(error)
+            warn(f'buildtool: error: {error}')
         raise SystemExit(max(1, getattr(error, 'returncode', 1))) from None
     except KeyboardInterrupt:
         raise SystemExit(130) from None

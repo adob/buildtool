@@ -1,0 +1,9 @@
+{
+    "name": "buildtool",
+    "version": "0.0.0",
+    "description": "C++ module build integration for PlatformIO",
+    "build": {
+        "srcDir": ".",
+        "srcFilter": "-<*>"
+    }
+}

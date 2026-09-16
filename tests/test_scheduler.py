@@ -179,7 +179,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, 'failed'):
             await asyncio.wait_for(session.finish(), 2)
         self.assertTrue(cancelled.is_set())
-        self.assertEqual(output.getvalue(), 'compiler error\nfailed\n')
+        self.assertEqual(output.getvalue(), 'compiler error\nbuildtool: error: failed\n')
 
     async def test_later_failure_does_not_hide_earlier_warnings(self):
         """A failure that finishes early waits behind earlier jobs in the queue."""
@@ -201,7 +201,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         session.schedule('failure', failure)
         with self.assertRaisesRegex(RuntimeError, 'second: error'):
             await session.finish()
-        self.assertEqual(output.getvalue(), 'first: warning\nsecond: error\n')
+        self.assertEqual(output.getvalue(), 'first: warning\nbuildtool: error: second: error\n')
 
     async def test_cycle_reports_error_instead_of_deadlocking(self):
         """A -> B -> A is a cycle; unrelated shared dependencies are not."""

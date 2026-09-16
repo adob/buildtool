@@ -21,14 +21,13 @@ async def read_output(
     stream: asyncio.StreamReader,
     job: Job,
     captured: bytearray | None = None,
-    command: str | None = None,
+    announce: Callable[[], None] | None = None,
 ) -> None:
     """Drain stream into job or captured; prefix displayed output with command once."""
     while data := await stream.read(65536):
         if captured is None:
-            if command is not None:
-                job.message(command)
-                command = None
+            if announce is not None:
+                announce()
             job.write(data)
         else:
             captured.extend(data)
@@ -90,6 +89,15 @@ async def run_compiler(
     stdout, stderr = bytearray(), bytearray()
     async with job.compiler_slot(compilation=compilation):
         command_text = shlex.join(command)
+        announced = job.session.verbose
+
+        def announce() -> None:
+            """Print this invocation once, on output or failure (including mapper failures)."""
+            nonlocal announced
+            if not announced:
+                job.message(command_text)
+                announced = True
+
         if job.session.verbose:
             job.session.report_launch(command_text)
         process = await asyncio.create_subprocess_exec(
@@ -99,7 +107,7 @@ async def run_compiler(
             pass_fds=pass_fds, env=env, start_new_session=True)
         readers = [asyncio.create_task(read_output(
             process.stdout, job, stdout if capture else None,
-            None if job.session.verbose else command_text))]
+            announce))]
         if capture:
             readers.append(asyncio.create_task(read_output(process.stderr, job, stderr)))
         try:
@@ -108,8 +116,11 @@ async def run_compiler(
             code = await process.wait()
             await asyncio.gather(*readers)
             if not capture and code:
-                raise subprocess.CalledProcessError(code, command[0])
+                raise subprocess.CalledProcessError(code, command)
             return subprocess.CompletedProcess(command, code, bytes(stdout), bytes(stderr))
+        except Exception:
+            announce()
+            raise
         finally:
             if process.returncode is None or any(not task.done() for task in readers):
                 await stop_process(process)

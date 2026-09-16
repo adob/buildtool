@@ -5,6 +5,7 @@ import contextlib
 import io
 import os
 import shlex
+import subprocess
 import sys
 import unittest
 
@@ -14,6 +15,32 @@ from scheduler import BuildSession, Job
 
 
 class CompilerProcessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failure_prints_command_and_preserves_status(self) -> None:
+        """Silent failures and mapper errors must expose the invocation and fail the build."""
+        for mapper_failure in (False, True):
+            with self.subTest(mapper_failure=mapper_failure):
+                output = io.StringIO()
+                session = BuildSession(output=output)
+                command = [sys.executable, '-c', 'import sys; sys.exit(7)']
+
+                async def protocol(process: asyncio.subprocess.Process) -> None:
+                    """Simulate a failed module lookup while handling this compiler."""
+                    raise RuntimeError('module example not found')
+
+                async def work(job: Job) -> None:
+                    """Run the compiler with an optional failing mapper protocol."""
+                    await run_compiler(job, command, protocol=protocol if mapper_failure else None)
+
+                session.schedule('compile', work)
+                expected = RuntimeError if mapper_failure else subprocess.CalledProcessError
+                with self.assertRaises(expected) as caught:
+                    await session.finish()
+                if not mapper_failure:
+                    self.assertEqual(caught.exception.returncode, 7)
+                    self.assertEqual(caught.exception.cmd, command)
+                self.assertEqual(output.getvalue().count(shlex.join(command)), 1)
+                self.assertIn('buildtool: error:', output.getvalue())
+
     async def test_verbose_echoes_silent_and_captured_commands_once(self) -> None:
         """Verbose mode echoes every launch, without duplicating commands on diagnostics."""
         for code, capture in (('pass', False), ('print("output")', False),
@@ -198,7 +225,7 @@ class CompilerProcessTests(unittest.IsolatedAsyncioTestCase):
         session.schedule('sibling', sibling)
         with self.assertRaisesRegex(RuntimeError, 'stop now'):
             await asyncio.wait_for(session.finish(), 5)
-        self.assertEqual(output.getvalue(), 'stop now\n')
+        self.assertEqual(output.getvalue(), 'buildtool: error: stop now\n')
         self.assertEqual(len(processes), 1)
         self.assertIsNotNone(processes[0].returncode)
         with self.assertRaises(ProcessLookupError):

@@ -2,13 +2,39 @@
 
 import asyncio
 import io
+import os
 import unittest
+from unittest import mock
 
 from scheduler import BuildSession, Job
 from memory import GIB, MemoryBudget
 
 
 class ProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_colors_respect_environment(self) -> None:
+        """Color progress on terminals unless TERM or NO_COLOR disables it."""
+        class Terminal(io.StringIO):
+            def isatty(self) -> bool:
+                """Simulate terminal output for color selection."""
+                return True
+
+        for environment, colored in (({'TERM': 'xterm'}, True),
+                                     ({'TERM': 'dumb'}, False),
+                                     ({'TERM': 'xterm', 'NO_COLOR': '1'}, False)):
+            with self.subTest(environment=environment), mock.patch.dict(os.environ, environment, clear=True):
+                output = Terminal()
+                session = BuildSession(output=output, progress=True)
+
+                async def work(job: Job) -> None:
+                    """Complete one compilation to emit a progress line."""
+                    job.start_compilation('c++ example.cc')
+                    job.complete_compilation()
+
+                session.schedule('example', work)
+                await session.finish()
+                self.assertIn('[1/1] Building c++ example.cc', output.getvalue())
+                self.assertEqual('\x1b[32m' in output.getvalue(), colored)
+
     async def test_indented_concurrency(self) -> None:
         """Indent the worker ceiling, requested count, rounded memory, and job estimate."""
         for available, details in (
@@ -92,7 +118,7 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
             await session.finish()
         self.assertEqual(session.compilations_completed, 0)
         self.assertEqual(output.getvalue(),
-                         '       [0/1] Building module broken.cc\ncompiler failed\n')
+                         '       [0/1] Building module broken.cc\nbuildtool: error: compiler failed\n')
 
     async def test_up_to_date_build_is_silent(self) -> None:
         """Cache checks produce neither progress descriptions nor counts."""

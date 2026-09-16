@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import sys
 import os
 import tempfile
+import subprocess
 
 if __package__:
     from .jobserver import JobServer
@@ -112,6 +113,7 @@ class Job:
         self.log = tempfile.SpooledTemporaryFile(max_size=1024 * 1024)
         self.size = 0
         self.compilation_description: str | None = None
+        self.diagnostic_source: str | None = None
         self.task = asyncio.create_task(self.run())
 
     def start_compilation(self, description: str) -> None:
@@ -146,7 +148,14 @@ class Job:
             raise
         except Exception as error:
             self.error = error
-            self.message(error)
+            if not getattr(error, 'buildtool_logged', False):
+                if isinstance(error, subprocess.CalledProcessError):
+                    command = error.cmd
+                    compiler = command if isinstance(command, str) else command[0]
+                    self.message(f'buildtool: error: {compiler} failed with exit status {error.returncode}')
+                else:
+                    self.message(f'{self.diagnostic_source or "buildtool"}: error: {error}')
+                error.buildtool_logged = True
         finally:
             self.finished = True
             self.changed.set()

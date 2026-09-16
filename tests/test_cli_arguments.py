@@ -3,6 +3,7 @@
 import contextlib
 import io
 import sys
+import subprocess
 import unittest
 from unittest import mock
 
@@ -10,6 +11,17 @@ import buildtool as bt
 
 
 class CliArgumentTests(unittest.TestCase):
+    def test_compiler_failure_exits_with_compiler_status(self) -> None:
+        """A failed compiler must never turn into a successful CLI exit."""
+        error = subprocess.CalledProcessError(7, ['g++', '-c', 'broken.cc'])
+        error.buildtool_reported = True
+        output = io.StringIO()
+        with mock.patch.object(bt, '_main', side_effect=error), contextlib.redirect_stderr(output):
+            with self.assertRaises(SystemExit) as caught:
+                bt.main()
+        self.assertEqual(caught.exception.code, 7)
+        self.assertEqual(output.getvalue(), '')
+
     def test_clang_specific_configuration_is_not_used_by_gcc(self) -> None:
         """Only --clang selects its extra compilation and linking flags."""
         for flags in ([], ['--clang']):
@@ -19,6 +31,7 @@ class CliArgumentTests(unittest.TestCase):
                 bt.main(vfs=bt.MemoryFileSystem(), CLANG_CXXFLAGS=['--gcc-install-dir=/sdk'],
                         CLANG_LDFLAGS=['-L/sdk/lib'])
                 cfg = build.call_args.args[1]
+                self.assertTrue(cfg.progress)
                 self.assertEqual('--gcc-install-dir=/sdk' in cfg.CXXFLAGS, bool(flags))
                 self.assertEqual('-L/sdk/lib' in cfg.LDFLAGS, bool(flags))
 

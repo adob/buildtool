@@ -14,6 +14,20 @@ import buildtool as bt
 
 
 class ModuleLookupTests(unittest.TestCase):
+    def test_lookup_failure_identifies_source_before_compilation(self) -> None:
+        """A dependency lookup during cache checking still names its importing source."""
+        self.fs.write_text('main.cc', '')
+        output = io.StringIO()
+
+        async def build(source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
+            """Simulate dependency validation without launching a compiler."""
+            target.mod2src('missing', bt.SourceType.MODULE)
+
+        with mock.patch.object(bt.SourceFile, 'build', build), contextlib.redirect_stdout(output):
+            with self.assertRaisesRegex(RuntimeError, 'Unable to locate module missing'):
+                self.target.compile_many([bt.Path('main.cc')])
+        self.assertIn('main.cc: error: Unable to locate module missing', output.getvalue())
+
     def test_tagged_interface_requires_active_tags(self) -> None:
         """Find a qualified interface only when every filename tag is active."""
         self.fs.write_text('deps/base/lib/math/math+zephyr+posix.cc', '')
