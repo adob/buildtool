@@ -225,6 +225,8 @@ class BuildConfig:
     gcc_std_modules: GccStdModules
     std_header_sources: dict[tuple[Path, tuple[str, ...]], SourceFile]
     std_module_sources: dict[tuple[Path, tuple[str, ...]], SourceFile]
+    generated_outputs: dict[Path, GeneratedAction]
+    generated_logical_paths: dict[Path, Path]
 
     def __init__(
         self,
@@ -301,6 +303,8 @@ class BuildConfig:
         self.gcc_std_modules = GccStdModules(vfs)
         self.std_header_sources = {}
         self.std_module_sources = {}
+        self.generated_outputs = {}
+        self.generated_logical_paths = {}
         self.compilation_database_mtime: float | None = None
         self.compilation_database_dirty = False
 
@@ -371,6 +375,8 @@ class BuildConfig:
         self.gcc_std_modules.local_flags.clear()
         self.std_header_sources.clear()
         self.std_module_sources.clear()
+        self.generated_outputs.clear()
+        self.generated_logical_paths.clear()
 
 class TargetType(Enum):
     EXECUTABLE = 1
@@ -826,7 +832,57 @@ class Target:
             return Path(await self.cfg.gcc_std_modules.resolve(
                 name, self.cfg.CXX, flags, str(self.cfg.DEPDIR / 'gcc-std-modules'), parent,
                 clang=self.cfg.USECLANG))
-        return self.mod2src(name, type)
+        try:
+            return self.mod2src(name, type)
+        except RuntimeError as error:
+            if (type != SourceType.MODULE or not self.cfg.USE_DIRECTORY_CONFIG
+                    or not str(error).startswith(f'Unable to locate module {name}:')):
+                raise
+            generated = await self.resolve_generated_module_source(name, parent)
+            if generated is not None:
+                return generated
+            raise
+
+    def module_lookup_candidates(self, modname: str) -> list[Path]:
+        """Return explicit module layouts in lookup order, without filesystem probing."""
+        path = mod2path(modname, SourceType.MODULE)
+        if path.is_absolute():
+            return [path]
+        roots = [self.cfg.SRCDIR, *self.cfg.INCFLAGS]
+        tagged_partition = tagged_partition_path(modname)
+        result = []
+        for base_path in roots:
+            if isinstance(base_path, str):
+                base_path = base_path.removeprefix('-I').removeprefix('-iquote')
+                base_path = Path(base_path)
+            full_path = base_path / path
+            directory = full_path.with_suffix('')
+            candidates = [full_path, directory / 'module.cc', directory / full_path.name]
+            if tagged_partition is not None:
+                candidates.append(base_path / tagged_partition)
+            for candidate in candidates:
+                if candidate not in result:
+                    result.append(candidate)
+        return result
+
+    async def resolve_generated_module_source(self, modname: str, parent: Job) -> Path | None:
+        """Materialize a declared generated module after all source-tree layouts fail."""
+        cfg = self.cfg
+        for candidate in self.module_lookup_candidates(modname):
+            logical = source_relative_path(candidate, cfg)
+            if logical is None:
+                continue
+            owner = cfg.SRCDIR / logical.parent
+            DirectoryConfig.get(owner, cfg, log=parent)
+            action = cfg.generated_outputs.get(logical)
+            if action is None:
+                continue
+            await action.materialize(self, parent)
+            physical = action.physical_path(logical)
+            if not physical.is_file(cfg.vfs):
+                raise RuntimeError(f'Generated module output does not exist: {physical}')
+            return physical
+        return None
 
     def mod2src(self, modname: str | None, type: SourceType,
                 *, search_roots: Iterable[Path | str] | None = None) -> Path:
@@ -961,9 +1017,11 @@ class SourceFile:
         inherited_dircfg: DirectoryConfig | None = None,
     ) -> None:
         self.cfg = cfg
-        cfg.check_database_timestamp(path)
+        logical_path = cfg.generated_logical_paths.get(path, path)
+        cfg.check_database_timestamp(logical_path)
         self.path         = path
-        self.dirname      = path.parent
+        self.logical_path = logical_path
+        self.dirname      = logical_path.parent
         self.type         = type
         self.modname      = modname
         self.processed    = False
@@ -977,10 +1035,10 @@ class SourceFile:
         self.clang_exported_module: str | None = None
         self.cmhash = None
 
-        if path.is_absolute():
-            file_parts = list(path.parts)
+        if logical_path.is_absolute():
+            file_parts = list(logical_path.parts)
         else:
-            file_parts = list(path.relative_to(cfg.SRCDIR).parts)
+            file_parts = list(logical_path.relative_to(cfg.SRCDIR).parts)
 
         for i, part in enumerate(file_parts):
             if part == "..":
@@ -990,13 +1048,22 @@ class SourceFile:
         self.objpath     = cfg.OBJDIR / file.with_suffix('.o')
 
         if modname and not (cfg.USECLANG and cfg.CLANG_WRAPPER and type == SourceType.MODULE):
-            self.cmpath  = cfg.OBJDIR / mod2cm(modname, cfg.SRCDIR)
+            cmname = modname
+            if path != logical_path and type in (SourceType.USER_HEADER, SourceType.SYSTEM_HEADER):
+                cmname = './' + str(logical_path)
+            self.cmpath  = cfg.OBJDIR / mod2cm(cmname, cfg.SRCDIR)
         else:
             self.cmpath  = cfg.OBJDIR / file.with_suffix(".pcm")
         
         self.output_path = self.cmpath if self.type in [SourceType.USER_HEADER, SourceType.SYSTEM_HEADER, SourceType.GENERATED_HEADER] else self.objpath
-        self.infofile    = cfg.OBJDIR / file.with_suffix(".info")
-        self.makefile    = cfg.OBJDIR / file.with_suffix(".make")
+        if path != logical_path:
+            # Generated header/source siblings (for example foo.pb.h/foo.pb.cc)
+            # must not overwrite each other's dependency metadata.
+            self.infofile = cfg.OBJDIR / file.with_extra_suffix(".info")
+            self.makefile = cfg.OBJDIR / file.with_extra_suffix(".make")
+        else:
+            self.infofile = cfg.OBJDIR / file.with_suffix(".info")
+            self.makefile = cfg.OBJDIR / file.with_suffix(".make")
         self.mtime       = self.path.mtime(cfg.vfs)
         # Preserve dependency encounter order while deduplicating headers.
         self.deps        = {}
@@ -1228,6 +1295,11 @@ class SourceFile:
 
             cflags = map(lambda flag: re.sub(self.IFLAG_RE, '-idirafter', flag, count=1), cflags)
             flags.extend(cflags)
+
+        if self.path != self.logical_path:
+            # A generated source physically lives below OBJDIR, but quoted
+            # source-tree includes retain the semantics of its logical package.
+            flags.append('-iquote' + str(self.dirname))
 
         dirparts = list(self.dirname.parts)
         self.add_include(dirparts, flags)
@@ -1668,8 +1740,166 @@ class ModuleDep:
         self.sha256 = sha256
         self.type = type
 
+
+def source_relative_path(path: Path, cfg: BuildConfig) -> Path | None:
+    """Return path relative to SRCDIR, or None when it lies outside the source tree."""
+    absolute = pathlib.Path(cfg.vfs.abspath(path))
+    root = pathlib.Path(cfg.vfs.abspath(cfg.SRCDIR))
+    try:
+        return Path(absolute.relative_to(root))
+    except ValueError:
+        return None
+
+
+class GeneratedAction:
+    """One declared command producing fixed logical source-tree outputs."""
+
+    def __init__(self, owner: Path, spec: object, cfg: BuildConfig) -> None:
+        if not isinstance(spec, dict):
+            raise ValueError(f'GENERATED entries in {owner}/BUILD.py must be dictionaries')
+        unknown = set(spec) - {'inputs', 'outputs', 'command', 'tools'}
+        if unknown:
+            raise ValueError(f'Unknown GENERATED keys in {owner}/BUILD.py: {", ".join(sorted(unknown))}')
+        inputs, outputs, command, tools = (
+            spec.get('inputs', []), spec.get('outputs'), spec.get('command'), spec.get('tools', []))
+        if not isinstance(inputs, list) or not all(isinstance(value, str) for value in inputs):
+            raise ValueError(f'GENERATED inputs in {owner}/BUILD.py must be a list of paths')
+        if not isinstance(outputs, list) or not outputs or not all(isinstance(value, str) for value in outputs):
+            raise ValueError(f'GENERATED outputs in {owner}/BUILD.py must be a non-empty list of paths')
+        if not isinstance(command, list) or not command or not all(isinstance(value, str) for value in command):
+            raise ValueError(f'GENERATED command in {owner}/BUILD.py must be a non-empty argument list')
+        if not isinstance(tools, list) or not all(isinstance(value, str) for value in tools):
+            raise ValueError(f'GENERATED tools in {owner}/BUILD.py must be a list of executables')
+
+        self.owner = owner
+        self.inputs = tuple(self._input_path(value) for value in inputs)
+        self.outputs = tuple(self._output_path(value) for value in outputs)
+        self.command = tuple(command)
+        self.tools = tuple(tools)
+        self.cfg = cfg
+
+        for output in self.outputs:
+            previous = cfg.generated_outputs.get(output)
+            if previous is not None and previous is not self:
+                raise ValueError(f'Generated output {output} has multiple producers')
+            cfg.generated_outputs[output] = self
+            cfg.generated_logical_paths[self.physical_path(output)] = cfg.SRCDIR / output
+
+    def _input_path(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            raise ValueError(f'Generated input must be relative to {self.owner}: {value}')
+        logical = self.owner / path
+        if logical.parts and logical.parts[0] == '..':
+            raise ValueError(f'Generated input escapes the source tree: {value}')
+        return logical
+
+    def _output_path(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute() or str(path.parent) != '.':
+            raise ValueError(f'Generated output must be an immediate child of {self.owner}: {value}')
+        return self.owner / path
+
+    def physical_path(self, logical: Path) -> Path:
+        """Return this configuration's materialized path for logical."""
+        return self.cfg.OBJDIR / 'generated' / logical
+
+    def state_path(self) -> Path:
+        identity = hashlib.sha256('\0'.join(map(str, self.outputs)).encode()).hexdigest()[:20]
+        return self.cfg.DEPDIR / 'generated-actions' / (identity + '.json')
+
+    def expanded_command(self) -> list[str]:
+        """Expand stable directory placeholders without shell interpretation."""
+        cfg = self.cfg
+        substitutions = {
+            '{outdir}': cfg.vfs.abspath(cfg.OBJDIR / 'generated' / self.owner),
+            '{srcdir}': cfg.vfs.abspath(cfg.SRCDIR / self.owner),
+            '{root}': cfg.vfs.abspath(cfg.SRCDIR),
+        }
+        command = []
+        for argument in self.command:
+            for key, value in substitutions.items():
+                argument = argument.replace(key, value)
+            command.append(argument)
+        return command
+
+    def executable_identity(self, tool: str) -> list[str | int]:
+        """Identify one generator executable so tool upgrades invalidate outputs."""
+        cfg = self.cfg
+        if os.path.dirname(tool):
+            candidate = tool if os.path.isabs(tool) else os.path.join(
+                cfg.vfs.abspath(cfg.SRCDIR / self.owner), tool)
+            executable = candidate if cfg.vfs.is_file(candidate) else None
+        else:
+            executable = cfg.vfs.which(tool)
+        if executable is None:
+            raise FileNotFoundError(f'Generator tool {tool!r} not found')
+        path = cfg.vfs.realpath(executable)
+        status = cfg.vfs.stat(path)
+        return [path, status.st_mtime_ns, status.st_size]
+
+    def tool_identities(self, command: Sequence[str]) -> list[list[str | int]]:
+        """Identify the command executable and any additionally declared tools."""
+        return [self.executable_identity(tool) for tool in (command[0], *self.tools)]
+
+    def identity(self, command: Sequence[str]) -> dict[str, object]:
+        """Hash declared inputs plus command/tool identity for incremental generation."""
+        cfg = self.cfg
+        inputs = {}
+        for logical in self.inputs:
+            path = cfg.SRCDIR / logical
+            if not path.is_file(cfg.vfs):
+                raise FileNotFoundError(f'Generated input not found: {path}')
+            inputs[str(logical)] = sha256_file(path, cfg.vfs)
+        return {
+            'command': list(command),
+            'tools': self.tool_identities(command),
+            'inputs': inputs,
+        }
+
+    def current(self, identity: dict[str, object]) -> bool:
+        """Return whether all outputs exist and their recorded action identity matches."""
+        cfg = self.cfg
+        if cfg.REBUILD or any(not self.physical_path(output).is_file(cfg.vfs) for output in self.outputs):
+            return False
+        try:
+            return json.loads(self.state_path().read_text(cfg.vfs)) == identity
+        except FileNotFoundError:
+            return False
+
+    async def build(self, job: Job) -> None:
+        """Materialize all outputs once when this action's identity is stale."""
+        cfg = self.cfg
+        command = self.expanded_command()
+        identity = self.identity(command)
+        if self.current(identity):
+            return
+        for output in self.outputs:
+            cfg.vfs.makedirs(self.physical_path(output).parent, exist_ok=True)
+        job.message('GENERATING', ', '.join(map(str, self.outputs)))
+        await run_compiler(
+            job, command, cwd=cfg.vfs.abspath(cfg.SRCDIR / self.owner), compilation=False,
+            announce_command=cfg.VERBOSE, announce_on_failure=True)
+        missing = [output for output in self.outputs if not self.physical_path(output).is_file(cfg.vfs)]
+        if missing:
+            raise RuntimeError('Generator did not produce declared outputs: ' + ', '.join(map(str, missing)))
+        cfg.vfs.makedirs(self.state_path().parent, exist_ok=True)
+        atomic_write(self.state_path(), json.dumps(identity, indent=2, sort_keys=True) + '\n', cfg.vfs)
+
+    async def materialize(self, target: Target, parent: Job) -> None:
+        """Share this generation action in target's current scheduler and await it."""
+        key = ('generate', tuple(map(str, self.outputs)))
+
+        async def work(job: Job) -> None:
+            job.diagnostic_source = str(self.owner / 'BUILD.py')
+            await self.build(job)
+
+        dependency = target.session.schedule(key, work, parent=parent)
+        await parent.wait_for_dependency(dependency)
+
+
 class DirectoryConfig:
-    CACHE_VERSION = 2
+    CACHE_VERSION = 3
 
     @classmethod
     def get(cls, path: Path, cfg: BuildConfig, log: Job | None = None) -> DirectoryConfig:
@@ -1721,7 +1951,7 @@ class DirectoryConfig:
             exec(code, env)
 
             out = {}
-            ALLOWED = ('LDFLAGS', 'CFLAGS', 'PKGCONFIG', 'EXPLICIT_SOURCES')
+            ALLOWED = ('LDFLAGS', 'CFLAGS', 'PKGCONFIG', 'EXPLICIT_SOURCES', 'GENERATED')
             for key, val in env.items():
                 if key in ALLOWED:
                     out[key] = val
@@ -1739,6 +1969,11 @@ class DirectoryConfig:
             atomic_write(json_file, json.dumps(cached, indent=2), self.cfg.vfs)
         else:
             self.buildvars = cached['buildvars']
+
+        generated = self.buildvars.get('GENERATED', [])
+        if not isinstance(generated, list):
+            raise ValueError(f'GENERATED in {buildpy_file} must be a list')
+        self.generators = [GeneratedAction(self.dir, spec, self.cfg) for spec in generated]
 
         if 'LDFLAGS' in self.buildvars:
             self.linkflags = self.buildvars['LDFLAGS']

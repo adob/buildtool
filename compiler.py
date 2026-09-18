@@ -72,6 +72,7 @@ async def run_compiler(
     protocol: Callable[[asyncio.subprocess.Process], Awaitable[None]] | None = None,
     pass_fds: Sequence[int] = (),
     env: Mapping[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
     capture: bool = False,
     color_diagnostics: bool = False,
     compilation: bool = True,
@@ -80,7 +81,7 @@ async def run_compiler(
 ) -> subprocess.CompletedProcess[bytes]:
     """Run command in job; protocol handles mapper requests while output drains.
 
-    pass_fds and env configure the child. capture returns stdout/stderr bytes
+    pass_fds, env, and cwd configure the child. capture returns stdout/stderr bytes
     without checking status, for tools whose output is machine-readable.
     color_diagnostics enables terminal-aware GCC/Clang diagnostic flags.
     compilation=False shares the job limit without announcing a compilation.
@@ -108,7 +109,7 @@ async def run_compiler(
             *command, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE if capture else asyncio.subprocess.STDOUT,
-            pass_fds=pass_fds, env=env, start_new_session=True)
+            pass_fds=pass_fds, env=env, cwd=cwd, start_new_session=True)
         readers = [asyncio.create_task(read_output(
             process.stdout, job, stdout if capture else None,
             announce if announce_command else None))]

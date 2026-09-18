@@ -22,3 +22,40 @@ Named module lookup also accepts active `+tag` variants when no unqualified
 module layout exists in that search root. For example, `import lib.serial.usbio`
 can resolve `lib/serial/usbio+zephyr.cc` when the `zephyr` tag is active. More than
 one matching active variant is an error; buildtool does not guess between them.
+
+## Generated module sources
+
+`BUILD.py` may declare generated files owned by that directory. The initial
+implementation resolves these declarations lazily for named C++ module imports;
+generated textual `#include` files are not yet supported.
+
+```python
+GENERATED = [{
+    "inputs": ["schema.txt", "gen.py"],
+    "outputs": ["foo.cc"],
+    "tools": ["protoc"],
+    "command": ["python3", "gen.py", "schema.txt", "{outdir}/foo.cc"],
+}]
+```
+
+Inputs and outputs are relative to the directory containing `BUILD.py`. Outputs
+must be immediate children of that directory and each logical output may have
+only one producer. Commands run in the `BUILD.py` directory without a shell.
+The following substitutions are available in command arguments:
+
+- `{outdir}`: the absolute generated-output directory for this package
+- `{srcdir}`: the absolute source directory containing `BUILD.py`
+- `{root}`: the absolute source root
+
+If `import pkg.foo;` cannot resolve any ordinary source layout, Buildtool checks
+the `BUILD.py` owning each logical candidate. A declaration for `pkg/foo.cc`
+materializes it at `build/<configuration>/generated/pkg/foo.cc`, then compiles
+that physical source as the requested module. Ordinary source files always take
+precedence over generated declarations.
+
+Generation is incremental. Buildtool records the expanded command, generator
+executable identity, identities of optional `tools`, and hashes of declared
+inputs; changing any of these, or removing an output, reruns the action. Use
+`tools` for executables invoked indirectly by a generator wrapper, such as a
+Python script that runs `protoc`. Multiple imports of outputs from the same
+action share one generation job.
