@@ -120,6 +120,62 @@ class ModuleLookupTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Unable to locate module'):
             self.target.mod2src('lib/math.h', bt.SourceType.USER_HEADER)
 
+    def test_partition_variant_maps_dots_to_filename_tags(self) -> None:
+        """Dots in a partition select +tag source variants without changing module paths."""
+        self.fs.write_text('deps/base/lib/math/core+zephyr.cc', '')
+        self.fs.write_text('deps/base/lib/math/core+zephyr+debug.cc', '')
+        self.assertEqual(bt.mod2path('lib.math:core.zephyr', bt.SourceType.MODULE),
+                         bt.Path('lib/math/core+zephyr.cc'))
+        self.assertEqual(bt.mod2path('lib.math:core.zephyr.debug', bt.SourceType.MODULE),
+                         bt.Path('lib/math/core+zephyr+debug.cc'))
+        self.assertEqual(self.target.mod2src('lib.math:core.zephyr', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math/core+zephyr.cc'))
+        self.assertEqual(self.target.mod2src('lib.math:core.zephyr.debug', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math/core+zephyr+debug.cc'))
+
+    def test_partition_falls_back_to_tagged_primary_source(self) -> None:
+        """A partition may select a +tag variant beside the primary module source."""
+        self.fs.write_text('deps/base/lib/math+zephyr.cc', '')
+        self.fs.write_text('deps/base/lib/math+zephyr+debug.cc', '')
+        self.cfg.TAGS = {'linux'}
+        self.assertEqual(self.target.mod2src('lib.math:zephyr', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math+zephyr.cc'))
+        self.assertEqual(self.target.mod2src('lib.math:zephyr.debug', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math+zephyr+debug.cc'))
+
+    def test_structural_partition_precedes_tagged_primary_fallback(self) -> None:
+        """Keep the conventional partition layout ahead of the +tag primary layout."""
+        self.fs.write_text('deps/base/lib/math/zephyr.cc', '')
+        self.fs.write_text('deps/base/lib/math+zephyr.cc', '')
+        self.assertEqual(self.target.mod2src('lib.math:zephyr', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math/zephyr.cc'))
+
+    def test_explicit_partition_variant_ignores_active_source_tags(self) -> None:
+        """An explicit partition variant remains addressable even when its +tag is inactive."""
+        path = bt.Path('deps/base/lib/math/core+zephyr.cc')
+        self.fs.write_text(str(path), '')
+        self.cfg.TAGS = {'linux'}
+        self.cfg.KNOWN_TAGS = {'linux'}
+        self.assertEqual(self.target.mod2src('lib.math:core.zephyr', bt.SourceType.MODULE), path)
+        source = bt.SourceFile.get(path, self.cfg, type=bt.SourceType.MODULE,
+                                   modname='lib.math:core.zephyr')
+        self.assertEqual(source.path, path)
+
+        tagged_primary = bt.Path('deps/base/lib/math+zephyr.cc')
+        self.fs.write_text(str(tagged_primary), '')
+        self.assertEqual(self.target.mod2src('lib.math:zephyr', bt.SourceType.MODULE), tagged_primary)
+        source = bt.SourceFile.get(tagged_primary, self.cfg, type=bt.SourceType.MODULE,
+                                   modname='lib.math:zephyr')
+        self.assertEqual(source.path, tagged_primary)
+
+    def test_ordinary_partition_keeps_existing_path_mapping(self) -> None:
+        """Partitions without dots continue mapping directly to a same-directory .cc file."""
+        self.fs.write_text('deps/base/lib/math/core.cc', '')
+        self.assertEqual(bt.mod2path('lib.math:core', bt.SourceType.MODULE),
+                         bt.Path('lib/math/core.cc'))
+        self.assertEqual(self.target.mod2src('lib.math:core', bt.SourceType.MODULE),
+                         bt.Path('deps/base/lib/math/core.cc'))
+
 
 class ModuleLookupCompilerTests(unittest.TestCase):
     def exercise(self, compiler: str, wrapper: str | None = None, ldflags: str = '') -> None:

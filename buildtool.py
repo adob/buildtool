@@ -143,6 +143,46 @@ def source_matches_target(path: Path, cfg: BuildConfig) -> bool:
         raise ValueError(f'Unknown build tags in {path}: {", ".join(sorted(unknown))}')
     return tags <= cfg.TAGS
 
+
+def tagged_partition_path(modname: str | None) -> Path | None:
+    """Map a module partition to a +tag variant of its primary source.
+
+    For example, ``lib.sync.cond:teensy`` maps to
+    ``lib/sync/cond+teensy.cc`` and ``lib.sync.cond:teensy.debug`` maps to
+    ``lib/sync/cond+teensy+debug.cc``.  This is an alternate lookup layout;
+    the conventional partition layout remains preferred.
+    """
+    if not modname or ':' not in modname:
+        return None
+    module, partition = modname.split(':', 1)
+    if not partition:
+        return None
+    return Path(module.replace('.', '/') + '+' + partition.replace('.', '+') + '.cc')
+
+
+def module_partition_selects_variant(path: Path, modname: str | None) -> bool:
+    """Return whether path is explicitly selected by modname's partition.
+
+    A dotted module partition is mapped to filename tags, for example
+    ``lib.sync:mutex.linux`` resolves to ``lib/sync/mutex+linux.cc``.  Such an
+    explicit import is authoritative even when ``linux`` is not an active
+    Buildtool source tag; source tags continue to filter automatic/root source
+    selection only.  A tagged-primary fallback such as
+    ``lib.sync.cond:teensy`` -> ``lib/sync/cond+teensy.cc`` is also explicit.
+    """
+    if not modname or ':' not in modname:
+        return False
+    _, partition = modname.split(':', 1)
+    candidates = []
+    if '.' in partition:
+        candidates.append(mod2path(modname, SourceType.MODULE))
+    tagged = tagged_partition_path(modname)
+    if tagged is not None:
+        candidates.append(tagged)
+    return any(len(path.parts) >= len(candidate.parts)
+               and path.parts[-len(candidate.parts):] == candidate.parts
+               for candidate in candidates)
+
 THIS_MTIME = 0
 
 # Generate the representation while retaining custom initialization and identity.
@@ -792,6 +832,9 @@ class Target:
                 *, search_roots: Iterable[Path | str] | None = None) -> Path:
         """Find modname/type in search_roots, defaulting to source/include directories."""
         path = mod2path(modname, type)
+        dotted_partition_variant = (type == SourceType.MODULE and modname is not None
+                                    and ':' in modname and '.' in modname.split(':', 1)[1])
+        tagged_partition = tagged_partition_path(modname) if type == SourceType.MODULE else None
         failed = []
 
         if path.is_absolute():
@@ -812,11 +855,13 @@ class Target:
                     candidates.append(directory / 'module.cc')
                 candidates.append(directory / full_path.name)
                 for candidate in candidates:
-                    if candidate.is_file(self.cfg.vfs) and source_matches_target(candidate, self.cfg):
+                    if (candidate.is_file(self.cfg.vfs)
+                            and (dotted_partition_variant or source_matches_target(candidate, self.cfg))):
                         return candidate
                     failed.append(str(candidate))
                 for candidate in candidates:
-                    if type == SourceType.MODULE and candidate.parent.is_dir(self.cfg.vfs):
+                    if (type == SourceType.MODULE and not dotted_partition_variant
+                            and candidate.parent.is_dir(self.cfg.vfs)):
                         # Tagged interfaces retain the logical module name. Only
                         # scan after all unqualified layouts in this root fail.
                         variants = sorted(
@@ -830,6 +875,11 @@ class Target:
                                                + ", ".join(map(str, variants)))
                         if variants:
                             return variants[0]
+                if tagged_partition is not None:
+                    tagged_candidate = base_path / tagged_partition
+                    if tagged_candidate.is_file(self.cfg.vfs):
+                        return tagged_candidate
+                    failed.append(str(tagged_candidate))
 
         raise RuntimeError(f"Unable to locate module {modname}: " + ", ".join(failed))
 
@@ -842,7 +892,8 @@ class SourceFile:
         modname: str | None = None,
         inherited_dircfg: DirectoryConfig | None = None,
     ) -> SourceFile:
-        if not source_matches_target(path, cfg):
+        if not (type == SourceType.MODULE and module_partition_selects_variant(path, modname)) \
+                and not source_matches_target(path, cfg):
             raise RuntimeError(f'Source {path} requires inactive build tags (active: {", ".join(sorted(cfg.TAGS))})')
         std_header = type == SourceType.SYSTEM_HEADER and str(path).endswith('/bits/stdc++.h')
         std_module = type == SourceType.MODULE and modname in ('std', 'std.compat') and path.is_absolute()
@@ -2020,12 +2071,12 @@ def mod2path(modname: str | None, type: SourceType) -> Path:
     if modname.startswith('./'):
         return Path(modname)
 
-    # puts "modname #{modname.inspect}"
-    path = modname.replace('.', '/')
-
     if ':' in modname:
-        path = path.replace(':', '/')
-        
+        module, partition = modname.split(':', 1)
+        path = module.replace('.', '/') + '/' + partition.replace('.', '+')
+    else:
+        path = modname.replace('.', '/')
+
     return Path(path + '.cc')
     
     # srcfile =  SRCDIR / path + ".cc"
