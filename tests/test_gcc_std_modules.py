@@ -229,8 +229,8 @@ class RealStandardModuleTests(unittest.TestCase):
                     return cfg, output.getvalue()
 
                 cfg, output = build()
-                self.assertEqual(output.count('BUILDING module'), 2)
-                self.assertEqual(output.count('BUILDING system header'), 1)
+                self.assertEqual(output.count('BUILT module'), 2)
+                self.assertEqual(output.count('BUILT system header'), 1)
                 self.assertEqual(len(cfg.std_module_sources), 2)
                 for source in cfg.std_module_sources.values():
                     self.assertTrue(Path(str(source.objpath)).is_file())
@@ -246,15 +246,15 @@ class RealStandardModuleTests(unittest.TestCase):
                     source.write('// edit only the importer\n')
                 with mock.patch.object(gcc_std, 'run_compiler', side_effect=AssertionError('unexpected discovery')):
                     output = build()[1]
-                self.assertEqual(output.count('BUILDING c++'), 1)
-                self.assertNotIn('BUILDING module', output)
-                self.assertNotIn('BUILDING system header', output)
+                self.assertEqual(output.count('BUILT c++'), 1)
+                self.assertNotIn('BUILT module', output)
+                self.assertNotIn('BUILT system header', output)
                 output = build(rebuild=True)[1]
-                self.assertEqual(output.count('BUILDING module'), 2)
-                self.assertEqual(output.count('BUILDING system header'), 1)
+                self.assertEqual(output.count('BUILT module'), 2)
+                self.assertEqual(output.count('BUILT system header'), 1)
                 output = build(header_unit=False)[1]
-                self.assertEqual(output.count('BUILDING module'), 2)
-                self.assertNotIn('BUILDING system header', output)
+                self.assertEqual(output.count('BUILT module'), 2)
+                self.assertNotIn('BUILT system header', output)
                 self.assertEqual(subprocess.check_output(['build/release/bin/main'], text=True), '3\n')
                 self.assertEqual(build(header_unit=False)[1], '')
             finally:

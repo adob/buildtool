@@ -1,7 +1,9 @@
 """Regression coverage for dependency flags populated after library discovery."""
 
+import asyncio
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -45,6 +47,68 @@ class PlatformIOAdapterTests(unittest.TestCase):
                          bt.Path('deps/serialrpc/serialrpc.cc'))
         self.assertEqual(target.mod2src('serialrpc.server', bt.SourceType.MODULE),
                          bt.Path('deps/serialrpc/server.cc'))
+
+    def test_mapped_module_falls_back_to_library_generated_action(self) -> None:
+        """A mapped library may materialize a missing module through its own BUILD.py."""
+        fs = bt.MemoryFileSystem()
+        fs.makedirs('deps/serialrpc/generated')
+        fs.makedirs('/tools')
+        fs.write_text('/tools/gen', 'generator')
+        fs.write_text(
+            'deps/serialrpc/generated/BUILD.py',
+            '''GENERATED = [{
+    "outputs": ["serialrpc_protocol/msg.cc"],
+    "command": ["/tools/gen", "{outdir}/serialrpc_protocol/msg.cc"],
+}]\n''',
+        )
+        cfg = bt.BuildConfig(
+            vfs=fs, SRCDIR='.', OBJDIR='build/target', DEPDIR='build/target/deps',
+            USE_DIRECTORY_CONFIG=False, STD_HEADER_UNIT=False,
+        )
+        generated_cfg = bt.BuildConfig(
+            vfs=fs, SRCDIR='deps/serialrpc', OBJDIR='build/generated',
+            DEPDIR='build/generated/deps', STD_HEADER_UNIT=False,
+        )
+        target = LibraryTarget(
+            cfg, [], {'serialrpc': 'deps/serialrpc'}, {'serialrpc': generated_cfg})
+
+        async def generate(job: bt.Job, command: list[str], **kwargs: object):
+            output = bt.Path(command[-1])
+            fs.makedirs(output.parent, exist_ok=True)
+            fs.write_text(output, 'export module serialrpc.generated.serialrpc_protocol.msg;\n')
+            return subprocess.CompletedProcess(command, 0, b'', b'')
+
+        async def run() -> bt.Path:
+            graph = bt.CompilationGraph(cfg)
+            target.session = graph.session
+            target.job_sources = graph.job_sources
+            target.link_events = graph.link_events
+            result: bt.Path | None = None
+
+            async def resolve(job: bt.Job) -> None:
+                nonlocal result
+                result = await target.resolve_module_source(
+                    'serialrpc.generated.serialrpc_protocol.msg',
+                    bt.SourceType.MODULE, None, job)
+
+            try:
+                root = graph.session.schedule('resolve', resolve)
+                await graph.session.finish()
+                if root.error:
+                    raise root.error
+                assert result is not None
+                return result
+            finally:
+                await graph.session.close()
+                target.session = None
+
+        with patch.object(bt, 'run_compiler', side_effect=generate):
+            path = asyncio.run(run())
+        self.assertEqual(
+            path, bt.Path('build/generated/generated/generated/serialrpc_protocol/msg.cc'))
+        self.assertEqual(
+            cfg.generated_logical_paths[path],
+            bt.Path('__generated__/serialrpc/generated/serialrpc_protocol/msg.cc'))
 
     def test_dependency_flags_are_read_at_action_time(self) -> None:
         """Includes added after registration must reach both module compiler commands."""

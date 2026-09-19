@@ -90,11 +90,17 @@ class ParallelBuildTests(unittest.TestCase):
         self.assertEqual(self.maximum_active, 2)
         self.assertEqual(self.calls.count('value.cc'), 1)
         self.assertEqual(target.get_linkflags(), ['-la', '-lb'])
-        self.assertEqual(output,
-                     'BUILDING c++ main.cc...\nmain.cc: start\nmain.cc: done\n'
-                     'BUILDING c++ a/a.cc...\na/a.cc: start\na/a.cc: done\n'
-                     'BUILDING c++ b/b.cc...\nb/b.cc: start\nb/b.cc: done\n'
-                     'BUILDING module value.cc...\nvalue.cc: start\nvalue.cc: done\n')
+        lines = output.splitlines()
+        for description in ('c++ main.cc', 'c++ a/a.cc', 'c++ b/b.cc', 'module value.cc'):
+            self.assertIn(f'BUILT {description}', lines)
+        # Diagnostics retain dependency-order buffering even though lifecycle
+        # status is now emitted at the moment a compiler starts/completes.
+        diagnostics = [line for line in lines if line.endswith(': start') or line.endswith(': done')]
+        self.assertEqual(diagnostics,
+                         ['main.cc: start', 'main.cc: done',
+                          'a/a.cc: start', 'a/a.cc: done',
+                          'b/b.cc: start', 'b/b.cc: done',
+                          'value.cc: start', 'value.cc: done'])
 
     def test_incremental_parallel_build_rechecks_shared_module_hash(self):
         """A module edit rebuilds its importers, while a no-op rebuild is silent."""

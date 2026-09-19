@@ -117,15 +117,16 @@ class Job:
         self.task = asyncio.create_task(self.run())
 
     def start_compilation(self, description: str) -> None:
-        """Register actual compilation work described by description, excluding cache hits."""
+        """Register actual compilation work without printing a start line."""
         self.session.compilation_started = True
         self.session.compilations_total += 1
         self.compilation_description = description
-        self.changed.set()
 
     def complete_compilation(self) -> None:
-        """Count this compilation after its compiler has completed successfully."""
+        """Count and immediately announce one successful compilation."""
         self.session.compilations_completed += 1
+        if self.compilation_description is not None:
+            self.session.report_compilation_completed(self.compilation_description)
 
     def write(self, data: str | bytes) -> None:
         """Append bytes or text data to this job's stream and wake its reader."""
@@ -292,6 +293,11 @@ class BuildSession:
         self.report_concurrency()
         print(f'launching {command}', file=self.output, flush=True)
 
+    def report_compilation_completed(self, description: str) -> None:
+        """Print a successful file completion immediately."""
+        self.report_concurrency()
+        print(f'BUILT {description}', file=self.output, flush=True)
+
     def schedule(
         self,
         key: Hashable,
@@ -315,19 +321,8 @@ class BuildSession:
         """Print job's buffered bytes, then new bytes until the job completes."""
         offset = 0
         decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
-        progress_printed = False
         while True:
             job.changed.clear()
-            if self.progress and job.compilation_description is not None and not progress_printed:
-                self.report_concurrency()
-                message = (f'       [{self.compilations_completed}/{self.compilations_total}] '
-                           f'Building {job.compilation_description}')
-                if (self.output.isatty() and os.environ.get('TERM') != 'dumb'
-                        and not os.environ.get('NO_COLOR')):
-                    message = f'\x1b[32m{message}\x1b[0m'
-                self.output.write(message + '\n')
-                self.output.flush()
-                progress_printed = True
             job.log.seek(offset)
             while data := job.log.read(65536):
                 offset += len(data)

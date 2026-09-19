@@ -133,14 +133,14 @@ class GeneratedModuleTests(unittest.TestCase):
             self.resolve()
         self.assertEqual(len(self.invocations), 4)
 
-    def test_build_tool_placeholder_uses_source_root_target(self) -> None:
-        """Source-built generator tools expand to their configuration artifact path."""
+    def test_build_tool_placeholder_uses_owner_relative_target(self) -> None:
+        """Source-built generator tools resolve relative to the owning BUILD.py."""
         self.fs.write_text(
             "pkg/generated/BUILD.py",
             """GENERATED = [{
     "inputs": ["schema.txt"],
     "outputs": ["foo.cc"],
-    "build_tools": {"codegen": "cmd/codegen"},
+    "build_tools": {"codegen": "../../cmd/codegen"},
     "command": ["{tool:codegen}", "schema.txt", "{outdir}/foo.cc"],
 }]
 """,
@@ -149,6 +149,15 @@ class GeneratedModuleTests(unittest.TestCase):
         bt.DirectoryConfig.get(bt.Path("pkg/generated"), self.cfg)
         action = self.cfg.generated_outputs[bt.Path("pkg/generated/foo.cc")]
         self.assertEqual(action.build_tools, {"codegen": bt.Path("cmd/codegen")})
+
+        exec_cfg = bt.BuildConfig(
+            vfs=self.fs, SRCDIR=".", OBJDIR="build/host", DEPDIR="build/host/deps"
+        )
+        self.cfg.EXEC_CONFIG = exec_cfg
+        self.assertEqual(
+            action.build_tool_artifact(bt.Path("cmd/codegen")),
+            bt.Path("build/host/tools/cmd/codegen"),
+        )
 
         tool = bt.Path("build/release/tools/cmd/codegen")
         self.fs.makedirs(tool.parent, exist_ok=True)
@@ -186,6 +195,22 @@ class GeneratedModuleTests(unittest.TestCase):
         self.assertEqual(hfile.infofile, bt.Path("build/release/pkg/generated/foo.pb.h.info"))
         self.assertEqual(ccfile.infofile, bt.Path("build/release/pkg/generated/foo.pb.cc.info"))
         self.assertNotEqual(hfile.infofile, ccfile.infofile)
+
+    def test_absolute_generated_header_keeps_user_header_companion_semantics(self) -> None:
+        """Generated headers outside cwd still find their generated source companions."""
+        header = bt.Path("/workspace/out/generated/pkg/foo.pb.h")
+        source = bt.Path("/workspace/out/generated/pkg/foo.pb.cc")
+        self.fs.makedirs(header.parent, exist_ok=True)
+        self.fs.write_text(header, "#pragma once\n")
+        self.fs.write_text(source, "")
+        self.cfg.generated_logical_paths[header] = bt.Path("pkg/foo.pb.h")
+        self.cfg.generated_logical_paths[source] = bt.Path("pkg/foo.pb.cc")
+
+        module = bt.CompiledModule.get(str(header), self.cfg)
+        self.assertEqual(module.type, bt.SourceType.USER_HEADER)
+        dependency = bt.HeaderDep.get(header, self.cfg)
+        self.assertEqual(dependency.path, bt.Path("pkg/foo.pb.h"))
+        self.assertEqual(dependency.find_cpp(dependency.path, self.cfg), source)
 
     def test_source_tree_module_precedes_generated_declaration(self) -> None:
         """An existing ordinary module wins without loading or running its generator."""

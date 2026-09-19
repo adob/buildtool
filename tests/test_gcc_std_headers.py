@@ -302,11 +302,11 @@ class RealStandardHeaderTests(unittest.TestCase):
                             [bt.Path('a/main.cc'), bt.Path('b/main.cc')])
                     return output.getvalue()
 
-                self.assertEqual(build().count('BUILDING system header'), 1)
+                self.assertEqual(build().count('BUILT system header'), 1)
                 self.assertEqual(build(), '')
                 with Path('b/BUILD.py').open('a') as config:
                     config.write('CFLAGS += ["-D_GLIBCXX_USE_CXX11_ABI=0"]\n')
-                self.assertEqual(build().count('BUILDING system header'), 1)
+                self.assertEqual(build().count('BUILT system header'), 1)
                 self.assertEqual(len(cfg.std_header_sources), 2)
                 self.assertEqual(build(), '')
             finally:
@@ -336,22 +336,22 @@ class RealStandardHeaderTests(unittest.TestCase):
                         bt.Target(bt.Path('main'), cfg).compile_many([bt.Path('a.cc'), bt.Path('b.cc')])
                     return output.getvalue()
                 output = build()
-                self.assertEqual(output.count('BUILDING system header'), 1)
+                self.assertEqual(output.count('BUILT system header'), 1)
                 for path in ('build/release/b.info', 'build/release/wrapper.info'):
                     info = json.loads(Path(path).read_text())
                     self.assertTrue(any(key.startswith('module:') and 'bits/stdc++.h@' in key for key in info['deps']))
                 self.assertEqual(build(), '')
                 cfg.JOBS = 2
                 cfg.REBUILD = True
-                self.assertEqual(build().count('BUILDING system header'), 1)
+                self.assertEqual(build().count('BUILT system header'), 1)
                 cfg.REBUILD = False
                 cfg.STD_HEADER_UNIT = False
                 output = build()
-                self.assertIn('BUILDING c++', output)
-                self.assertNotIn('BUILDING system header', output)
+                self.assertIn('BUILT c++', output)
+                self.assertNotIn('BUILT system header', output)
                 self.assertEqual(build(), '')
                 cfg.STD_HEADER_UNIT = True
-                self.assertIn('BUILDING c++', build())
+                self.assertIn('BUILT c++', build())
                 self.assertEqual(build(), '')
             finally:
                 os.chdir(previous)

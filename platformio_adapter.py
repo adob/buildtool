@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 from typing import Any
@@ -82,6 +83,8 @@ def configure(env: Any, projenv: Any, root: Path, sources: list[Path] | tuple[Pa
 
     settings = dict(modules=modules, cc=tool('CC'), cxx=tool('CXX'),
                     archiver=tool('AR'), tags=list(env.get('PIOFRAMEWORK', [])))
+    settings['host_cc'] = shutil.which('gcc') or shutil.which('cc') or ''
+    settings['host_cxx'] = shutil.which('g++') or shutil.which('c++') or ''
     # PlatformIO may implement RANLIB as AR with flags; use GCC's actual ranlib.
     settings['ranlib'] = subprocess.check_output(
         [settings['cxx'], '-print-prog-name=ranlib'], text=True).strip()

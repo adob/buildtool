@@ -231,6 +231,7 @@ class BuildConfig:
     IDE_CXX: str | None
     IDE_CC: str | None
     IDE_CXXFLAGS: list[str] | None
+    EXEC_CONFIG: BuildConfig | None
 
     def __init__(
         self,
@@ -264,6 +265,7 @@ class BuildConfig:
         IDE_CXX: str | None = None,
         IDE_CC: str | None = None,
         IDE_CXXFLAGS: list[str] | None = None,
+        EXEC_CONFIG: BuildConfig | None = None,
     ) -> None:
         self.vfs = vfs
         self.jobserver = jobserver
@@ -293,6 +295,7 @@ class BuildConfig:
         self.IDE_CXX = IDE_CXX
         self.IDE_CC = IDE_CC
         self.IDE_CXXFLAGS = list(IDE_CXXFLAGS) if IDE_CXXFLAGS is not None else None
+        self.EXEC_CONFIG = EXEC_CONFIG
         if JOBS < 1:
             raise ValueError("JOBS must be at least 1")
         self.JOBS = JOBS
@@ -538,6 +541,11 @@ class CompiledModule:
         mod = cfg.compiled_modules.get(name)
         if mod:
             return mod
+        if type is None and name.startswith('/'):
+            path = Path(name)
+            logical = cfg.generated_logical_paths.get(path)
+            if logical is not None and logical.suffix in HFILE_SUFFIXES:
+                type = SourceType.USER_HEADER
         mod = CompiledModule(name, type)
         cfg.compiled_modules[name] = mod
         return mod
@@ -1440,8 +1448,6 @@ class SourceFile:
     async def compile(self, target: Target, cfg: BuildConfig) -> None:
         """Compile for target/cfg using its selected asynchronous backend."""
         self.job.start_compilation(f'{self.type} {self.path}')
-        if not self.job.session.progress:
-            self.job.message(f"BUILDING {self.type} {self.path}...")
         self.header_deps = {}
 
         if cfg.USECLANG:
@@ -1821,11 +1827,15 @@ class GeneratedAction:
         return self.owner / Path(raw)
 
     def _source_target_path(self, value: str) -> Path:
-        """Resolve one source-root-relative build target."""
+        """Resolve one BUILD.py-relative target and keep it inside the source tree."""
         raw = pathlib.PurePath(value)
-        if raw.is_absolute() or not raw.parts or '..' in raw.parts:
-            raise ValueError(f'Generated build tool must be source-root-relative: {value}')
-        return Path(raw)
+        if raw.is_absolute() or not raw.parts:
+            raise ValueError(f'Generated build tool must be relative to {self.owner}: {value}')
+        candidate = self.cfg.SRCDIR / self.owner / Path(raw)
+        logical = source_relative_path(candidate, self.cfg)
+        if logical is None:
+            raise ValueError(f'Generated build tool escapes the source tree: {value}')
+        return logical
 
     def physical_path(self, logical: Path) -> Path:
         """Return this configuration's materialized path for logical."""
@@ -1905,16 +1915,29 @@ class GeneratedAction:
 
     def build_tool_artifact(self, logical: Path) -> Path:
         """Give source-built generator executables unique deterministic artifact paths."""
-        return self.cfg.OBJDIR / 'tools' / logical
+        cfg = self.cfg.EXEC_CONFIG or self.cfg
+        return cfg.OBJDIR / 'tools' / self.execution_tool_path(logical)
+
+    def execution_tool_path(self, logical: Path) -> Path:
+        """Map a generator target from the action source tree into the execution tree."""
+        cfg = self.cfg.EXEC_CONFIG
+        if cfg is None:
+            return logical
+        source = self.cfg.SRCDIR / logical
+        mapped = source_relative_path(source, cfg)
+        if mapped is None:
+            raise RuntimeError(f'Generated build tool lies outside execution source tree: {source}')
+        return mapped
 
     async def build_tool(self, logical: Path, target: Target, parent: Job) -> Path:
         """Recursively build one executable target in the current scheduler."""
-        cfg = self.cfg
-        source = cfg.SRCDIR / logical
+        cfg = self.cfg.EXEC_CONFIG or self.cfg
+        execution_logical = self.execution_tool_path(logical)
+        source = cfg.SRCDIR / execution_logical
         if not source.is_dir(cfg.vfs):
             raise RuntimeError(f'Generated build tool target is not a directory: {source}')
         artifact = self.build_tool_artifact(logical)
-        key = ('build-tool', str(logical), str(artifact))
+        key = ('build-tool', str(execution_logical), str(artifact))
 
         async def work(job: Job) -> None:
             job.diagnostic_source = str(source)
@@ -1928,14 +1951,11 @@ class GeneratedAction:
             if not sources:
                 raise RuntimeError(f'No source files in generated build tool target {source}')
 
-            dependencies = []
             for path in sources:
                 dependency = tool.schedule_compilation_job(path, parent=job)
                 if dependency not in tool.roots:
                     tool.roots.append(dependency)
-                dependencies.append(dependency)
-            for dependency in dependencies:
-                await job.wait_for_dependency(dependency)
+            await tool.wait_for_compilations()
 
             tool.collect_link_inputs()
             if not await tool.defines_main_async(job):
@@ -2015,7 +2035,7 @@ class DirectoryConfig:
             self.linkflags = []
             return
         
-        buildpy_file = self.dir / 'BUILD.py'
+        buildpy_file = self.cfg.SRCDIR / self.dir / 'BUILD.py'
         self.cfg.check_database_timestamp(buildpy_file, build_config=True)
         if not buildpy_file.exists(self.cfg.vfs):
             self.buildvars = {}
@@ -2108,6 +2128,7 @@ class HeaderDep:
     @classmethod
     def get(cls, path: Path, cfg: BuildConfig) -> HeaderDep:
         """Cache path in cfg, normalizing workspace headers for companion discovery."""
+        path = cfg.generated_logical_paths.get(path, path)
         if path.is_absolute():
             try:
                 path = path.relative_to(cfg.vfs.getcwd())
@@ -2165,6 +2186,9 @@ class HeaderDep:
             cppfile = basename.with_extra_suffix(ext)
             if cppfile.exists(vfs) and source_matches_target(cppfile, cfg):
                 return cppfile
+            for physical, logical in cfg.generated_logical_paths.items():
+                if logical == cppfile and physical.exists(vfs):
+                    return physical
             
         #print("!!!!", list(hfile.parts), 'include' in hfile.parts)
         if "include" in hfile.parts:

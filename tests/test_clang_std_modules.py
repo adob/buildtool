@@ -130,7 +130,7 @@ class RealClangStandardModuleTests(unittest.TestCase):
                         self.assertTrue(Path(str(source.cmpath)).is_file())
                     return output.getvalue()
 
-                self.assertEqual(build().count('BUILDING module'), 2)
+                self.assertEqual(build().count('BUILT module'), 2)
                 self.assertEqual(subprocess.check_output(['build/release/bin/main'], text=True), '3\n')
                 if clangd := os.environ.get('BT_TEST_CLANGD'):
                     with contextlib.redirect_stdout(io.StringIO()):
@@ -147,8 +147,8 @@ class RealClangStandardModuleTests(unittest.TestCase):
                     source.write('// edited importer\n')
                 with mock.patch.object(gcc_std, 'run_compiler', side_effect=AssertionError('unexpected discovery')):
                     output = build()
-                self.assertEqual(output.count('BUILDING c++'), 1)
-                self.assertNotIn('BUILDING module', output)
-                self.assertEqual(build(rebuild=True).count('BUILDING module'), 2)
+                self.assertEqual(output.count('BUILT c++'), 1)
+                self.assertNotIn('BUILT module', output)
+                self.assertEqual(build(rebuild=True).count('BUILT module'), 2)
             finally:
                 os.chdir(previous)

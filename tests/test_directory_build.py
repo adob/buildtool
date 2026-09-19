@@ -129,7 +129,6 @@ class DirectoryBuildTests(unittest.TestCase):
 
         def compile_source(source: bt.SourceFile, target: bt.Target, cfg: bt.BuildConfig) -> None:
             """Emit a compiler status for source and simulate its object output."""
-            source.job.message(f'BUILDING {source.path}')
             self.compile_source(source, target, cfg)
 
         with mock.patch.object(bt.SourceFile.compile_gcc, 'side_effect', compile_source):
@@ -144,7 +143,7 @@ class DirectoryBuildTests(unittest.TestCase):
                     text = output.getvalue()
                     self.assertEqual(text.count('Concurrency:'), 0 if state == 'cached' else 1)
                     if state != 'cached':
-                        self.assertLess(text.index('Concurrency:'), text.index('BUILDING'))
+                        self.assertLess(text.index('Concurrency:'), text.index('BUILT'))
 
     def test_recursive_same_basename_has_distinct_artifacts(self) -> None:
         """Different packages named foo must not accidentally reuse the same binary."""

@@ -54,15 +54,15 @@ class ParallelCompilerTests(unittest.TestCase):
                                   if source.path.name == 'shared.h')
                     self.assertTrue(header.cmpath.is_file(cfg.vfs))
                     self.assertFalse(Path('shared.h.pcm').exists())
-                starts = [line for line in output.getvalue().splitlines()
-                          if line.startswith('BUILDING ')]
-                self.assertEqual(len(starts), 5)
-                for line, path in zip(starts[:3], ('main.cc', 'a.cc', 'b.cc')):
-                    self.assertIn(path, line)
+                completed = [line for line in output.getvalue().splitlines()
+                             if line.startswith('BUILT ')]
+                self.assertEqual(len(completed), 5)
+                for path in ('main.cc', 'a.cc', 'b.cc'):
+                    self.assertTrue(any(path in line for line in completed))
                 # Clang requests header units during preprocessing, before
                 # its parser asks for named modules. GCC's encounter order differs.
-                self.assertTrue(any('value.cc' in line for line in starts[3:]))
-                self.assertTrue(any('shared.h' in line for line in starts[3:]))
+                self.assertTrue(any('value.cc' in line for line in completed))
+                self.assertTrue(any('shared.h' in line for line in completed))
                 before = {p: p.stat().st_mtime_ns for p in Path('build').rglob('*')
                           if p.is_file()}
                 cfg.reset_build_state()
@@ -75,8 +75,8 @@ class ParallelCompilerTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()) as output:
                     bt.build(bt.Path('main.cc'), cfg)
                 rebuilt = [line for line in output.getvalue().splitlines()
-                           if line.startswith('BUILDING ')]
-                self.assertEqual(rebuilt, starts)
+                           if line.startswith('BUILT ')]
+                self.assertCountEqual(rebuilt, completed)
                 self.assertIn('LINKING ', output.getvalue())
                 self.assertEqual(subprocess.run([os.path.abspath(binary)]).returncode, 0)
                 cfg.REBUILD = False
@@ -98,11 +98,11 @@ class ParallelCompilerTests(unittest.TestCase):
                 cfg.reset_build_state()
                 with contextlib.redirect_stdout(io.StringIO()) as output:
                     bt.build_targets(bt.Path('apps/...'), cfg)
-                starts = [line for line in output.getvalue().splitlines()
-                          if line.startswith('BUILDING ')]
-                self.assertEqual(len(starts), 6)
-                self.assertEqual(sum('value.cc' in line for line in starts), 1)
-                self.assertEqual(sum('shared.h' in line for line in starts), 1)
+                completed = [line for line in output.getvalue().splitlines()
+                             if line.startswith('BUILT ')]
+                self.assertEqual(len(completed), 6)
+                self.assertEqual(sum('value.cc' in line for line in completed), 1)
+                self.assertEqual(sum('shared.h' in line for line in completed), 1)
                 for name in ('one', 'two'):
                     subprocess.run([os.path.abspath('bin/' + name)], check=True)
                 cfg.REBUILD = False

@@ -67,9 +67,11 @@ inputs; changing any of these, or removing an output, reruns the action. Use
 Python script that runs `protoc`. Multiple imports of outputs from the same
 action share one generation job.
 
-`build_tools` maps command-local names to source-root-relative Buildtool target
-directories. Buildtool compiles and links those executables in the
+`build_tools` maps command-local names to Buildtool target directories relative
+to the owning `BUILD.py`. Buildtool compiles and links those executables in the
 same scheduler before running the generator, so their own generated/module
 dependencies are resolved recursively. A changed tool binary invalidates the
 generation action. `tools` remains for external executables that Buildtool does
-not build itself.
+not build itself. Cross-build integrations may provide a separate execution
+configuration so `build_tools` are native host executables while generated
+sources are compiled by the target toolchain.
