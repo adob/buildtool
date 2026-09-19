@@ -95,6 +95,7 @@ def configure(env: Any, projenv: Any, root: Path, sources: list[Path] | tuple[Pa
         """Capture resolved library flags and build modules before application compilation."""
         # Library scripts run before PlatformIO propagates dependency include paths.
         # Read the library environments only after SCons has constructed the graph.
+        settings['jobs'] = int(env.GetOption('num_jobs'))
         roots: list[str] = []
         for item in libraries:
             for candidate in (item['root'], *item['search_roots']):

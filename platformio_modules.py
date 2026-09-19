@@ -75,6 +75,7 @@ def build(manifest: Path) -> None:
     directory = manifest.parent
     roots = [Path(value).resolve() for value in settings['roots']]
     common_root = Path(os.path.commonpath([str(root) for root in roots]))
+    jobs = int(settings.get('jobs', 1))
     os.chdir(common_root)
     cfg = bt.BuildConfig(
         CC=settings['cc'], CXX=settings['cxx'], CFLAGS=settings['cflags'],
@@ -82,7 +83,7 @@ def build(manifest: Path) -> None:
         SRCDIR='.', OBJDIR=str(directory / 'artifacts'),
         DEPDIR=str(directory / 'artifacts/deps'), TAGS=settings['tags'],
         USE_DIRECTORY_CONFIG=False, STD_HEADER_UNIT=False,
-        ABSOLUTE_MODULE_PATHS=True, JOBS=1, memory=bt.MemoryBudget())
+        ABSOLUTE_MODULE_PATHS=True, JOBS=jobs, memory=bt.MemoryBudget())
 
     module_roots = settings.get('module_roots', {})
     host_incflags = [
@@ -103,13 +104,13 @@ def build(manifest: Path) -> None:
             CC=host_cc, CXX=host_cxx, SRCDIR='.',
             OBJDIR=str(directory / 'host' / key),
             DEPDIR=str(directory / 'host' / key / 'deps'),
-            INCFLAGS=host_incflags, JOBS=1)
+            INCFLAGS=host_incflags, JOBS=jobs)
         generation_configs[prefix] = bt.BuildConfig(
             CC=settings['cc'], CXX=settings['cxx'], CFLAGS=settings['cflags'],
             CXXFLAGS=settings['cxxflags'], INCFLAGS=[], LDFLAGS=[],
             SRCDIR=relative_root, OBJDIR=str(directory / 'generated' / key),
             DEPDIR=str(directory / 'generated' / key / 'deps'), TAGS=settings['tags'],
-            STD_HEADER_UNIT=False, ABSOLUTE_MODULE_PATHS=True, JOBS=1,
+            STD_HEADER_UNIT=False, ABSOLUTE_MODULE_PATHS=True, JOBS=jobs,
             EXEC_CONFIG=host_cfg)
 
     target = LibraryTarget(cfg, settings['roots'], module_roots, generation_configs)

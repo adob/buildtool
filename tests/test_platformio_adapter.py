@@ -31,6 +31,7 @@ def project_environment() -> MagicMock:
     variables: dict[str, object] = {}
     project.get.side_effect = lambda key, default=None: variables.get(key, default)
     project.__setitem__.side_effect = variables.__setitem__
+    project.GetOption.side_effect = lambda name: 6 if name == 'num_jobs' else None
     return project
 
 
@@ -128,6 +129,7 @@ class PlatformIOAdapterTests(unittest.TestCase):
                 self.assertIn(includes[0], request[field])
             self.assertEqual(request['roots'], [str(root)])
             self.assertEqual(request['sources'], [])
+            self.assertEqual(request['jobs'], 6)
 
     def test_libraries_share_one_action(self) -> None:
         """A second library adds its sources, roots, and includes to the first registration."""
