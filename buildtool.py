@@ -664,8 +664,12 @@ class Target:
             else:
                 self.schedule_compilation_job(source)
 
-    async def wait_for_compilations(self) -> None:
-        """Wait for this target's roots and all dynamically discovered dependencies."""
+    async def wait_for_compilations(self, parent: Job | None = None) -> None:
+        """Wait for this target's roots and dynamically discovered dependencies.
+
+        When parent is supplied, dependency failures are routed through it so
+        buffered compiler diagnostics are preserved in the parent's log.
+        """
         seen: set[Job] = set()
 
         async def wait(job: Job) -> None:
@@ -673,9 +677,12 @@ class Target:
             if job in seen:
                 return
             seen.add(job)
-            await asyncio.shield(job.task)
-            if job.error:
-                raise job.error
+            if parent is None:
+                await asyncio.shield(job.task)
+                if job.error:
+                    raise job.error
+            else:
+                await parent.wait_for_dependency(job)
             for child in job.children:
                 await wait(child)
 
@@ -1955,7 +1962,7 @@ class GeneratedAction:
                 dependency = tool.schedule_compilation_job(path, parent=job)
                 if dependency not in tool.roots:
                     tool.roots.append(dependency)
-            await tool.wait_for_compilations()
+            await tool.wait_for_compilations(job)
 
             tool.collect_link_inputs()
             if not await tool.defines_main_async(job):
@@ -2582,7 +2589,7 @@ class BuildPlan:
 
     async def finish(self, job: Job) -> None:
         """Wait for this target's graph, then inspect/link using job's slot and log."""
-        await self.target.wait_for_compilations()
+        await self.target.wait_for_compilations(job)
         self.target.collect_link_inputs()
         if self.check_main and not await self.target.defines_main_async(job):
             return

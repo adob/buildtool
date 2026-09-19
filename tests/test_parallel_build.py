@@ -261,6 +261,36 @@ class ParallelBuildTests(unittest.TestCase):
         self.assertEqual(linked, ['b'])
         self.assertEqual(self.calls.count('value.cc'), 1)
 
+    def test_wait_for_compilations_parent_preserves_failure_diagnostic(self) -> None:
+        """A nested target failure must copy its compiler log into the waiting parent."""
+        output = io.StringIO()
+
+        async def run() -> None:
+            graph = bt.CompilationGraph(self.cfg)
+            graph.session.output = output
+            target = bt.Target(bt.Path('nested'), self.cfg)
+            target.session = graph.session
+            target.roots = []
+
+            async def fail(job: bt.Job) -> None:
+                job.message('broken.cc:7: error: deliberate failure')
+                raise RuntimeError('compile failed')
+
+            async def finish(job: bt.Job) -> None:
+                dependency = graph.session.schedule('compile', fail, parent=job)
+                target.roots.append(dependency)
+                await target.wait_for_compilations(job)
+
+            graph.session.schedule('finish', finish, final=True)
+            try:
+                with self.assertRaisesRegex(RuntimeError, 'compile failed'):
+                    await graph.session.finish()
+            finally:
+                await graph.session.close()
+
+        asyncio.run(run())
+        self.assertIn('broken.cc:7: error: deliberate failure', output.getvalue())
+
     def test_forced_rebuild_recompiles_shared_and_transitive_dependencies(self) -> None:
         """Force unchanged companions and nested modules once each, then return to no-op."""
         self.write('value.cc', {'imports': ['leaf'], 'value': 42})
