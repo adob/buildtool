@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import unittest
+from unittest import mock
 
 import buildtool as bt
 
@@ -32,3 +33,38 @@ class IdeModuleTests(unittest.TestCase):
                         self.assertIn('-fprebuilt-module-path=/vendor/modules', row['arguments'])
                 source = bt.SourceFile.get(bt.Path('lib/math/math.cc'), cfg)
                 self.assertIn(automatic, source.compiler_cmd_clang(cfg))
+
+    def test_generated_sources_are_added_to_compilation_database(self) -> None:
+        """Materialized generated translation units use physical paths in the IDE database."""
+        fs = bt.MemoryFileSystem()
+        fs.makedirs('proto')
+        fs.write_text(
+            'proto/BUILD.py',
+            '''GENERATED = [{
+    "outputs": ["controller/client.cc", "controller/server.cc", "controller/msg.cc"],
+    "command": ["/tools/gen", "{outdir}"],
+}]\n''',
+        )
+        cfg = bt.BuildConfig(vfs=fs)
+        bt.DirectoryConfig.get(bt.Path('proto'), cfg)
+
+        for name in ('client.cc', 'server.cc', 'msg.cc'):
+            path = bt.Path(f'build/release/generated/proto/controller/{name}')
+            fs.makedirs(path.parent, exist_ok=True)
+            fs.write_text(path, f'export module proto.controller.{name[:-3]};\n')
+
+        with mock.patch.object(
+            bt.CompilationDatabase, 'add_standard_modules', new=mock.AsyncMock()
+        ):
+            entries = json.loads(bt.make_compilation_database([bt.Path('proto')], cfg))
+
+        by_file = {entry['file']: entry for entry in entries}
+        expected = {
+            'build/release/generated/proto/controller/client.cc',
+            'build/release/generated/proto/controller/server.cc',
+            'build/release/generated/proto/controller/msg.cc',
+        }
+        self.assertEqual(set(by_file), expected)
+        for path in expected:
+            self.assertIn(path, by_file[path]['arguments'])
+            self.assertIn('-iquoteproto/controller', by_file[path]['arguments'])

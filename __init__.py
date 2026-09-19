@@ -1,4 +1,4 @@
-from .buildtool import BuildConfig, INCFLAGS, main
+from .buildtool import BuildConfig, CXXFLAGS, INCFLAGS, main
 from .buildtool import build as _build, Path, Target, build_compilation_database as _build_compilation_database
 from .buildtool import reset_build_state
 from .vfs import FileSystem, RealFileSystem, MemoryFileSystem

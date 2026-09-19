@@ -8,6 +8,7 @@ import hashlib
 import subprocess
 import shlex
 import argparse
+import copy
 import sys
 import re
 from datetime import datetime
@@ -227,6 +228,9 @@ class BuildConfig:
     std_module_sources: dict[tuple[Path, tuple[str, ...]], SourceFile]
     generated_outputs: dict[Path, GeneratedAction]
     generated_logical_paths: dict[Path, Path]
+    IDE_CXX: str | None
+    IDE_CC: str | None
+    IDE_CXXFLAGS: list[str] | None
 
     def __init__(
         self,
@@ -257,6 +261,9 @@ class BuildConfig:
         ABSOLUTE_MODULE_PATHS: bool = False,
         jobserver: JobServer | None = None,
         progress: bool = False,
+        IDE_CXX: str | None = None,
+        IDE_CC: str | None = None,
+        IDE_CXXFLAGS: list[str] | None = None,
     ) -> None:
         self.vfs = vfs
         self.jobserver = jobserver
@@ -283,6 +290,9 @@ class BuildConfig:
         self.OUTFILE = OUTFILE
         self.USECLANG = USECLANG
         self.CLANG_WRAPPER = CLANG_WRAPPER
+        self.IDE_CXX = IDE_CXX
+        self.IDE_CC = IDE_CC
+        self.IDE_CXXFLAGS = list(IDE_CXXFLAGS) if IDE_CXXFLAGS is not None else None
         if JOBS < 1:
             raise ValueError("JOBS must be at least 1")
         self.JOBS = JOBS
@@ -872,16 +882,19 @@ class Target:
             logical = source_relative_path(candidate, cfg)
             if logical is None:
                 continue
-            owner = cfg.SRCDIR / logical.parent
-            DirectoryConfig.get(owner, cfg, log=parent)
-            action = cfg.generated_outputs.get(logical)
-            if action is None:
-                continue
-            await action.materialize(self, parent)
-            physical = action.physical_path(logical)
-            if not physical.is_file(cfg.vfs):
-                raise RuntimeError(f'Generated module output does not exist: {physical}')
-            return physical
+            directory = logical.parent
+            while True:
+                DirectoryConfig.get(cfg.SRCDIR / directory, cfg, log=parent)
+                action = cfg.generated_outputs.get(logical)
+                if action is not None:
+                    await action.materialize(self, parent)
+                    physical = action.physical_path(logical)
+                    if not physical.is_file(cfg.vfs):
+                        raise RuntimeError(f'Generated module output does not exist: {physical}')
+                    return physical
+                if str(directory) == '.':
+                    break
+                directory = directory.parent
         return None
 
     def mod2src(self, modname: str | None, type: SourceType,
@@ -1770,7 +1783,6 @@ class GeneratedAction:
             raise ValueError(f'GENERATED command in {owner}/BUILD.py must be a non-empty argument list')
         if not isinstance(tools, list) or not all(isinstance(value, str) for value in tools):
             raise ValueError(f'GENERATED tools in {owner}/BUILD.py must be a list of executables')
-
         self.owner = owner
         self.inputs = tuple(self._input_path(value) for value in inputs)
         self.outputs = tuple(self._output_path(value) for value in outputs)
@@ -1795,10 +1807,10 @@ class GeneratedAction:
         return logical
 
     def _output_path(self, value: str) -> Path:
-        path = Path(value)
-        if path.is_absolute() or str(path.parent) != '.':
-            raise ValueError(f'Generated output must be an immediate child of {self.owner}: {value}')
-        return self.owner / path
+        raw = pathlib.PurePath(value)
+        if raw.is_absolute() or not raw.parts or '..' in raw.parts:
+            raise ValueError(f'Generated output must stay below {self.owner}: {value}')
+        return self.owner / Path(raw)
 
     def physical_path(self, logical: Path) -> Path:
         """Return this configuration's materialized path for logical."""
@@ -1883,6 +1895,10 @@ class GeneratedAction:
         missing = [output for output in self.outputs if not self.physical_path(output).is_file(cfg.vfs)]
         if missing:
             raise RuntimeError('Generator did not produce declared outputs: ' + ', '.join(map(str, missing)))
+        for output in self.outputs:
+            physical = self.physical_path(output)
+            if output.name.endswith((".cc", ".cpp", ".c")):
+                cfg.check_database_timestamp(physical)
         cfg.vfs.makedirs(self.state_path().parent, exist_ok=True)
         atomic_write(self.state_path(), json.dumps(identity, indent=2, sort_keys=True) + '\n', cfg.vfs)
 
@@ -1899,7 +1915,7 @@ class GeneratedAction:
 
 
 class DirectoryConfig:
-    CACHE_VERSION = 3
+    CACHE_VERSION = 4
 
     @classmethod
     def get(cls, path: Path, cfg: BuildConfig, log: Job | None = None) -> DirectoryConfig:
@@ -2131,36 +2147,66 @@ class CompilationDatabase:
         self.entries = []
 
     def build(self, cfg: BuildConfig) -> str:
+        command_cfg = cfg
+        if cfg.IDE_CXX is not None:
+            command_cfg = copy.copy(cfg)
+            command_cfg.CXX = cfg.IDE_CXX
+            command_cfg.CC = cfg.IDE_CC or cfg.IDE_CXX
+            if cfg.IDE_CXXFLAGS is not None:
+                command_cfg.CXXFLAGS = cfg.IDE_CXXFLAGS
+            command_cfg.USECLANG = True
+            command_cfg.CLANG_WRAPPER = None
+
         for path in find_files(self.paths, suffixes=[".cc", ".cpp", ".c"], vfs=cfg.vfs):
             if source_matches_target(path, cfg):
-                self.process_file(path, cfg)
+                self.process_file(path, cfg, command_cfg=command_cfg)
 
-        asyncio.run(self.add_standard_modules(cfg))
+        # Generated translation units live below OBJDIR rather than the source
+        # roots scanned above. A normal build has already registered their
+        # physical-to-logical paths. A standalone `ide` invocation has not, so
+        # discover materialized outputs under OBJDIR/generated and infer the same
+        # logical source path from their relative path.
+        generated_root = cfg.OBJDIR / 'generated'
+        if generated_root.is_dir(cfg.vfs):
+            for path in find_files([generated_root], suffixes=[".cc", ".cpp", ".c"], vfs=cfg.vfs):
+                if path not in cfg.generated_logical_paths:
+                    cfg.generated_logical_paths[path] = cfg.SRCDIR / path.relative_to(generated_root)
+
+        for path in sorted(cfg.generated_logical_paths, key=str):
+            if path.name.endswith((".cc", ".cpp", ".c")) and path.is_file(cfg.vfs):
+                self.process_file(path, cfg, command_cfg=command_cfg)
+
+        asyncio.run(self.add_standard_modules(cfg, command_cfg))
         return json.dumps(self.entries, indent=2)
 
-    async def add_standard_modules(self, cfg: BuildConfig) -> None:
+    async def add_standard_modules(self, cfg: BuildConfig, command_cfg: BuildConfig) -> None:
         """Add installed SDK sources to cfg's IDE database so clangd builds its own PCMs."""
         directory = DirectoryConfig.get(Path('.'), cfg)
-        flags = header_unit_flags([*cfg.CXXFLAGS, *cfg.INCFLAGS], directory.buildvars.get('CFLAGS', []))
+        flags = header_unit_flags([*command_cfg.CXXFLAGS, *command_cfg.INCFLAGS],
+                                  directory.buildvars.get('CFLAGS', []))
         session = BuildSession(cfg.JOBS, verbose=cfg.VERBOSE, jobserver=cfg.jobserver)
 
         async def discover(job: Job) -> None:
             """Discover optional SDK modules through job without compiling them."""
             for name in ('std', 'std.compat'):
-                source = await cfg.gcc_std_modules.resolve(name, cfg.CXX, flags,
-                    str(cfg.DEPDIR / 'gcc-std-modules'), job, clang=cfg.USECLANG, optional=True)
+                source = await cfg.gcc_std_modules.resolve(name, command_cfg.CXX, flags,
+                    str(cfg.DEPDIR / 'gcc-std-modules'), job,
+                    clang=command_cfg.USECLANG, optional=True)
                 if source:
-                    self.process_file(Path(source), cfg, modname=name)
+                    self.process_file(Path(source), cfg, modname=name, command_cfg=command_cfg)
 
         session.schedule('ide-standard-modules', discover)
         await session.finish()
 
-    def process_file(self, path: Path, cfg: BuildConfig, *, modname: str | None = None) -> None:
+    def process_file(self, path: Path, cfg: BuildConfig, *, modname: str | None = None,
+                     command_cfg: BuildConfig | None = None) -> None:
         """Record path's IDE command; modname identifies an external SDK module."""
         # path = os.path.normpath(os.path.join(basepath, filepath))
-        file = SourceFile.get(path, cfg, type=SourceType.MODULE if modname else None,
+        command_cfg = command_cfg or cfg
+        source_cfg = command_cfg if modname in ('std', 'std.compat') else cfg
+        file = SourceFile.get(path, source_cfg, type=SourceType.MODULE if modname else None,
                               modname=modname,
-                              inherited_dircfg=DirectoryConfig.get(Path('.'), cfg) if modname else None)
+                              inherited_dircfg=DirectoryConfig.get(Path('.'), source_cfg) if modname else None)
         if file in self.processed_files:
             return
         
@@ -2168,15 +2214,15 @@ class CompilationDatabase:
 
         # dirpath = os.path.dirname(filepath)
         # filename = os.path.basename(filepath)
-        compilation_cmd = [str(cmd) for cmd in file.compiler_cmd_clang(cfg)]
-        if not cfg.USECLANG:
+        compilation_cmd = [str(cmd) for cmd in file.compiler_cmd_clang(command_cfg)]
+        if not command_cfg.USECLANG:
             # GCC's query-driver probe understands c++, but not c++-module.
             # clangd's module builder selects the module-interface action itself.
             compilation_cmd = ['-xc++' if arg == '-xc++-module' else arg for arg in compilation_cmd]
         # clangd builds its own BMIs. The normal build cache may contain GCC CMIs
         # or Clang BMIs made with a different compiler/configuration.
         compilation_cmd = [arg for arg in compilation_cmd
-                           if arg != f'-fprebuilt-module-path={cfg.OBJDIR}']
+                           if arg != f'-fprebuilt-module-path={command_cfg.OBJDIR}']
 
         self.entries.append({
             "file": str(path),
@@ -2721,6 +2767,9 @@ def _main(
     vfs: FileSystem = _DEFAULT_VFS,
     CLANG_CXXFLAGS: list[str] = [],
     CLANG_LDFLAGS: list[str] = [],
+    IDE_CXX: str | None = None,
+    IDE_CC: str | None = None,
+    IDE_CXXFLAGS: list[str] | None = None,
     TAGS: Iterable[str] | None = None,
     KNOWN_TAGS: Iterable[str] | None = None,
 ) -> None:
@@ -2854,6 +2903,9 @@ def _main(
         SUFFIX=SUFFIX,
         USECLANG=USECLANG,
         CLANG_WRAPPER=os.environ.get("BT_CLANG_WRAPPER") if USECLANG else None,
+        IDE_CXX=IDE_CXX,
+        IDE_CC=IDE_CC,
+        IDE_CXXFLAGS=IDE_CXXFLAGS,
         JOBS=getattr(args, "jobs", 1),
         REBUILD=getattr(args, 'rebuild', False),
         VERBOSE=args.verbose,

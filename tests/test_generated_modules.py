@@ -169,6 +169,65 @@ class GeneratedModuleTests(unittest.TestCase):
         )
         self.assertEqual(self.cfg.generated_outputs, {})
 
+    def test_ancestor_build_may_generate_nested_module_candidate(self) -> None:
+        """An ancestor BUILD.py may generate a normal nested module candidate."""
+        self.fs.write_text(
+            "pkg/generated/BUILD.py",
+            """GENERATED = [{
+    "outputs": ["foo/client.cc"],
+    "command": ["/tools/gen", "{outdir}/foo/client.cc"],
+}]
+""",
+        )
+
+        async def generate(
+            job: bt.Job, command: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            self.fs.makedirs(bt.Path(command[-1]).parent, exist_ok=True)
+            self.fs.write_text(
+                command[-1],
+                "export module pkg.generated.foo.client;\nexport int answer() { return 42; }\n",
+            )
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(bt, "run_compiler", side_effect=generate):
+            target = bt.Target(bt.Path("main"), self.cfg)
+
+            async def run() -> bt.Path:
+                graph = bt.CompilationGraph(self.cfg)
+                target.session = graph.session
+                result: bt.Path | None = None
+
+                async def resolve(job: bt.Job) -> None:
+                    nonlocal result
+                    result = await target.resolve_module_source(
+                        "pkg.generated.foo.client", bt.SourceType.MODULE, None, job
+                    )
+
+                try:
+                    root = graph.session.schedule("resolve", resolve)
+                    await graph.session.finish()
+                    if root.error:
+                        raise root.error
+                    assert result is not None
+                    return result
+                finally:
+                    await graph.session.close()
+                    target.session = None
+
+            path = asyncio.run(run())
+
+        self.assertEqual(
+            path, bt.Path("build/release/generated/pkg/generated/foo/client.cc")
+        )
+        source = bt.SourceFile.get(
+            path,
+            self.cfg,
+            type=bt.SourceType.MODULE,
+            modname="pkg.generated.foo.client",
+        )
+        self.assertEqual(source.logical_path, bt.Path("pkg/generated/foo/client.cc"))
+
     def test_tagged_partition_fallback_may_be_generated(self) -> None:
         """An explicit :tag import can generate the sibling primary+tag.cc layout."""
         self.fs.makedirs("lib/sync")

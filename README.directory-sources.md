@@ -39,8 +39,8 @@ GENERATED = [{
 ```
 
 Inputs and outputs are relative to the directory containing `BUILD.py`. Outputs
-must be immediate children of that directory and each logical output may have
-only one producer. Commands run in the `BUILD.py` directory without a shell.
+must remain below that directory and each logical output may have only one
+producer. Commands run in the `BUILD.py` directory without a shell.
 The following substitutions are available in command arguments:
 
 - `{outdir}`: the absolute generated-output directory for this package
@@ -52,6 +52,11 @@ the `BUILD.py` owning each logical candidate. A declaration for `pkg/foo.cc`
 materializes it at `build/<configuration>/generated/pkg/foo.cc`, then compiles
 that physical source as the requested module. Ordinary source files always take
 precedence over generated declarations.
+
+For a missing module source, Buildtool checks the normal module lookup candidates
+against generated outputs as it walks ancestor `BUILD.py` files. For example,
+`import pkg.foo.client;` first considers `pkg/foo/client.cc`, then its directory
+fallbacks; an ancestor `pkg/BUILD.py` may declare `foo/client.cc` as an output.
 
 Generation is incremental. Buildtool records the expanded command, generator
 executable identity, identities of optional `tools`, and hashes of declared
