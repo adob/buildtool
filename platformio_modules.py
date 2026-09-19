@@ -10,6 +10,17 @@ import buildtool as bt
 from cmake_modules import artifact_manifest, archive_objects, publish_consumer_files, write_changed
 
 
+def module_namespace_search_root(prefix: str, root: Path) -> Path | None:
+    """Return the base directory that makes prefix map naturally onto root."""
+    parts = tuple(prefix.split('.'))
+    if len(root.parts) < len(parts) or tuple(root.parts[-len(parts):]) != parts:
+        return None
+    base = root
+    for _ in parts:
+        base = base.parent
+    return base
+
+
 class LibraryTarget(bt.Target):
     """Resolve named modules across every registered library root."""
 
@@ -37,7 +48,8 @@ class LibraryTarget(bt.Target):
             if mapped is not None:
                 prefix, local_name = mapped
                 return super().mod2src(
-                    local_name, type, search_roots=[self.module_roots[prefix]])
+                    local_name, type, search_roots=[self.module_roots[prefix]],
+                    display_name=modname)
             return super().mod2src(modname, type, search_roots=self.search_roots)
         return super().mod2src(modname, type)
 
@@ -59,14 +71,49 @@ class LibraryTarget(bt.Target):
             generated_target.session = self.session
             generated_target.job_sources = self.job_sources
             generated_target.link_events = self.link_events
-            generated = await generated_target.resolve_generated_module_source(local_name, parent)
+            mapped_root = self.module_roots[prefix]
+            generated = await generated_target.resolve_generated_module_source(
+                local_name, parent, search_roots=[mapped_root])
             if generated is None:
                 raise error
             logical = generated_cfg.generated_logical_paths.get(generated, generated)
-            relative = bt.source_relative_path(logical, generated_cfg) or logical
+            relative = bt.Path(os.path.relpath(
+                generated_cfg.vfs.abspath(logical),
+                generated_cfg.vfs.abspath(bt.Path(mapped_root))))
+            if relative.parts and relative.parts[0] == '..':
+                raise RuntimeError(
+                    f'Generated module {name} is outside mapped root {mapped_root}: {logical}')
             self.cfg.generated_logical_paths[generated] = (
                 bt.Path('__generated__') / prefix.replace('.', '/') / relative)
             return generated
+
+    def resolve_requested_modules(self, names: list[str]) -> list[bt.Path]:
+        """Resolve explicit top-level modules, materializing generated sources first."""
+        resolved: dict[str, bt.Path] = {}
+
+        async def run() -> None:
+            graph = bt.CompilationGraph(self.cfg)
+            self.session = graph.session
+            self.job_sources = graph.job_sources
+            self.link_events = graph.link_events
+
+            async def resolve(job: bt.Job, name: str) -> None:
+                resolved[name] = await self.resolve_module_source(
+                    name, bt.SourceType.MODULE, None, job)
+
+            try:
+                for name in names:
+                    graph.session.schedule(
+                        ('resolve-platformio-module', name),
+                        lambda job, name=name: resolve(job, name))
+                await graph.session.finish()
+            finally:
+                await graph.session.close()
+                self.session = None
+
+        import asyncio
+        asyncio.run(run())
+        return [resolved[name] for name in names]
 
 
 def build(manifest: Path) -> None:
@@ -86,15 +133,19 @@ def build(manifest: Path) -> None:
         ABSOLUTE_MODULE_PATHS=True, JOBS=jobs, memory=bt.MemoryBudget())
 
     module_roots = settings.get('module_roots', {})
+    host_include_roots = [root for root in roots if root != common_root]
+    for prefix, root_value in module_roots.items():
+        namespace_root = module_namespace_search_root(prefix, Path(root_value).resolve())
+        if (namespace_root is not None and namespace_root != common_root
+                and namespace_root not in host_include_roots):
+            host_include_roots.append(namespace_root)
     host_incflags = [
         '-I' + os.path.relpath(root, common_root)
-        for root in roots
-        if root != common_root
+        for root in host_include_roots
     ]
     generation_configs: dict[str, bt.BuildConfig] = {}
     for prefix, root_value in module_roots.items():
         root = Path(root_value).resolve()
-        relative_root = os.path.relpath(root, common_root)
         key = prefix.replace('.', '_').replace(':', '_')
         host_cxx = settings.get('host_cxx') or ''
         host_cc = settings.get('host_cc') or host_cxx
@@ -108,15 +159,17 @@ def build(manifest: Path) -> None:
         generation_configs[prefix] = bt.BuildConfig(
             CC=settings['cc'], CXX=settings['cxx'], CFLAGS=settings['cflags'],
             CXXFLAGS=settings['cxxflags'], INCFLAGS=[], LDFLAGS=[],
-            SRCDIR=relative_root, OBJDIR=str(directory / 'generated' / key),
+            SRCDIR='.', OBJDIR=str(directory / 'generated' / key),
             DEPDIR=str(directory / 'generated' / key / 'deps'), TAGS=settings['tags'],
             STD_HEADER_UNIT=False, ABSOLUTE_MODULE_PATHS=True, JOBS=jobs,
             EXEC_CONFIG=host_cfg)
 
     target = LibraryTarget(cfg, settings['roots'], module_roots, generation_configs)
     # Absolute source paths keep object names stable regardless of the working root.
-    requests = [(target.mod2src(name, bt.SourceType.MODULE), bt.SourceType.MODULE, name, None)
-                for name in settings['modules']]
+    modules = settings['modules']
+    module_sources = target.resolve_requested_modules(modules)
+    requests = [(path, bt.SourceType.MODULE, name, None)
+                for name, path in zip(modules, module_sources)]
     requests.extend((bt.Path(source), None, None, None) for source in settings.get('sources', []))
     target.compile_many(requests)
     for field in ('archiver', 'ranlib'):

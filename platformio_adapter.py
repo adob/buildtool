@@ -130,17 +130,23 @@ def configure(env: Any, projenv: Any, root: Path, sources: list[Path] | tuple[Pa
     job = projenv.Command(outputs, [], compile_modules)
     projenv.AlwaysBuild(job)
     projenv.Clean(job, str(directory))
-    projenv.Replace(CXXFLAGS=[flag for flag in projenv.get('CXXFLAGS', [])
-                             if not str(flag).startswith('-std=')])
-    projenv.Append(CXXFLAGS=['-std=gnu++23', '@' + str(directory / 'consumer.rsp')],
-                   LIBS=[projenv.File(outputs[0])])
+    projenv.Append(LIBS=[projenv.File(outputs[0])])
 
     def application_object(buildenv: Any, node: Any) -> Any:
-        """Order application objects after module publication, leaving framework sources alone."""
+        """Compile application sources with module flags after publication."""
         path = Path(node.srcnode().abspath)
         if path.is_relative_to(Path(env.subst('$PROJECT_SRC_DIR'))):
-            obj = buildenv.Object(node)
-            buildenv.Depends(obj, job)
+            appenv = buildenv.Clone()
+            appenv.Replace(CXXFLAGS=[
+                flag for flag in buildenv.get('CXXFLAGS', [])
+                if not str(flag).startswith('-std=')
+            ])
+            appenv.Append(CXXFLAGS=[
+                '-std=gnu++23',
+                '@' + str(directory / 'consumer.rsp'),
+            ])
+            obj = appenv.Object(node)
+            appenv.Depends(obj, job)
             return obj
         return node
 

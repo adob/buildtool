@@ -868,12 +868,14 @@ class Target:
                 return generated
             raise
 
-    def module_lookup_candidates(self, modname: str) -> list[Path]:
+    def module_lookup_candidates(
+        self, modname: str, *, search_roots: Iterable[Path | str] | None = None
+    ) -> list[Path]:
         """Return explicit module layouts in lookup order, without filesystem probing."""
         path = mod2path(modname, SourceType.MODULE)
         if path.is_absolute():
             return [path]
-        roots = [self.cfg.SRCDIR, *self.cfg.INCFLAGS]
+        roots = search_roots if search_roots is not None else [self.cfg.SRCDIR, *self.cfg.INCFLAGS]
         tagged_partition = tagged_partition_path(modname)
         result = []
         for base_path in roots:
@@ -890,10 +892,12 @@ class Target:
                     result.append(candidate)
         return result
 
-    async def resolve_generated_module_source(self, modname: str, parent: Job) -> Path | None:
+    async def resolve_generated_module_source(
+        self, modname: str, parent: Job, *, search_roots: Iterable[Path | str] | None = None
+    ) -> Path | None:
         """Materialize a declared generated module after all source-tree layouts fail."""
         cfg = self.cfg
-        for candidate in self.module_lookup_candidates(modname):
+        for candidate in self.module_lookup_candidates(modname, search_roots=search_roots):
             logical = source_relative_path(candidate, cfg)
             if logical is None:
                 continue
@@ -913,8 +917,10 @@ class Target:
         return None
 
     def mod2src(self, modname: str | None, type: SourceType,
-                *, search_roots: Iterable[Path | str] | None = None) -> Path:
+                *, search_roots: Iterable[Path | str] | None = None,
+                display_name: str | None = None) -> Path:
         """Find modname/type in search_roots, defaulting to source/include directories."""
+        diagnostic_name = modname if display_name is None else display_name
         path = mod2path(modname, type)
         dotted_partition_variant = (type == SourceType.MODULE and modname is not None
                                     and ':' in modname and '.' in modname.split(':', 1)[1])
@@ -955,7 +961,7 @@ class Target:
                              and source_matches_target(Path(entry.path), self.cfg)),
                             key=str)
                         if len(variants) > 1:
-                            raise RuntimeError(f"Ambiguous module {modname}: "
+                            raise RuntimeError(f"Ambiguous module {diagnostic_name}: "
                                                + ", ".join(map(str, variants)))
                         if variants:
                             return variants[0]
@@ -965,7 +971,7 @@ class Target:
                         return tagged_candidate
                     failed.append(str(tagged_candidate))
 
-        raise RuntimeError(f"Unable to locate module {modname}: " + ", ".join(failed))
+        raise RuntimeError(f"Unable to locate module {diagnostic_name}: " + ", ".join(failed))
 
 class SourceFile:
     @staticmethod
