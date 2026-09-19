@@ -34,7 +34,8 @@ GENERATED = [{
     "inputs": ["schema.txt", "gen.py"],
     "outputs": ["foo.cc"],
     "tools": ["protoc"],
-    "command": ["python3", "gen.py", "schema.txt", "{outdir}/foo.cc"],
+    "build_tools": {"codegen": "../cmd/codegen"},
+    "command": ["{tool:codegen}", "schema.txt", "{outdir}/foo.cc"],
 }]
 ```
 
@@ -46,6 +47,7 @@ The following substitutions are available in command arguments:
 - `{outdir}`: the absolute generated-output directory for this package
 - `{srcdir}`: the absolute source directory containing `BUILD.py`
 - `{root}`: the absolute source root
+- `{tool:name}`: the executable produced by the corresponding `build_tools` target
 
 If `import pkg.foo;` cannot resolve any ordinary source layout, Buildtool checks
 the `BUILD.py` owning each logical candidate. A declaration for `pkg/foo.cc`
@@ -64,3 +66,10 @@ inputs; changing any of these, or removing an output, reruns the action. Use
 `tools` for executables invoked indirectly by a generator wrapper, such as a
 Python script that runs `protoc`. Multiple imports of outputs from the same
 action share one generation job.
+
+`build_tools` maps command-local names to source-root-relative Buildtool target
+directories. Buildtool compiles and links those executables in the
+same scheduler before running the generator, so their own generated/module
+dependencies are resolved recursively. A changed tool binary invalidates the
+generation action. `tools` remains for external executables that Buildtool does
+not build itself.

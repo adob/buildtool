@@ -1770,11 +1770,12 @@ class GeneratedAction:
     def __init__(self, owner: Path, spec: object, cfg: BuildConfig) -> None:
         if not isinstance(spec, dict):
             raise ValueError(f'GENERATED entries in {owner}/BUILD.py must be dictionaries')
-        unknown = set(spec) - {'inputs', 'outputs', 'command', 'tools'}
+        unknown = set(spec) - {'inputs', 'outputs', 'command', 'tools', 'build_tools'}
         if unknown:
             raise ValueError(f'Unknown GENERATED keys in {owner}/BUILD.py: {", ".join(sorted(unknown))}')
-        inputs, outputs, command, tools = (
-            spec.get('inputs', []), spec.get('outputs'), spec.get('command'), spec.get('tools', []))
+        inputs, outputs, command, tools, build_tools = (
+            spec.get('inputs', []), spec.get('outputs'), spec.get('command'), spec.get('tools', []),
+            spec.get('build_tools', {}))
         if not isinstance(inputs, list) or not all(isinstance(value, str) for value in inputs):
             raise ValueError(f'GENERATED inputs in {owner}/BUILD.py must be a list of paths')
         if not isinstance(outputs, list) or not outputs or not all(isinstance(value, str) for value in outputs):
@@ -1783,12 +1784,19 @@ class GeneratedAction:
             raise ValueError(f'GENERATED command in {owner}/BUILD.py must be a non-empty argument list')
         if not isinstance(tools, list) or not all(isinstance(value, str) for value in tools):
             raise ValueError(f'GENERATED tools in {owner}/BUILD.py must be a list of executables')
+        if (not isinstance(build_tools, dict)
+                or not all(isinstance(name, str) and name and isinstance(value, str)
+                           for name, value in build_tools.items())):
+            raise ValueError(f'GENERATED build_tools in {owner}/BUILD.py must map names to target paths')
         self.owner = owner
         self.inputs = tuple(self._input_path(value) for value in inputs)
         self.outputs = tuple(self._output_path(value) for value in outputs)
         self.command = tuple(command)
         self.tools = tuple(tools)
         self.cfg = cfg
+        self.build_tools = {
+            name: self._source_target_path(value) for name, value in build_tools.items()
+        }
 
         for output in self.outputs:
             previous = cfg.generated_outputs.get(output)
@@ -1812,6 +1820,13 @@ class GeneratedAction:
             raise ValueError(f'Generated output must stay below {self.owner}: {value}')
         return self.owner / Path(raw)
 
+    def _source_target_path(self, value: str) -> Path:
+        """Resolve one source-root-relative build target."""
+        raw = pathlib.PurePath(value)
+        if raw.is_absolute() or not raw.parts or '..' in raw.parts:
+            raise ValueError(f'Generated build tool must be source-root-relative: {value}')
+        return Path(raw)
+
     def physical_path(self, logical: Path) -> Path:
         """Return this configuration's materialized path for logical."""
         return self.cfg.OBJDIR / 'generated' / logical
@@ -1820,7 +1835,7 @@ class GeneratedAction:
         identity = hashlib.sha256('\0'.join(map(str, self.outputs)).encode()).hexdigest()[:20]
         return self.cfg.DEPDIR / 'generated-actions' / (identity + '.json')
 
-    def expanded_command(self) -> list[str]:
+    def expanded_command(self, built_tools: dict[str, Path] | None = None) -> list[str]:
         """Expand stable directory placeholders without shell interpretation."""
         cfg = self.cfg
         substitutions = {
@@ -1832,6 +1847,11 @@ class GeneratedAction:
         for argument in self.command:
             for key, value in substitutions.items():
                 argument = argument.replace(key, value)
+            for name, path in (built_tools or {}).items():
+                argument = argument.replace('{tool:' + name + '}', cfg.vfs.abspath(path))
+            unresolved = re.search(r'\{tool:([^}]+)\}', argument)
+            if unresolved:
+                raise ValueError(f'Generated command references undeclared build tool {unresolved.group(1)!r}')
             command.append(argument)
         return command
 
@@ -1854,7 +1874,7 @@ class GeneratedAction:
         """Identify the command executable and any additionally declared tools."""
         return [self.executable_identity(tool) for tool in (command[0], *self.tools)]
 
-    def identity(self, command: Sequence[str]) -> dict[str, object]:
+    def identity(self, command: Sequence[str], built_tools: dict[str, Path] | None = None) -> dict[str, object]:
         """Hash declared inputs plus command/tool identity for incremental generation."""
         cfg = self.cfg
         inputs = {}
@@ -1866,6 +1886,10 @@ class GeneratedAction:
         return {
             'command': list(command),
             'tools': self.tool_identities(command),
+            'build_tools': {
+                name: [cfg.vfs.realpath(path), sha256_file(path, cfg.vfs)]
+                for name, path in sorted((built_tools or {}).items())
+            },
             'inputs': inputs,
         }
 
@@ -1879,11 +1903,60 @@ class GeneratedAction:
         except FileNotFoundError:
             return False
 
-    async def build(self, job: Job) -> None:
+    def build_tool_artifact(self, logical: Path) -> Path:
+        """Give source-built generator executables unique deterministic artifact paths."""
+        return self.cfg.OBJDIR / 'tools' / logical
+
+    async def build_tool(self, logical: Path, target: Target, parent: Job) -> Path:
+        """Recursively build one executable target in the current scheduler."""
+        cfg = self.cfg
+        source = cfg.SRCDIR / logical
+        if not source.is_dir(cfg.vfs):
+            raise RuntimeError(f'Generated build tool target is not a directory: {source}')
+        artifact = self.build_tool_artifact(logical)
+        key = ('build-tool', str(logical), str(artifact))
+
+        async def work(job: Job) -> None:
+            job.diagnostic_source = str(source)
+            tool = Target(Path(cfg.vfs.abspath(source)), cfg)
+            tool.session = target.session
+            tool.job_sources = target.job_sources
+            tool.link_events = target.link_events
+            tool.roots = []
+            tool.link_events.setdefault(job, [])
+            sources = directory_sources(source, cfg)
+            if not sources:
+                raise RuntimeError(f'No source files in generated build tool target {source}')
+
+            dependencies = []
+            for path in sources:
+                dependency = tool.schedule_compilation_job(path, parent=job)
+                if dependency not in tool.roots:
+                    tool.roots.append(dependency)
+                dependencies.append(dependency)
+            for dependency in dependencies:
+                await job.wait_for_dependency(dependency)
+
+            tool.collect_link_inputs()
+            if not await tool.defines_main_async(job):
+                raise RuntimeError(f'Generated build tool target has no main function: {source}')
+            await tool.link_async(job, artifact)
+
+        dependency = target.session.schedule(key, work, parent=parent)
+        await parent.wait_for_dependency(dependency)
+        if not artifact.is_file(cfg.vfs):
+            raise RuntimeError(f'Generated build tool did not produce executable: {artifact}')
+        return artifact
+
+    async def build(self, target: Target, job: Job) -> None:
         """Materialize all outputs once when this action's identity is stale."""
         cfg = self.cfg
-        command = self.expanded_command()
-        identity = self.identity(command)
+        built_tools = {
+            name: await self.build_tool(logical, target, job)
+            for name, logical in self.build_tools.items()
+        }
+        command = self.expanded_command(built_tools)
+        identity = self.identity(command, built_tools)
         if self.current(identity):
             return
         for output in self.outputs:
@@ -1908,7 +1981,7 @@ class GeneratedAction:
 
         async def work(job: Job) -> None:
             job.diagnostic_source = str(self.owner / 'BUILD.py')
-            await self.build(job)
+            await self.build(target, job)
 
         dependency = target.session.schedule(key, work, parent=parent)
         await parent.wait_for_dependency(dependency)

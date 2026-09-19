@@ -133,6 +133,37 @@ class GeneratedModuleTests(unittest.TestCase):
             self.resolve()
         self.assertEqual(len(self.invocations), 4)
 
+    def test_build_tool_placeholder_uses_source_root_target(self) -> None:
+        """Source-built generator tools expand to their configuration artifact path."""
+        self.fs.write_text(
+            "pkg/generated/BUILD.py",
+            """GENERATED = [{
+    "inputs": ["schema.txt"],
+    "outputs": ["foo.cc"],
+    "build_tools": {"codegen": "cmd/codegen"},
+    "command": ["{tool:codegen}", "schema.txt", "{outdir}/foo.cc"],
+}]
+""",
+        )
+        self.cfg.reset_build_state()
+        bt.DirectoryConfig.get(bt.Path("pkg/generated"), self.cfg)
+        action = self.cfg.generated_outputs[bt.Path("pkg/generated/foo.cc")]
+        self.assertEqual(action.build_tools, {"codegen": bt.Path("cmd/codegen")})
+
+        tool = bt.Path("build/release/tools/cmd/codegen")
+        self.fs.makedirs(tool.parent, exist_ok=True)
+        self.fs.write_text(tool, "codegen binary")
+        command = action.expanded_command({"codegen": tool})
+
+        self.assertEqual(command[0], "/workspace/build/release/tools/cmd/codegen")
+        identity = action.identity(command, {"codegen": tool})
+        self.assertEqual(
+            identity["build_tools"]["codegen"][0], self.fs.abspath(tool)
+        )
+        self.assertEqual(
+            identity["build_tools"]["codegen"][1], bt.sha256_file(tool, self.fs)
+        )
+
     def test_generated_header_and_companion_metadata_do_not_collide(self) -> None:
         """Generated foo.pb.h and foo.pb.cc retain distinct cache and BMI paths."""
         header = bt.Path("build/release/generated/pkg/generated/foo.pb.h")
